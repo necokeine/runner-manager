@@ -158,7 +158,13 @@ pub fn render<R: CommandRunner>(
 
     // Scrollbar on the right border, only when the content overflows.
     if total > view_h {
-        let mut sb_state = ScrollbarState::new(total)
+        // The list offset maxes at `total - view_h` (last row pinned to the
+        // bottom of the viewport), but ratatui's scrollbar only puts the thumb at
+        // the track end when `position == content_length - 1`. So the content
+        // length must be the number of distinct offsets (`max_off + 1`), not the
+        // row count — otherwise the thumb can never reach the end. Keeping
+        // `viewport_content_length == view_h` makes the thumb size `view_h/total`.
+        let mut sb_state = ScrollbarState::new(max_off + 1)
             .viewport_content_length(view_h)
             .position(app.tree_offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -413,6 +419,51 @@ mod tests {
         assert!(has_thumb(make_rows(40)));
         // 3 rows fit -> no scrollbar.
         assert!(!has_thumb(make_rows(3)));
+    }
+
+    #[test]
+    fn scrollbar_thumb_reaches_bottom_at_max_scroll() {
+        // Regression: at full scroll the thumb stopped short of the track end, so
+        // the scrollbar "couldn't reach the end" of the directory list. The list
+        // offset maxes at total - view_h (last row at the bottom of the viewport),
+        // so the scrollbar's content_length must match that range.
+        use crate::app::App;
+        use crate::rows::{Row, RowKind};
+        use crate::tmux::{MockRunner, Tmux};
+        use crate::viewer::FileView;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::{Path, PathBuf};
+
+        let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+        app.rows = (0..30)
+            .map(|i| Row { path: PathBuf::from("/"), label: format!("f{i}"), depth: 0, kind: RowKind::File })
+            .collect();
+        app.viewer = Some(FileView::load(Path::new("/nonexistent")));
+
+        // 40x10 terminal: tree pane is 35% wide (14 cols) so the scrollbar sits in
+        // column 13; its track spans rows 1..=8 (the 8-row inner viewport).
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let view_h = 8usize;
+        let max_off = 30 - view_h; // 22
+        let thumb_ys = |app: &mut App<MockRunner>, t: &mut Terminal<TestBackend>, off: usize| -> Vec<u16> {
+            app.tree_offset = off;
+            app.selected = off; // keep the selection in view so the List leaves the offset alone
+            t.draw(|f| {
+                render(f, f.area(), app, None);
+            })
+            .unwrap();
+            let buf = t.backend().buffer();
+            (0..10u16)
+                .filter(|&y| buf.content()[(y * 40 + 13) as usize].symbol() == "█")
+                .collect()
+        };
+
+        let bottom = thumb_ys(&mut app, &mut terminal, max_off);
+        assert!(bottom.contains(&8), "thumb should reach the bottom track row (y=8) at max scroll, got {bottom:?}");
+        let top = thumb_ys(&mut app, &mut terminal, 0);
+        assert!(top.contains(&1), "thumb should start at the top track row (y=1), got {top:?}");
+        assert!(!top.contains(&8), "thumb should not cover the bottom row when scrolled to the top, got {top:?}");
     }
 
     #[test]
