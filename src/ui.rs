@@ -336,6 +336,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "",
         "right pane focused: type into the shell, or",
         "j/k/PgUp/PgDn to scroll a file view",
+        "wheel over the terminal scrolls its history (old logs)",
         "",
         "— press any key to close —",
     ];

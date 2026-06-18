@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, Focus, Popup};
-use crate::keys::encode_key;
+use crate::keys::{encode_key, encode_wheel};
 use crate::pty::{ParserHandle, Pty};
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui::{self, Hit, PaneHit};
@@ -70,6 +70,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         // user's tmux config can turn it on, so we force it off to be safe.
         let _ = app.tmux.set_global_option("detach-on-destroy", "off");
         let _ = app.tmux.set_global_option("destroy-unattached", "off");
+        // Let the embedded client scroll its own scrollback: with mouse on,
+        // a forwarded wheel event puts the pane into copy-mode (showing the
+        // old logs) unless a full-screen app has grabbed the mouse itself.
+        let _ = app.tmux.set_global_option("mouse", "on");
     }
     let _ = app.sync();
 
@@ -239,6 +243,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                             app.scroll_tree(3, layout.tree.view_h as usize);
                         } else if let Some(v) = &mut app.viewer {
                             v.scroll_down(3);
+                        } else {
+                            forward_wheel(&mut pty, false, m.column, m.row, layout.term_area);
                         }
                     }
                 }
@@ -248,6 +254,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                             app.scroll_tree(-3, layout.tree.view_h as usize);
                         } else if let Some(v) = &mut app.viewer {
                             v.scroll_up(3);
+                        } else {
+                            forward_wheel(&mut pty, true, m.column, m.row, layout.term_area);
                         }
                     }
                 }
@@ -271,6 +279,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     // A brand-new tmux server lost the global options; re-apply.
                     let _ = app.tmux.set_global_option("detach-on-destroy", "off");
                     let _ = app.tmux.set_global_option("destroy-unattached", "off");
+                    let _ = app.tmux.set_global_option("mouse", "on");
                     app.status = format!("reopened terminal for {slug}");
                 }
             }
@@ -287,4 +296,24 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let restore_raw = disable_raw_mode();
     let restore_screen = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     result.and(restore_raw).and(restore_screen)
+}
+
+/// Forward a mouse-wheel tick to the embedded terminal, but only when a live
+/// client exists and the pointer is over its pane. Screen coordinates are
+/// translated to the tmux client's 1-based, pane-local origin so the wheel
+/// report lands on the right pane; tmux (`mouse on`) turns it into scrollback
+/// scrolling, revealing the old logs.
+fn forward_wheel(pty: &mut Option<Pty>, up: bool, col: u16, row: u16, term: ratatui::layout::Rect) {
+    let Some(p) = pty else { return };
+    if !p.is_alive() {
+        return;
+    }
+    let in_pane = col >= term.x
+        && row >= term.y
+        && col < term.x + term.width
+        && row < term.y + term.height;
+    if !in_pane {
+        return;
+    }
+    let _ = p.write_input(&encode_wheel(up, col - term.x + 1, row - term.y + 1));
 }
