@@ -30,6 +30,12 @@ pub enum SessionKind {
     Claude,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudePerm {
+    Normal,
+    Skip,
+}
+
 impl SessionKind {
     pub fn label_base(&self) -> &'static str {
         match self {
