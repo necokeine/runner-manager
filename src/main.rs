@@ -11,6 +11,10 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let root = env::current_dir()?;
-    let socket = env::var("RM_SOCKET").unwrap_or_else(|_| "runner".to_string());
+    // Use a project-local socket file (`<root>/pjma.sock`) so each project's
+    // tmux sessions live on their own socket rather than a shared named one.
+    // `RM_SOCKET` can still override with an explicit socket path.
+    let socket = env::var("RM_SOCKET")
+        .unwrap_or_else(|_| root.join("pjma.sock").to_string_lossy().into_owned());
     run::run(root, socket)
 }
