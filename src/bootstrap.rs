@@ -92,10 +92,33 @@ pub fn run_bootstrap(socket: &str, outer: &str) -> io::Result<()> {
         ));
     }
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    execute(&inner_setup_commands(socket))?;
-    execute(&outer_layout_commands(outer, socket, &exe))?;
+    // Inner setup creates the scratch session (which would error as a duplicate on a
+    // re-run) and sets the prefix; only do it when the inner server isn't already set
+    // up. The scratch session's presence is our marker that setup has run.
+    if !session_exists(Some(socket), "scratch") {
+        execute(&inner_setup_commands(socket))?;
+    }
+    // Only build the outer layout the first time; on a re-run the session already
+    // exists and we just re-attach (rebuilding would duplicate panes / error).
+    if !session_exists(None, outer) {
+        execute(&outer_layout_commands(outer, socket, &exe))?;
+    }
     Command::new("tmux").args(["attach", "-t", outer]).status()?;
     Ok(())
+}
+
+/// Returns true if a session named `name` exists on the given tmux server
+/// (`socket` = None means the default server).
+fn session_exists(socket: Option<&str>, name: &str) -> bool {
+    let mut command = Command::new("tmux");
+    if let Some(sock) = socket {
+        command.arg("-L").arg(sock);
+    }
+    command
+        .args(["has-session", "-t", name])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
