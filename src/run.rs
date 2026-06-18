@@ -46,6 +46,15 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
     let mut app = App::new(root, tmux, editor);
     let _ = app.sync_active();
 
+    // Wait briefly for the embedded PTY's tmux client to register, so the first
+    // directory selection can switch the right pane (avoids a startup race).
+    for _ in 0..20 {
+        if app.host_client_ready() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
     let mut last_term_size: (u16, u16) = (0, 0);
 
     let result = loop {

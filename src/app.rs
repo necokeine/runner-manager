@@ -138,6 +138,12 @@ impl<R: CommandRunner> App<R> {
         Ok(())
     }
 
+    /// True once the inner tmux server reports at least one client (the embedded
+    /// PTY). Used at startup to avoid switching before that client has attached.
+    pub fn host_client_ready(&mut self) -> bool {
+        matches!(self.tmux.host_tty(), Ok(Some(_)))
+    }
+
     fn ensure_host_tty(&mut self) -> io::Result<Option<String>> {
         self.host_tty = self.tmux.host_tty()?;
         Ok(self.host_tty.clone())
@@ -258,6 +264,15 @@ mod tests {
         let call = app.tmux.runner.nth_call(0);
         assert_eq!(call[2], "kill-session");
         assert!(call.contains(&"-t".to_string()), "kill-session must target a session");
+    }
+
+    #[test]
+    fn host_client_ready_reflects_list_clients() {
+        let (_dir, mut app) = app_over_tempdir();
+        app.tmux.runner.push(false, "");                // list-clients fails -> no client
+        assert!(!app.host_client_ready());
+        app.tmux.runner.push(true, "/dev/ttys009\n");   // a client present
+        assert!(app.host_client_ready());
     }
 
     #[test]
