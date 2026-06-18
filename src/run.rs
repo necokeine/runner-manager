@@ -51,10 +51,14 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
 
     let mut last_term_size: (u16, u16) = (0, 0);
     let mut last_sync = Instant::now();
+    let mut area_width: u16 = 0;
+    let mut dragging_split = false;
+    let mut chooser_row_ys: Vec<(u16, crate::app::ChooserRow)> = Vec::new();
 
     let result = loop {
         let mut captured: Option<ui::Layout> = None;
         let draw_res = terminal.draw(|f| {
+            area_width = f.area().width;
             let screen_guard = if app.viewer.is_none() {
                 Some(parser.read().unwrap())
             } else {
@@ -65,8 +69,13 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             drop(screen_guard);
             match &app.popup {
                 Popup::Help => ui::render_help(f, f.area()),
-                Popup::Chooser { selected, .. } => {
-                    let _ = ui::render_chooser(f, f.area(), *selected);
+                Popup::Chooser { kind, perm, focus, .. } => {
+                    let focus_row = app
+                        .chooser_rows()
+                        .get(*focus)
+                        .copied()
+                        .unwrap_or(crate::app::ChooserRow::KindShell);
+                    chooser_row_ys = ui::render_chooser(f, f.area(), *kind, *perm, focus_row);
                 }
                 Popup::None => {}
             }
@@ -101,8 +110,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                     Popup::Chooser { .. } => match key.code {
                         KeyCode::Esc => app.chooser_cancel(),
-                        KeyCode::Enter => {
-                            let _ = app.chooser_confirm();
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            let _ = app.chooser_activate();
                         }
                         KeyCode::Down | KeyCode::Char('j') => app.chooser_move(1),
                         KeyCode::Up | KeyCode::Char('k') => app.chooser_move(-1),
@@ -126,6 +135,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                     KeyCode::Enter => {
                                         let _ = app.activate();
                                     }
+                                    KeyCode::Char('<') => app.narrow_split(),
+                                    KeyCode::Char('>') => app.widen_split(),
                                     _ => {}
                                 },
                                 Focus::Right => {
@@ -150,12 +161,24 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                 }
             }
-            Ok(Event::Mouse(m)) => {
-                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                    match app.popup.clone() {
-                        Popup::Help => app.popup = Popup::None,
-                        Popup::Chooser { .. } => app.chooser_cancel(),
-                        Popup::None => {
+            Ok(Event::Mouse(m)) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => match app.popup.clone() {
+                    Popup::Help => app.popup = Popup::None,
+                    Popup::Chooser { .. } => {
+                        match chooser_row_ys.iter().find(|(y, _)| *y == m.row) {
+                            Some((_, row)) => {
+                                let _ = app.chooser_click(*row);
+                            }
+                            None => app.chooser_cancel(),
+                        }
+                    }
+                    Popup::None => {
+                        let border = layout.split_col;
+                        let on_border =
+                            m.column + 1 >= border && m.column <= border.saturating_add(1);
+                        if on_border {
+                            dragging_split = true;
+                        } else {
                             match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree) {
                                 PaneHit::Right => app.focus = Focus::Right,
                                 PaneHit::Tree(hit) => {
@@ -175,8 +198,17 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                             }
                         }
                     }
+                },
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if dragging_split {
+                        app.split_pct = crate::app::col_to_split_pct(m.column, area_width);
+                    }
                 }
-            }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    dragging_split = false;
+                }
+                _ => {}
+            },
             Ok(_) => {}
             Err(e) => break Err(e),
         }

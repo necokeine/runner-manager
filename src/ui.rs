@@ -1,12 +1,14 @@
 use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Focus, CHOOSER_KINDS};
+use crate::app::{App, ChooserRow, Focus};
 use crate::rows::{Row, RowKind};
+use crate::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
 
 pub struct ListLayout {
@@ -88,7 +90,10 @@ pub fn render<R: CommandRunner>(
 ) -> Layout {
     let chunks = RtLayout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([
+            Constraint::Percentage(app.split_pct),
+            Constraint::Percentage(100 - app.split_pct),
+        ])
         .split(area);
     let tree_area = chunks[0];
     let right_area = chunks[1];
@@ -194,21 +199,58 @@ pub fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(para, popup);
 }
 
-pub fn render_chooser(f: &mut Frame, area: Rect, selected: usize) -> Rect {
-    let popup = centered_rect(40, 30, area);
-    let block = Block::default().title("New session").borders(Borders::ALL);
-    let items: Vec<ListItem> = CHOOSER_KINDS
-        .iter()
-        .map(|k| ListItem::new(format!("  {}", k.label_base())))
-        .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default();
-    state.select(Some(selected.min(CHOOSER_KINDS.len() - 1)));
+pub fn render_chooser(
+    f: &mut Frame,
+    area: Rect,
+    kind: SessionKind,
+    perm: ClaudePerm,
+    focus_row: ChooserRow,
+) -> Vec<(u16, ChooserRow)> {
+    let popup = centered_rect(50, 60, area);
     f.render_widget(Clear, popup);
-    f.render_stateful_widget(list, popup, &mut state);
-    popup
+    let block = Block::default().title("New session").borders(Borders::ALL);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut row_ys: Vec<(u16, ChooserRow)> = Vec::new();
+    let mut y = inner.y;
+
+    let radio = |selected: bool| if selected { "(•)" } else { "( )" };
+    let arrow = |row: ChooserRow| if row == focus_row { "> " } else { "  " };
+
+    // Kind:
+    lines.push(Line::from("Kind:".to_string()));
+    y += 1;
+    lines.push(Line::from(format!("{}{} shell", arrow(ChooserRow::KindShell), radio(kind == SessionKind::Shell))));
+    row_ys.push((y, ChooserRow::KindShell));
+    y += 1;
+    lines.push(Line::from(format!("{}{} claude", arrow(ChooserRow::KindClaude), radio(kind == SessionKind::Claude))));
+    row_ys.push((y, ChooserRow::KindClaude));
+    y += 1;
+
+    if kind == SessionKind::Claude {
+        lines.push(Line::from("Permission:".to_string()));
+        y += 1;
+        lines.push(Line::from(format!("{}{} normal", arrow(ChooserRow::PermNormal), radio(perm == ClaudePerm::Normal))));
+        row_ys.push((y, ChooserRow::PermNormal));
+        y += 1;
+        lines.push(Line::from(format!("{}{} skip (--dangerously-skip-permissions)", arrow(ChooserRow::PermSkip), radio(perm == ClaudePerm::Skip))));
+        row_ys.push((y, ChooserRow::PermSkip));
+        y += 1;
+    }
+
+    lines.push(Line::from(String::new()));
+    y += 1;
+    lines.push(Line::from(format!("{}[ Cancel ]", arrow(ChooserRow::Cancel))));
+    row_ys.push((y, ChooserRow::Cancel));
+    y += 1;
+    lines.push(Line::from(format!("{}[ Create ]", arrow(ChooserRow::Create))));
+    row_ys.push((y, ChooserRow::Create));
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
+    row_ys
 }
 
 #[cfg(test)]
@@ -235,5 +277,34 @@ mod tests {
     fn centered_rect_is_centered() {
         let area = Rect { x: 0, y: 0, width: 100, height: 100 };
         assert_eq!(centered_rect(50, 50, area), Rect { x: 25, y: 25, width: 50, height: 50 });
+    }
+
+    #[test]
+    fn render_chooser_draws_radios_and_buttons() {
+        use crate::app::ChooserRow;
+        use crate::session::{ClaudePerm, SessionKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let rows = render_chooser(
+                    f,
+                    f.area(),
+                    SessionKind::Claude,
+                    ClaudePerm::Skip,
+                    ChooserRow::Create,
+                );
+                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::Create));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("shell"));
+        assert!(content.contains("claude"));
+        assert!(content.contains("skip"));
+        assert!(content.contains("Cancel"));
+        assert!(content.contains("Create"));
     }
 }

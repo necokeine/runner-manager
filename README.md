@@ -28,12 +28,16 @@ runner-manager
 | `j` / `down`   | move down (tree focus)                              |
 | `k` / `up`     | move up (tree focus)                                |
 | `Enter`        | expand/collapse dir · switch to session · view file |
-| `a` / `[+]`    | new session (shell/claude) on a directory           |
+| `a` / `[+]`    | new session form (shell/claude) on a directory      |
+| `<` / `>`      | narrow / widen the tree pane (tree focus)           |
 | `h` / `?`      | help popup                                          |
 | `q`            | quit (tree focus)                                   |
 | `Ctrl-q`       | toggle focus between tree and the right pane        |
 | left-click     | focus a pane; in the tree, act on the clicked row   |
+| drag border    | resize the tree/terminal split                      |
 
-In the chooser popup: `↑`/`↓`/`j`/`k` to move, `Enter` to start, `Esc` to
-cancel. When the right pane is focused: keys go to the shell, or — if a file
-is shown — `j`/`k`/`PgUp`/`PgDn` scroll it (read-only).
+In the new-session form: `↑`/`↓`/`j`/`k` move between rows (selecting `claude`
+reveals a permission choice: `normal` or `skip` = `--dangerously-skip-permissions`),
+`Enter`/`Space` activates the focused `Cancel`/`Create` button, `Esc` cancels.
+Click a row to select it, or click `Cancel`/`Create`. The split between the tree
+and the right pane is adjustable with `<`/`>` or by dragging the border.

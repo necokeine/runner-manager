@@ -3,10 +3,25 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::rows::{build_rows, Row, RowKind};
-use crate::session::{SessionKind, SessionStore};
+use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::Tree;
 use crate::viewer::FileView;
+
+const MIN_SPLIT: u16 = 15;
+const MAX_SPLIT: u16 = 80;
+const SPLIT_STEP: u16 = 5;
+const DEFAULT_SPLIT: u16 = 35;
+
+/// Convert a cursor column to a clamped tree-width percent. Zero width
+/// returns the default (avoids divide-by-zero during a drag on a 0-wide area).
+pub fn col_to_split_pct(col: u16, width: u16) -> u16 {
+    if width == 0 {
+        return DEFAULT_SPLIT;
+    }
+    let pct = (col as u32 * 100 / width as u32) as u16;
+    pct.clamp(MIN_SPLIT, MAX_SPLIT)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -14,15 +29,27 @@ pub enum Focus {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChooserRow {
+    KindShell,
+    KindClaude,
+    PermNormal,
+    PermSkip,
+    Cancel,
+    Create,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
     None,
     Help,
-    Chooser { dir: PathBuf, selected: usize },
+    Chooser {
+        dir: PathBuf,
+        kind: SessionKind,
+        perm: ClaudePerm,
+        focus: usize,
+    },
 }
-
-/// The kinds offered by the chooser, in display order.
-pub const CHOOSER_KINDS: [SessionKind; 2] = [SessionKind::Shell, SessionKind::Claude];
 
 pub struct App<R: CommandRunner> {
     pub tree: Tree,
@@ -36,6 +63,7 @@ pub struct App<R: CommandRunner> {
     pub focus: Focus,
     pub popup: Popup,
     pub status: String,
+    pub split_pct: u16,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -53,6 +81,7 @@ impl<R: CommandRunner> App<R> {
             focus: Focus::Tree,
             popup: Popup::None,
             status: String::new(),
+            split_pct: DEFAULT_SPLIT,
         };
         app.rebuild_rows();
         app
@@ -109,24 +138,87 @@ impl<R: CommandRunner> App<R> {
             if matches!(row.kind, RowKind::Dir { .. }) {
                 self.popup = Popup::Chooser {
                     dir: row.path.clone(),
-                    selected: 0,
+                    kind: SessionKind::Shell,
+                    perm: ClaudePerm::Normal,
+                    focus: 0,
                 };
             }
         }
     }
 
+    /// Visible focusable rows for the current chooser kind.
+    pub fn chooser_rows(&self) -> Vec<ChooserRow> {
+        let mut rows = vec![ChooserRow::KindShell, ChooserRow::KindClaude];
+        if let Popup::Chooser { kind: SessionKind::Claude, .. } = self.popup {
+            rows.push(ChooserRow::PermNormal);
+            rows.push(ChooserRow::PermSkip);
+        }
+        rows.push(ChooserRow::Cancel);
+        rows.push(ChooserRow::Create);
+        rows
+    }
+
     pub fn chooser_move(&mut self, delta: i32) {
-        if let Popup::Chooser { selected, .. } = &mut self.popup {
-            let n = CHOOSER_KINDS.len() as i32;
-            *selected = (((*selected as i32 + delta) % n + n) % n) as usize;
+        let rows = self.chooser_rows();
+        let Popup::Chooser { focus, .. } = &mut self.popup else {
+            return;
+        };
+        let max = rows.len() as i32 - 1;
+        let new_focus = (*focus as i32 + delta).clamp(0, max) as usize;
+        *focus = new_focus;
+        self.chooser_apply_focus(rows[new_focus]);
+    }
+
+    /// Clicking (or focusing) a row selects radios; clicking a button acts.
+    pub fn chooser_click(&mut self, row: ChooserRow) -> io::Result<()> {
+        if let Some(idx) = self.chooser_rows().iter().position(|r| *r == row) {
+            if let Popup::Chooser { focus, .. } = &mut self.popup {
+                *focus = idx;
+            }
+        }
+        self.chooser_apply_focus(row);
+        if matches!(row, ChooserRow::Cancel | ChooserRow::Create) {
+            self.chooser_activate()?;
+        }
+        Ok(())
+    }
+
+    /// Apply the radio-follows-focus rule for the given row.
+    fn chooser_apply_focus(&mut self, row: ChooserRow) {
+        // Apply radio selection first (this may change `kind`, which changes the row set).
+        if let Popup::Chooser { kind, perm, .. } = &mut self.popup {
+            match row {
+                ChooserRow::KindShell => *kind = SessionKind::Shell,
+                ChooserRow::KindClaude => *kind = SessionKind::Claude,
+                ChooserRow::PermNormal => *perm = ClaudePerm::Normal,
+                ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
+                _ => {}
+            }
+        }
+        // Re-clamp focus against the (possibly shrunken) row set.
+        let row_count = self.chooser_rows().len();
+        if let Popup::Chooser { focus, .. } = &mut self.popup {
+            if *focus >= row_count {
+                *focus = row_count - 1;
+            }
         }
     }
 
-    pub fn chooser_confirm(&mut self) -> io::Result<()> {
-        if let Popup::Chooser { dir, selected } = self.popup.clone() {
-            let kind = CHOOSER_KINDS[selected];
-            self.popup = Popup::None;
-            self.create_session(&dir, kind)?;
+    pub fn chooser_activate(&mut self) -> io::Result<()> {
+        let Popup::Chooser { dir, kind, perm, focus } = self.popup.clone() else {
+            return Ok(());
+        };
+        let rows = self.chooser_rows();
+        match rows.get(focus) {
+            Some(ChooserRow::Cancel) => {
+                self.popup = Popup::None;
+            }
+            Some(ChooserRow::Create) => {
+                let cmd = Self::chooser_command(kind, perm);
+                self.popup = Popup::None;
+                self.create_session(&dir, kind, cmd.as_deref())?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -135,9 +227,19 @@ impl<R: CommandRunner> App<R> {
         self.popup = Popup::None;
     }
 
-    fn create_session(&mut self, dir: &Path, kind: SessionKind) -> io::Result<()> {
+    pub fn chooser_command(kind: SessionKind, perm: ClaudePerm) -> Option<String> {
+        match kind {
+            SessionKind::Shell => None,
+            SessionKind::Claude => match perm {
+                ClaudePerm::Normal => Some("claude".to_string()),
+                ClaudePerm::Skip => Some("claude --dangerously-skip-permissions".to_string()),
+            },
+        }
+    }
+
+    fn create_session(&mut self, dir: &Path, kind: SessionKind, command: Option<&str>) -> io::Result<()> {
         let slug = self.store.create(dir, &self.root, kind);
-        self.tmux.new_session(&slug, dir, kind.command())?;
+        self.tmux.new_session(&slug, dir, command)?;
         self.rebuild_rows();
         self.switch_to(&slug)?;
         self.status = format!("started {}", kind.label_base());
@@ -185,6 +287,14 @@ impl<R: CommandRunner> App<R> {
         };
     }
 
+    pub fn widen_split(&mut self) {
+        self.split_pct = (self.split_pct + SPLIT_STEP).min(MAX_SPLIT);
+    }
+
+    pub fn narrow_split(&mut self) {
+        self.split_pct = self.split_pct.saturating_sub(SPLIT_STEP).max(MIN_SPLIT);
+    }
+
     pub fn host_client_ready(&mut self) -> bool {
         matches!(self.tmux.host_tty(), Ok(Some(_)))
     }
@@ -222,18 +332,33 @@ mod tests {
         assert_eq!(app.tmux.runner.call_count(), 0); // no tmux for expand
     }
 
+    fn focus_create(app: &mut App<MockRunner>) {
+        let create_idx = app
+            .chooser_rows()
+            .iter()
+            .position(|r| *r == ChooserRow::Create)
+            .unwrap();
+        if let Popup::Chooser { focus, .. } = &mut app.popup {
+            *focus = create_idx;
+        }
+    }
+
     #[test]
-    fn chooser_confirm_creates_shell_and_switches() {
+    fn chooser_create_makes_shell_and_switches() {
         let (_d, mut app) = app_over_tempdir();
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        assert!(matches!(app.popup, Popup::Chooser { selected: 0, .. }));
-        // shell (index 0): new-session (no command), then list-clients, then switch-client
+        assert!(matches!(
+            app.popup,
+            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
+        ));
+        // shell: new-session (no command), then list-clients, then switch-client
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
-        app.chooser_confirm().unwrap();
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
         assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
         assert!(!app.tmux.runner.nth_call(0).contains(&"claude".to_string()));
         assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
@@ -246,16 +371,17 @@ mod tests {
     }
 
     #[test]
-    fn chooser_confirm_claude_appends_command() {
+    fn chooser_create_claude_appends_command() {
         let (_d, mut app) = app_over_tempdir();
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        app.chooser_move(1); // select claude (index 1)
+        app.chooser_move(1); // focus -> claude
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
-        app.chooser_confirm().unwrap();
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
         assert!(app.tmux.runner.nth_call(0).contains(&"claude".to_string()));
     }
 
@@ -274,6 +400,31 @@ mod tests {
     }
 
     #[test]
+    fn split_widen_and_narrow_clamp() {
+        let (_d, mut app) = app_over_tempdir();
+        assert_eq!(app.split_pct, 35);
+        app.widen_split(); // 40
+        app.narrow_split(); // 35
+        assert_eq!(app.split_pct, 35);
+        for _ in 0..30 {
+            app.widen_split();
+        }
+        assert_eq!(app.split_pct, 80); // clamped high
+        for _ in 0..30 {
+            app.narrow_split();
+        }
+        assert_eq!(app.split_pct, 15); // clamped low
+    }
+
+    #[test]
+    fn col_to_split_pct_clamps_and_is_safe() {
+        assert_eq!(col_to_split_pct(50, 100), 50);
+        assert_eq!(col_to_split_pct(0, 100), 15); // clamp low
+        assert_eq!(col_to_split_pct(99, 100), 80); // clamp high
+        assert_eq!(col_to_split_pct(10, 0), 35); // zero width -> default, no panic
+    }
+
+    #[test]
     fn sync_prunes_dead_session_rows() {
         let (_d, mut app) = app_over_tempdir();
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
@@ -282,11 +433,122 @@ mod tests {
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
-        app.chooser_confirm().unwrap();
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
         assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
         // sync with an empty live set -> the session is gone
         app.tmux.runner.push(true, ""); // list-sessions returns nothing
         app.sync().unwrap();
         assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    use crate::session::ClaudePerm;
+
+    fn open_dir_chooser(app: &mut App<MockRunner>) {
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+    }
+
+    #[test]
+    fn chooser_defaults_to_shell_with_no_perm_rows() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        assert_eq!(
+            app.chooser_rows(),
+            vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::Cancel, ChooserRow::Create]
+        );
+    }
+
+    #[test]
+    fn focusing_claude_reveals_perm_rows_and_selects_it() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_move(1); // focus -> claude
+        if let Popup::Chooser { kind, .. } = app.popup {
+            assert_eq!(kind, SessionKind::Claude);
+        } else {
+            panic!("expected chooser");
+        }
+        assert_eq!(
+            app.chooser_rows(),
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::PermNormal,
+                ChooserRow::PermSkip,
+                ChooserRow::Cancel,
+                ChooserRow::Create
+            ]
+        );
+    }
+
+    #[test]
+    fn focusing_skip_sets_perm_then_back_to_shell_reclamps() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_move(1); // claude
+        app.chooser_move(1); // normal
+        app.chooser_move(1); // skip
+        if let Popup::Chooser { perm, .. } = app.popup {
+            assert_eq!(perm, ClaudePerm::Skip);
+        } else {
+            panic!();
+        }
+        // move focus up to shell -> kind becomes Shell, perm rows vanish, focus valid
+        app.chooser_move(-3); // skip(3) -> shell(0)
+        if let Popup::Chooser { kind, focus, .. } = app.popup {
+            assert_eq!(kind, SessionKind::Shell);
+            assert!(focus < app.chooser_rows().len());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn chooser_command_maps_kind_and_perm() {
+        assert_eq!(App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal), None);
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip).as_deref(),
+            Some("claude --dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn chooser_activate_create_starts_claude_skip() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_move(1); // claude
+        app.chooser_move(2); // skip
+        // move focus to Create (rows: shell,claude,normal,skip,Cancel,Create => Create index 5)
+        let create_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Create).unwrap();
+        if let Popup::Chooser { focus, .. } = &mut app.popup {
+            *focus = create_idx;
+        }
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        let call = app.tmux.runner.nth_call(0);
+        assert_eq!(call[2], "new-session");
+        assert!(call.contains(&"claude --dangerously-skip-permissions".to_string()));
+        assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn chooser_activate_cancel_closes_without_tmux() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        let cancel_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Cancel).unwrap();
+        if let Popup::Chooser { focus, .. } = &mut app.popup {
+            *focus = cancel_idx;
+        }
+        app.chooser_activate().unwrap();
+        assert_eq!(app.popup, Popup::None);
+        assert_eq!(app.tmux.runner.call_count(), 0);
     }
 }
