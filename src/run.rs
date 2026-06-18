@@ -70,6 +70,9 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
                 app.focus,
                 guard.screen(),
             ));
+            if app.show_help {
+                ui::render_help(f, f.area());
+            }
         });
         if let Err(e) = draw_res {
             break Err(e);
@@ -89,26 +92,37 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
 
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                // Ctrl-q toggles focus regardless of current focus.
-                if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if app.show_help {
+                    // While the help popup is open, any key closes it (swallowed).
+                    app.show_help = false;
+                } else if key.code == KeyCode::Char('q')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    // Ctrl-q toggles focus regardless of current focus.
                     app.toggle_focus();
                 } else {
                     match app.focus {
-                        Focus::Tree => match map_key(key) {
-                            Action::Quit => break Ok(()),
-                            Action::Up => app.up(),
-                            Action::Down => app.down(),
-                            Action::Activate => {
-                                let _ = app.activate();
+                        Focus::Tree => {
+                            if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('?')) {
+                                app.show_help = true;
+                            } else {
+                                match map_key(key) {
+                                    Action::Quit => break Ok(()),
+                                    Action::Up => app.up(),
+                                    Action::Down => app.down(),
+                                    Action::Activate => {
+                                        let _ = app.activate();
+                                    }
+                                    Action::OpenSession => {
+                                        let _ = app.open_session();
+                                    }
+                                    Action::Kill => {
+                                        let _ = app.kill_selected();
+                                    }
+                                    Action::Noop => {}
+                                }
                             }
-                            Action::OpenSession => {
-                                let _ = app.open_session();
-                            }
-                            Action::Kill => {
-                                let _ = app.kill_selected();
-                            }
-                            Action::Noop => {}
-                        },
+                        }
                         Focus::Terminal => {
                             let _ = pty.write_input(&encode_key(key));
                         }
@@ -116,7 +130,12 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
                 }
             }
             Ok(Event::Mouse(m)) => {
-                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                if app.show_help {
+                    // Any click also dismisses the help popup.
+                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        app.show_help = false;
+                    }
+                } else if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                     match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree) {
                         PaneHit::Terminal => app.focus = Focus::Terminal,
                         PaneHit::Tree(hit) => {
