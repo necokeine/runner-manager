@@ -1,9 +1,10 @@
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -12,10 +13,12 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::app::{App, Focus};
 use crate::input::{map_key, Action};
+use crate::keys::encode_key;
+use crate::pty::Pty;
 use crate::tmux::{SystemRunner, Tmux};
-use crate::ui::{self, Hit, Layout, ListLayout};
+use crate::ui::{self, Hit, PaneHit};
 
 pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
     enable_raw_mode()?;
@@ -24,61 +27,101 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Spawn the embedded terminal: a tmux client attached to (or creating) the
+    // scratch session on the runner socket. Initial size is a placeholder; the
+    // first resize after the initial draw corrects it.
+    let pty_args = ["tmux", "-L", socket.as_str(), "new-session", "-A", "-s", "scratch"];
+    let pty = Pty::spawn(&pty_args, 24, 80);
+    let mut pty = match pty {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+            return Err(e);
+        }
+    };
+    let parser = pty.parser();
+
     let tmux = Tmux::new(socket, SystemRunner);
     let mut app = App::new(root, tmux, editor);
     let _ = app.sync_active();
 
-    // TODO(Task 6): wire up PTY and use the new Layout type
-    let _ = Layout { tree: ListLayout { origin_y: 0, button_col_start: 0, button_col_end: 0, row_count: 0 }, split_col: 0, term_area: ratatui::layout::Rect::default() };
-    let mut layout = ListLayout {
-        origin_y: 0,
-        button_col_start: 0,
-        button_col_end: 0,
-        row_count: 0,
-    };
+    let mut last_term_size: (u16, u16) = (0, 0);
 
     let result = loop {
-        if let Err(e) = terminal.draw(|f| {
-            // TODO(Task 6): pass Focus and PTY screen; placeholder keeps Task 5 ui tests green
-            let parser = tui_term::vt100::Parser::new(24, 80, 0);
-            let full = ui::render(f, f.area(), &app.rows, app.selected, &app.active, app.focus, parser.screen());
-            layout = ListLayout {
-                origin_y: full.tree.origin_y,
-                button_col_start: full.tree.button_col_start,
-                button_col_end: full.tree.button_col_end,
-                row_count: full.tree.row_count,
-            };
-        }) {
+        let mut captured: Option<ui::Layout> = None;
+        let draw_res = terminal.draw(|f| {
+            let guard = parser.read().unwrap();
+            captured = Some(ui::render(
+                f,
+                f.area(),
+                &app.rows,
+                app.selected,
+                &app.active,
+                app.focus,
+                guard.screen(),
+            ));
+        });
+        if let Err(e) = draw_res {
             break Err(e);
+        }
+        let layout = captured.expect("render returns a Layout");
+
+        // Resize the PTY to match the terminal pane's inner area.
+        let term_size = (layout.term_area.height, layout.term_area.width);
+        if term_size != last_term_size && term_size.0 > 0 && term_size.1 > 0 {
+            let _ = pty.resize(term_size.0, term_size.1);
+            last_term_size = term_size;
+        }
+
+        if !event::poll(Duration::from_millis(33)).unwrap_or(false) {
+            continue; // tick: redraw to reflect new PTY output
         }
 
         match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => match map_key(key) {
-                Action::Quit => break Ok(()),
-                Action::Up => app.up(),
-                Action::Down => app.down(),
-                Action::Activate => {
-                    let _ = app.activate();
-                }
-                Action::OpenSession => {
-                    let _ = app.open_session();
-                }
-                Action::Kill => {
-                    let _ = app.kill_selected();
-                }
-                Action::Noop => {}
-            },
-            Ok(Event::Mouse(m)) => {
-                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                    if let Some(hit) = ui::resolve_click(m.column, m.row, &layout) {
-                        match hit {
-                            Hit::Row(idx) => {
-                                app.selected = idx;
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                // Ctrl-q toggles focus regardless of current focus.
+                if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.toggle_focus();
+                } else {
+                    match app.focus {
+                        Focus::Tree => match map_key(key) {
+                            Action::Quit => break Ok(()),
+                            Action::Up => app.up(),
+                            Action::Down => app.down(),
+                            Action::Activate => {
                                 let _ = app.activate();
                             }
-                            Hit::Button(idx) => {
-                                app.selected = idx;
+                            Action::OpenSession => {
                                 let _ = app.open_session();
+                            }
+                            Action::Kill => {
+                                let _ = app.kill_selected();
+                            }
+                            Action::Noop => {}
+                        },
+                        Focus::Terminal => {
+                            let _ = pty.write_input(&encode_key(key));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Mouse(m)) => {
+                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                    match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree) {
+                        PaneHit::Terminal => app.focus = Focus::Terminal,
+                        PaneHit::Tree(hit) => {
+                            app.focus = Focus::Tree;
+                            match hit {
+                                Some(Hit::Row(idx)) => {
+                                    app.selected = idx;
+                                    let _ = app.activate();
+                                }
+                                Some(Hit::Button(idx)) => {
+                                    app.selected = idx;
+                                    let _ = app.open_session();
+                                }
+                                None => {}
                             }
                         }
                     }
