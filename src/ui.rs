@@ -366,6 +366,63 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_nav_past_first_page_does_not_pin_cursor_to_bottom() {
+        // Regression for the reported bug: once the selection moved past the
+        // first page, the cursor stayed glued to the bottom row. That happened
+        // because the offset was recomputed from zero every frame; with a
+        // tracked tree_offset, scrolling down then stepping back up moves the
+        // cursor within the viewport instead of re-pinning it to the bottom.
+        use crate::app::App;
+        use crate::rows::{Row, RowKind};
+        use crate::tmux::{MockRunner, Tmux};
+        use crate::viewer::FileView;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::{Path, PathBuf};
+
+        let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+        app.rows = (0..30)
+            .map(|i| Row {
+                path: PathBuf::from("/"),
+                label: format!("f{i}"),
+                depth: 0,
+                kind: RowKind::File,
+            })
+            .collect();
+        app.viewer = Some(FileView::load(Path::new("/nonexistent")));
+
+        // 40x10 -> tree inner height is 8 rows after the border.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let view_h = 8usize;
+        let draw = |app: &mut App<MockRunner>, t: &mut Terminal<TestBackend>| {
+            t.draw(|f| {
+                render(f, f.area(), app, None);
+            })
+            .unwrap();
+        };
+
+        // Jump well past the first page and render: the cursor lands on the
+        // bottom visible row (offset nudged so the selection stays in view).
+        app.selected = 25;
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.tree_offset, 25 + 1 - view_h);
+        assert_eq!(app.selected - app.tree_offset, view_h - 1);
+
+        // Step the cursor up; the tracked offset must stay put so the cursor
+        // moves up *within* the viewport rather than snapping back to the bottom.
+        for _ in 0..4 {
+            app.up();
+        }
+        draw(&mut app, &mut terminal);
+        assert_eq!(app.tree_offset, 25 + 1 - view_h, "offset should not jump");
+        assert_eq!(app.selected, 21);
+        assert!(
+            app.selected - app.tree_offset < view_h - 1,
+            "cursor should be in the viewport interior, not pinned to the bottom"
+        );
+    }
+
+    #[test]
     fn render_chooser_draws_radios_and_buttons() {
         use crate::app::ChooserRow;
         use crate::session::{ClaudePerm, SessionKind};
