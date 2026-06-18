@@ -55,6 +55,10 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
 
+    // When a session's shell exits, destroy that session and switch the embedded
+    // client to the most recently active remaining one (instead of detaching).
+    let _ = app.tmux.set_global_option("detach-on-destroy", "off");
+
     let mut last_term_size: (u16, u16) = (0, 0);
 
     let result = loop {

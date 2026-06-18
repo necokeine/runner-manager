@@ -89,6 +89,11 @@ impl<R: CommandRunner> Tmux<R> {
         self.run(&["kill-session", "-t", slug])?;
         Ok(())
     }
+
+    pub fn set_global_option(&self, name: &str, value: &str) -> io::Result<()> {
+        self.run(&["set", "-g", name, value])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +149,18 @@ mod tests {
         assert_eq!(
             tmux.runner.nth_call(0),
             vec!["-L", "runner", "has-session", "-t", "src"]
+        );
+    }
+
+    #[test]
+    fn set_global_option_builds_set_g() {
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        tmux.set_global_option("detach-on-destroy", "off").unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "set", "-g", "detach-on-destroy", "off"]
         );
     }
 
