@@ -11,6 +11,5 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let root = env::current_dir()?;
-    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    run::run(root, "runner".to_string(), editor)
+    run::run(root, "runner".to_string())
 }

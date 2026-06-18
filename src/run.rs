@@ -19,7 +19,7 @@ use crate::pty::Pty;
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui::{self, Hit, PaneHit};
 
-pub fn run(root: PathBuf, socket: String, _editor: String) -> io::Result<()> {
+pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

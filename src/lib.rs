@@ -2,7 +2,6 @@ pub mod pty;
 pub mod tmux;
 pub mod session;
 pub mod tree;
-pub mod input;
 pub mod keys;
 pub mod ui;
 pub mod app;
