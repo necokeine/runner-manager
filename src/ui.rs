@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
@@ -154,6 +154,50 @@ pub fn render(
     }
 }
 
+/// A `Rect` centered within `area`, sized to the given percentages of it.
+pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = RtLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = RtLayout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+/// Overlay a centered popup listing the tree-pane keybindings. Clears the
+/// area underneath so it floats over the two-pane layout.
+pub fn render_help(f: &mut Frame, area: Rect) {
+    let lines = [
+        "j / ↓      move down",
+        "k / ↑      move up",
+        "Enter      expand·collapse dir / open file",
+        "a          open / switch dir session",
+        "x          kill dir session",
+        "h / ?      this help",
+        "Ctrl-q     toggle focus (tree / terminal)",
+        "q          quit",
+        "click      focus pane · select / act",
+        "",
+        "— press any key to close —",
+    ];
+    let popup = centered_rect(60, 70, area);
+    let block = Block::default().title("Tree keys").borders(Borders::ALL);
+    let para = Paragraph::new(lines.join("\n")).block(block);
+    f.render_widget(Clear, popup);
+    f.render_widget(para, popup);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +276,28 @@ mod tests {
         };
         assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Terminal);
         assert_eq!(resolve_pane_click(70, 4, 50, &layout), PaneHit::Terminal);
+    }
+
+    #[test]
+    fn centered_rect_is_centered_and_sized() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 100 };
+        let r = centered_rect(50, 50, area);
+        assert_eq!(r, Rect { x: 25, y: 25, width: 50, height: 50 });
+    }
+
+    #[test]
+    fn render_help_draws_keys_and_title() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_help(f, f.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Tree keys"));
+        assert!(content.contains("quit"));
+        assert!(content.contains("this help"));
     }
 }

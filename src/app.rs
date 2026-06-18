@@ -25,6 +25,7 @@ pub struct App<R: CommandRunner> {
     pub status: String,
     pub should_quit: bool,
     pub focus: Focus,
+    pub show_help: bool,
 }
 
 fn shell_quote(s: &str) -> String {
@@ -48,6 +49,7 @@ impl<R: CommandRunner> App<R> {
             status: String::new(),
             should_quit: false,
             focus: Focus::Tree,
+            show_help: false,
         }
     }
 
