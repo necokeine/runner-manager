@@ -36,6 +36,31 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Tree,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneHit {
+    Tree(Option<Hit>),
+    Terminal,
+}
+
+pub fn resolve_pane_click(
+    col: u16,
+    row: u16,
+    split_col: u16,
+    tree_layout: &ListLayout,
+) -> PaneHit {
+    if col >= split_col {
+        PaneHit::Terminal
+    } else {
+        PaneHit::Tree(resolve_click(col, row, tree_layout))
+    }
+}
+
 pub fn render(
     f: &mut Frame,
     area: Rect,
@@ -126,5 +151,39 @@ mod tests {
         let content: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(content.contains("src"));
         assert!(content.contains("[+]"));
+    }
+
+    #[test]
+    fn pane_click_left_of_split_resolves_tree() {
+        let layout = ListLayout {
+            origin_y: 1,
+            button_col_start: 38,
+            button_col_end: 40,
+            row_count: 3,
+        };
+        // split at col 50; a click at col 5 row 2 is in the tree on row 1
+        assert_eq!(
+            resolve_pane_click(5, 2, 50, &layout),
+            PaneHit::Tree(Some(Hit::Row(1)))
+        );
+        // a click on the [+] button column within the tree
+        assert_eq!(
+            resolve_pane_click(39, 1, 50, &layout),
+            PaneHit::Tree(Some(Hit::Button(0)))
+        );
+        // a tree-region click below the rows resolves to Tree(None)
+        assert_eq!(resolve_pane_click(5, 20, 50, &layout), PaneHit::Tree(None));
+    }
+
+    #[test]
+    fn pane_click_at_or_after_split_is_terminal() {
+        let layout = ListLayout {
+            origin_y: 1,
+            button_col_start: 38,
+            button_col_end: 40,
+            row_count: 3,
+        };
+        assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Terminal);
+        assert_eq!(resolve_pane_click(70, 4, 50, &layout), PaneHit::Terminal);
     }
 }
