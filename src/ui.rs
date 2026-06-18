@@ -135,7 +135,12 @@ pub fn render<R: CommandRunner>(
 
     // Scrollbar on the right border, only when the content overflows.
     if total > view_h {
-        let mut sb_state = ScrollbarState::new(total)
+        // ratatui places the thumb at the bottom of the track when
+        // `position == content_length - 1`. Our scroll range is `[0, max_off]`
+        // with `max_off = total - view_h`, so content_length must be the number
+        // of distinct scroll positions (`max_off + 1`) for the thumb to reach
+        // the end. `viewport_content_length` still sizes the thumb as view_h/total.
+        let mut sb_state = ScrollbarState::new(max_off + 1)
             .viewport_content_length(view_h)
             .position(app.tree_offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -363,6 +368,64 @@ mod tests {
         assert!(has_thumb(make_rows(40)));
         // 3 rows fit -> no scrollbar.
         assert!(!has_thumb(make_rows(3)));
+    }
+
+    #[test]
+    fn scrollbar_thumb_reaches_ends() {
+        use crate::app::App;
+        use crate::rows::{Row, RowKind};
+        use crate::tmux::{MockRunner, Tmux};
+        use crate::viewer::FileView;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::{Path, PathBuf};
+
+        let rows: Vec<Row> = (0..40)
+            .map(|i| Row {
+                path: PathBuf::from("/"),
+                label: format!("f{i}"),
+                depth: 0,
+                kind: RowKind::File,
+            })
+            .collect();
+
+        // Render at a given scroll offset and return the inclusive (min_y, max_y)
+        // of the scrollbar thumb cells.
+        let thumb_span = |offset: usize, selected: usize| -> (u16, u16) {
+            let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+            app.rows = rows.clone();
+            app.viewer = Some(FileView::load(Path::new("/nonexistent")));
+            app.tree_offset = offset;
+            app.selected = selected;
+            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            terminal
+                .draw(|f| {
+                    render(f, f.area(), &mut app, None);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let mut min_y = u16::MAX;
+            let mut max_y = 0u16;
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].symbol() == "█" {
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+            (min_y, max_y)
+        };
+
+        // The track lives inside a 1-cell vertical margin of the 10-row pane,
+        // so it spans rows 1..=8.
+        let (top_min, _) = thumb_span(0, 0);
+        assert_eq!(top_min, 1, "at the top the thumb should touch the first track cell");
+
+        // Scrolled to the bottom (max_off = 40 - 8 = 32), the thumb must reach
+        // the last track cell (row 8).
+        let (_, bot_max) = thumb_span(32, 39);
+        assert_eq!(bot_max, 8, "at the bottom the thumb should touch the last track cell");
     }
 
     #[test]
