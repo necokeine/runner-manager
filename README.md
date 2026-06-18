@@ -9,12 +9,13 @@ multiple tmux sessions (shell or claude), shown as rows under it.
 - Runs directly in your terminal (NOT inside tmux); draws a fixed two-pane
   layout on the alternate screen.
 - `a` (or clicking the `[+]` next to a directory name) opens a chooser to start
-  a **shell** or **claude** session in that directory, on the `tmux -L runner`
-  server. Sessions appear as rows under the directory (prefixed `$` for shell,
-  `✦` for claude) and disappear when their shell exits.
+  a **shell** or **claude** session in that directory, on a project-local
+  `pjma.sock` tmux server (`tmux -S <root>/pjma.sock`). Sessions appear as rows
+  under the directory (prefixed `$` for shell, `✦` for claude) and disappear when
+  their shell exits.
 - Quitting the tool does **not** close your tmux sessions — they keep running on
-  the `-L runner` socket. Reopen runner-manager and they are listed again under
-  their directories.
+  the `<root>/pjma.sock` socket. Reopen runner-manager and they are listed again
+  under their directories.
 - Selecting a session row shows it in the right pane (embedded terminal).
   Selecting a file shows it in a read-only viewer in the right pane.
 

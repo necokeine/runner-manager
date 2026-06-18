@@ -278,7 +278,7 @@ pub fn render<R: CommandRunner>(
         f.render_widget(para, right_area);
     } else {
         let block = Block::default()
-            .title("terminal")
+            .title(app.terminal_title())
             .borders(Borders::ALL)
             .border_style(border_style(right_focused));
         f.render_widget(block, right_area);

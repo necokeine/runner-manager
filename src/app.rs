@@ -71,6 +71,10 @@ pub struct App<R: CommandRunner> {
     /// terminal PTY died after all sessions exited). The run loop respawns the
     /// PTY attached to this slug so the right pane shows the new session.
     pub pending_respawn: Option<String>,
+    /// Slug of the session the embedded terminal client is currently showing.
+    /// Set when switching/recovering and reconciled against tmux in `sync`;
+    /// used to label the terminal pane with that session's directory.
+    pub current_session: Option<String>,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -91,6 +95,7 @@ impl<R: CommandRunner> App<R> {
             split_pct: DEFAULT_SPLIT,
             tree_offset: 0,
             pending_respawn: None,
+            current_session: None,
         };
         app.rebuild_rows();
         app
@@ -259,6 +264,10 @@ impl<R: CommandRunner> App<R> {
 
     fn switch_to(&mut self, slug: &str) -> io::Result<()> {
         self.viewer = None;
+        // The embedded client is about to show this session (either via
+        // switch-client below or after a respawn), so it becomes the one the
+        // terminal pane is labelled with.
+        self.current_session = Some(slug.to_string());
         // Selecting a session means the user wants to work in it, so hand
         // keyboard focus to the terminal pane right away (bug: focus used to
         // stay on the tree after picking a session).
@@ -305,8 +314,33 @@ impl<R: CommandRunner> App<R> {
         self.store.adopt(&adoptable);
         let live: HashSet<String> = infos.into_iter().map(|i| i.name).collect();
         self.store.sync(&live);
+        // Track which session the embedded client actually shows. It can change
+        // without a `switch_to` — when the viewed session's shell exits,
+        // `detach-on-destroy off` switches the client to another session — so
+        // querying tmux keeps the terminal title honest. Keep the last known
+        // slug when no client is attached (e.g. during a respawn window).
+        if let Some(slug) = self.tmux.client_session()? {
+            self.current_session = Some(slug);
+        }
         self.rebuild_rows();
         Ok(())
+    }
+
+    /// Title for the terminal pane: the literal "terminal" plus the directory
+    /// of the session the embedded client is showing, relative to the tree root
+    /// (e.g. "terminal — foo/bar" for a session opened on `<root>/foo/bar`).
+    /// Falls back to plain "terminal" when no session is shown, the session is
+    /// rooted at the tree root, or its directory isn't tracked.
+    pub fn terminal_title(&self) -> String {
+        let rel = self
+            .current_session
+            .as_deref()
+            .and_then(|slug| self.store.dir_of(slug))
+            .map(|dir| dir.strip_prefix(&self.root).unwrap_or(dir).to_string_lossy().into_owned());
+        match rel {
+            Some(rel) if !rel.is_empty() && rel != "." => format!("terminal — {rel}"),
+            _ => "terminal".to_string(),
+        }
     }
 
     pub fn toggle_focus(&mut self) {
@@ -713,6 +747,56 @@ mod tests {
         app.selected = file_idx;
         app.activate().unwrap(); // open file in viewer
         assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn terminal_title_shows_session_dir_relative_to_root() {
+        let (_d, mut app) = app_over_tempdir();
+        // Nothing shown yet -> plain title.
+        assert_eq!(app.terminal_title(), "terminal");
+        // Create a shell session under src/ -> title carries the relative dir.
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        assert_eq!(app.terminal_title(), "terminal — src");
+    }
+
+    #[test]
+    fn terminal_title_is_plain_for_a_root_session() {
+        // A session opened on the tree root has an empty relative path, so the
+        // title stays the bare "terminal".
+        let (_d, mut app) = app_over_tempdir();
+        app.selected = 0; // root dir row
+        app.open_chooser();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        assert_eq!(app.terminal_title(), "terminal");
+    }
+
+    #[test]
+    fn sync_updates_current_session_from_client() {
+        // The embedded client can switch sessions on its own (a viewed shell
+        // exits -> detach-on-destroy off moves it elsewhere); sync must adopt
+        // the client's real session so the title follows.
+        let (_d, mut app) = app_over_tempdir();
+        let root = app.root.to_str().unwrap().to_string();
+        // list-sessions-full adopts a session under src/, then client_session
+        // reports the client is attached to it.
+        app.tmux.runner.push(true, &format!("src-shell\tshell {root}/src\n"));
+        app.tmux.runner.push(true, "src-shell\n"); // list-clients (client_session)
+        app.sync().unwrap();
+        assert_eq!(app.current_session.as_deref(), Some("src-shell"));
+        assert_eq!(app.terminal_title(), "terminal — src");
     }
 
     #[test]

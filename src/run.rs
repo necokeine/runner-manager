@@ -35,10 +35,13 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // empty until the first session is created, at which point the run loop
     // attaches to it via `pending_respawn`.
     let latest = app.tmux.latest_session().ok().flatten();
+    // Label the terminal pane with the recovered session from the first frame;
+    // `sync` later reconciles this against the client's real session.
+    app.current_session = latest.clone();
     let mut pty: Option<Pty> = None;
     let mut parser: Option<ParserHandle> = None;
     if let Some(name) = &latest {
-        let args = ["tmux", "-L", socket.as_str(), "new-session", "-A", "-s", name.as_str()];
+        let args = ["tmux", "-S", socket.as_str(), "new-session", "-A", "-s", name.as_str()];
         match Pty::spawn(&args, 24, 80) {
             Ok(p) => {
                 parser = Some(p.parser());
@@ -271,7 +274,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         if let Some(slug) = app.pending_respawn.take() {
             let needs_spawn = pty.as_ref().is_none_or(|p| !p.is_alive());
             if needs_spawn {
-                let args = ["tmux", "-L", socket.as_str(), "new-session", "-A", "-s", slug.as_str()];
+                let args = ["tmux", "-S", socket.as_str(), "new-session", "-A", "-s", slug.as_str()];
                 if let Ok(p) = Pty::spawn(&args, 24, 80) {
                     parser = Some(p.parser());
                     pty = Some(p);
