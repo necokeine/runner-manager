@@ -1,7 +1,10 @@
-use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
@@ -16,6 +19,10 @@ pub struct ListLayout {
     pub button_col_start: u16,
     pub button_col_end: u16,
     pub row_count: usize,
+    /// First row index shown (scroll offset) and the visible row count. Needed
+    /// to map a screen row back to its absolute row index when the tree scrolls.
+    pub offset: usize,
+    pub view_h: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +47,11 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
     if row < layout.origin_y {
         return None;
     }
-    let idx = (row - layout.origin_y) as usize;
+    let visible = (row - layout.origin_y) as usize;
+    if visible >= layout.view_h as usize {
+        return None;
+    }
+    let idx = layout.offset + visible;
     if idx >= layout.row_count {
         return None;
     }
@@ -85,7 +96,7 @@ fn row_line(row: &Row, width: usize) -> String {
 pub fn render<R: CommandRunner>(
     f: &mut Frame,
     area: Rect,
-    app: &App<R>,
+    app: &mut App<R>,
     screen: Option<&vt100::Screen>,
 ) -> Layout {
     let chunks = RtLayout::default()
@@ -107,19 +118,43 @@ pub fn render<R: CommandRunner>(
     f.render_widget(tree_block, tree_area);
 
     let width = inner.width as usize;
+    let view_h = inner.height as usize;
+    let total = app.rows.len();
     let items: Vec<ListItem> = app.rows.iter().map(|r| ListItem::new(row_line(r, width))).collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    if !app.rows.is_empty() {
-        state.select(Some(app.selected.min(app.rows.len() - 1)));
+    if total > 0 {
+        state.select(Some(app.selected.min(total - 1)));
     }
+    // Start from the tracked scroll offset (clamped); the List may nudge it to
+    // keep the selection visible, so read the final value back afterwards.
+    let max_off = total.saturating_sub(view_h);
+    *state.offset_mut() = app.tree_offset.min(max_off);
     f.render_stateful_widget(list, inner, &mut state);
+    app.tree_offset = state.offset();
+
+    // Scrollbar on the right border, only when the content overflows.
+    if total > view_h {
+        let mut sb_state = ScrollbarState::new(total)
+            .viewport_content_length(view_h)
+            .position(app.tree_offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        f.render_stateful_widget(
+            scrollbar,
+            tree_area.inner(Margin { vertical: 1, horizontal: 0 }),
+            &mut sb_state,
+        );
+    }
 
     let tree_layout = ListLayout {
         origin_y: inner.y,
         button_col_start: inner.x + inner.width.saturating_sub(3),
         button_col_end: inner.x + inner.width.saturating_sub(1),
-        row_count: app.rows.len(),
+        row_count: total,
+        offset: app.tree_offset,
+        view_h: inner.height,
     };
 
     // ---- right: terminal or viewer ----
@@ -183,6 +218,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "k / ↑      move up",
         "Enter      expand dir / switch session / view file",
         "a / [+]    new session (shell or claude) on a dir",
+        "wheel      scroll the tree (scrollbar shows when needed)",
         "h / ?      this help",
         "Ctrl-q     toggle focus (tree / right pane)",
         "q          quit",
@@ -259,7 +295,7 @@ mod tests {
 
     #[test]
     fn resolve_click_distinguishes_row_and_button() {
-        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 3 };
+        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 3, offset: 0, view_h: 10 };
         assert_eq!(resolve_click(5, 1, &layout), Some(Hit::Row(0)));
         assert_eq!(resolve_click(21, 2, &layout), Some(Hit::Button(1)));
         assert_eq!(resolve_click(5, 0, &layout), None);
@@ -267,8 +303,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_click_accounts_for_scroll_offset() {
+        // Scrolled down by 5 rows: the top visible screen row maps to row index 5.
+        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 30, offset: 5, view_h: 8 };
+        assert_eq!(resolve_click(5, 1, &layout), Some(Hit::Row(5)));
+        assert_eq!(resolve_click(21, 1, &layout), Some(Hit::Button(5)));
+        // a click past the visible window height is ignored
+        assert_eq!(resolve_click(5, 1 + 8, &layout), None);
+    }
+
+    #[test]
     fn resolve_pane_click_splits_on_column() {
-        let layout = ListLayout { origin_y: 1, button_col_start: 38, button_col_end: 40, row_count: 3 };
+        let layout = ListLayout { origin_y: 1, button_col_start: 38, button_col_end: 40, row_count: 3, offset: 0, view_h: 10 };
         assert_eq!(resolve_pane_click(5, 2, 50, &layout), PaneHit::Tree(Some(Hit::Row(1))));
         assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Right);
     }
@@ -277,6 +323,46 @@ mod tests {
     fn centered_rect_is_centered() {
         let area = Rect { x: 0, y: 0, width: 100, height: 100 };
         assert_eq!(centered_rect(50, 50, area), Rect { x: 25, y: 25, width: 50, height: 50 });
+    }
+
+    #[test]
+    fn scrollbar_appears_only_when_tree_overflows() {
+        use crate::app::App;
+        use crate::rows::{Row, RowKind};
+        use crate::tmux::{MockRunner, Tmux};
+        use crate::viewer::FileView;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::{Path, PathBuf};
+
+        let make_rows = |n: usize| -> Vec<Row> {
+            (0..n)
+                .map(|i| Row {
+                    path: PathBuf::from("/"),
+                    label: format!("f{i}"),
+                    depth: 0,
+                    kind: RowKind::File,
+                })
+                .collect()
+        };
+        // viewer Some lets render skip the embedded terminal screen.
+        let has_thumb = |rows: Vec<Row>| -> bool {
+            let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+            app.rows = rows;
+            app.viewer = Some(FileView::load(Path::new("/nonexistent")));
+            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            terminal
+                .draw(|f| {
+                    render(f, f.area(), &mut app, None);
+                })
+                .unwrap();
+            let content: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            content.contains('█')
+        };
+        // 40 rows in an 8-row viewport -> scrollbar thumb visible.
+        assert!(has_thumb(make_rows(40)));
+        // 3 rows fit -> no scrollbar.
+        assert!(!has_thumb(make_rows(3)));
     }
 
     #[test]

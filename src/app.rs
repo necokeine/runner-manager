@@ -64,6 +64,13 @@ pub struct App<R: CommandRunner> {
     pub popup: Popup,
     pub status: String,
     pub split_pct: u16,
+    /// Index of the first tree row shown (scroll position). Reconciled against
+    /// the real viewport height in `ui::render`; driven by the mouse wheel.
+    pub tree_offset: usize,
+    /// Set to a session slug when a switch found no live embedded client (the
+    /// terminal PTY died after all sessions exited). The run loop respawns the
+    /// PTY attached to this slug so the right pane shows the new session.
+    pub pending_respawn: Option<String>,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -82,6 +89,8 @@ impl<R: CommandRunner> App<R> {
             popup: Popup::None,
             status: String::new(),
             split_pct: DEFAULT_SPLIT,
+            tree_offset: 0,
+            pending_respawn: None,
         };
         app.rebuild_rows();
         app
@@ -252,7 +261,11 @@ impl<R: CommandRunner> App<R> {
             self.tmux.switch_client(&tty, slug)?;
             self.status = format!("switched to {slug}");
         } else {
-            self.status = "no host client to switch".to_string();
+            // No client attached means the embedded terminal PTY exited after
+            // the last session was destroyed. Ask the run loop to respawn it
+            // attached to this session so the right pane fills again.
+            self.pending_respawn = Some(slug.to_string());
+            self.status = "reopening terminal".to_string();
         }
         Ok(())
     }
@@ -285,6 +298,21 @@ impl<R: CommandRunner> App<R> {
             Focus::Tree => Focus::Right,
             Focus::Right => Focus::Tree,
         };
+    }
+
+    /// Scroll the tree by `delta` rows within `view_h` visible rows. Keeps the
+    /// selection inside the new visible window so the List widget does not snap
+    /// the offset back to the selection on the next render.
+    pub fn scroll_tree(&mut self, delta: i32, view_h: usize) {
+        if self.rows.is_empty() || view_h == 0 {
+            return;
+        }
+        let max_off = self.rows.len().saturating_sub(view_h);
+        let new_off = (self.tree_offset as i32 + delta).clamp(0, max_off as i32) as usize;
+        self.tree_offset = new_off;
+        let last = self.rows.len() - 1;
+        let bottom = (new_off + view_h - 1).min(last);
+        self.selected = self.selected.clamp(new_off, bottom);
     }
 
     pub fn widen_split(&mut self) {
@@ -417,6 +445,42 @@ mod tests {
     }
 
     #[test]
+    fn scroll_tree_clamps_and_drags_selection_into_view() {
+        let (_d, mut app) = app_over_tempdir();
+        // 20 synthetic rows so content overflows a small viewport.
+        app.rows = (0..20)
+            .map(|i| Row {
+                path: app.root.clone(),
+                label: format!("f{i}"),
+                depth: 0,
+                kind: RowKind::File,
+            })
+            .collect();
+        app.selected = 0;
+        let view_h = 5;
+        assert_eq!(app.tree_offset, 0);
+        // scroll down past the selection: selection is dragged to the new top
+        app.scroll_tree(3, view_h);
+        assert_eq!(app.tree_offset, 3);
+        assert!(app.selected >= 3 && app.selected < 3 + view_h);
+        // can't scroll below the last full page
+        app.scroll_tree(1000, view_h);
+        assert_eq!(app.tree_offset, app.rows.len() - view_h);
+        // can't scroll above the top
+        app.scroll_tree(-1000, view_h);
+        assert_eq!(app.tree_offset, 0);
+        assert!(app.selected < view_h);
+    }
+
+    #[test]
+    fn scroll_tree_noop_when_content_fits() {
+        let (_d, mut app) = app_over_tempdir();
+        let big_view = 100; // far taller than the few rows
+        app.scroll_tree(5, big_view);
+        assert_eq!(app.tree_offset, 0);
+    }
+
+    #[test]
     fn col_to_split_pct_clamps_and_is_safe() {
         assert_eq!(col_to_split_pct(50, 100), 50);
         assert_eq!(col_to_split_pct(0, 100), 15); // clamp low
@@ -537,6 +601,34 @@ mod tests {
         assert_eq!(call[2], "new-session");
         assert!(call.contains(&"claude --dangerously-skip-permissions".to_string()));
         assert_eq!(app.popup, Popup::None);
+    }
+
+    #[test]
+    fn create_session_without_host_client_requests_respawn() {
+        // Simulates "all sessions quit -> embedded client dead": list-clients
+        // returns nothing, so switch_to finds no client and asks the run loop
+        // to respawn the terminal PTY attached to the new session.
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // list-clients -> empty (no host client)
+        app.chooser_activate().unwrap();
+        assert_eq!(app.pending_respawn.as_deref(), Some("src-shell"));
+        assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
+        assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
+    }
+
+    #[test]
+    fn switch_with_host_client_does_not_request_respawn() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients -> a client
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        assert_eq!(app.pending_respawn, None);
     }
 
     #[test]

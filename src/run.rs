@@ -35,9 +35,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             return Err(e);
         }
     };
-    let parser = pty.parser();
+    let mut parser = pty.parser();
 
-    let tmux = Tmux::new(socket, SystemRunner);
+    let tmux = Tmux::new(socket.clone(), SystemRunner);
     let mut app = App::new(root, tmux);
 
     for _ in 0..20 {
@@ -65,7 +65,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 None
             };
             let screen = screen_guard.as_ref().map(|g| g.screen());
-            captured = Some(ui::render(f, f.area(), &app, screen));
+            captured = Some(ui::render(f, f.area(), &mut app, screen));
             drop(screen_guard);
             match &app.popup {
                 Popup::Help => ui::render_help(f, f.area()),
@@ -207,10 +207,45 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 MouseEventKind::Up(MouseButton::Left) => {
                     dragging_split = false;
                 }
+                MouseEventKind::ScrollDown => {
+                    if matches!(app.popup, Popup::None) {
+                        if m.column < layout.split_col {
+                            app.scroll_tree(3, layout.tree.view_h as usize);
+                        } else if let Some(v) = &mut app.viewer {
+                            v.scroll_down(3);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if matches!(app.popup, Popup::None) {
+                        if m.column < layout.split_col {
+                            app.scroll_tree(-3, layout.tree.view_h as usize);
+                        } else if let Some(v) = &mut app.viewer {
+                            v.scroll_up(3);
+                        }
+                    }
+                }
                 _ => {}
             },
             Ok(_) => {}
             Err(e) => break Err(e),
+        }
+
+        // The embedded terminal PTY dies when the last tmux session exits. If a
+        // new session was just created with no client to switch into, respawn
+        // the PTY attached to it so the right pane fills with the new session.
+        if let Some(slug) = app.pending_respawn.take() {
+            if !pty.is_alive() {
+                let args = ["tmux", "-L", socket.as_str(), "new-session", "-A", "-s", slug.as_str()];
+                if let Ok(p) = Pty::spawn(&args, 24, 80) {
+                    pty = p;
+                    parser = pty.parser();
+                    last_term_size = (0, 0); // force a resize so the session fills the pane
+                    // A brand-new tmux server lost the global option; re-apply it.
+                    let _ = app.tmux.set_global_option("detach-on-destroy", "off");
+                    app.status = format!("reopened terminal for {slug}");
+                }
+            }
         }
     };
 
