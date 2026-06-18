@@ -79,11 +79,11 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
         }
     };
 
-    disable_raw_mode()?;
-    execute!(
+    let restore_raw = disable_raw_mode();
+    let restore_screen = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    result
+    );
+    result.and(restore_raw).and(restore_screen)
 }
