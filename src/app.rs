@@ -8,6 +8,21 @@ use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::Tree;
 use crate::viewer::FileView;
 
+const MIN_SPLIT: u16 = 15;
+const MAX_SPLIT: u16 = 80;
+const SPLIT_STEP: u16 = 5;
+const DEFAULT_SPLIT: u16 = 35;
+
+/// Convert a cursor column to a clamped tree-width percent. Zero width
+/// returns the default (avoids divide-by-zero during a drag on a 0-wide area).
+pub fn col_to_split_pct(col: u16, width: u16) -> u16 {
+    if width == 0 {
+        return DEFAULT_SPLIT;
+    }
+    let pct = (col as u32 * 100 / width as u32) as u16;
+    pct.clamp(MIN_SPLIT, MAX_SPLIT)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Tree,
@@ -36,6 +51,7 @@ pub struct App<R: CommandRunner> {
     pub focus: Focus,
     pub popup: Popup,
     pub status: String,
+    pub split_pct: u16,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -53,6 +69,7 @@ impl<R: CommandRunner> App<R> {
             focus: Focus::Tree,
             popup: Popup::None,
             status: String::new(),
+            split_pct: DEFAULT_SPLIT,
         };
         app.rebuild_rows();
         app
@@ -185,6 +202,14 @@ impl<R: CommandRunner> App<R> {
         };
     }
 
+    pub fn widen_split(&mut self) {
+        self.split_pct = (self.split_pct + SPLIT_STEP).min(MAX_SPLIT);
+    }
+
+    pub fn narrow_split(&mut self) {
+        self.split_pct = self.split_pct.saturating_sub(SPLIT_STEP).max(MIN_SPLIT);
+    }
+
     pub fn host_client_ready(&mut self) -> bool {
         matches!(self.tmux.host_tty(), Ok(Some(_)))
     }
@@ -271,6 +296,31 @@ mod tests {
         app.activate().unwrap();
         assert!(app.viewer.is_some());
         assert_eq!(app.tmux.runner.call_count(), 0);
+    }
+
+    #[test]
+    fn split_widen_and_narrow_clamp() {
+        let (_d, mut app) = app_over_tempdir();
+        assert_eq!(app.split_pct, 35);
+        app.widen_split(); // 40
+        app.narrow_split(); // 35
+        assert_eq!(app.split_pct, 35);
+        for _ in 0..30 {
+            app.widen_split();
+        }
+        assert_eq!(app.split_pct, 80); // clamped high
+        for _ in 0..30 {
+            app.narrow_split();
+        }
+        assert_eq!(app.split_pct, 15); // clamped low
+    }
+
+    #[test]
+    fn col_to_split_pct_clamps_and_is_safe() {
+        assert_eq!(col_to_split_pct(50, 100), 50);
+        assert_eq!(col_to_split_pct(0, 100), 15); // clamp low
+        assert_eq!(col_to_split_pct(99, 100), 80); // clamp high
+        assert_eq!(col_to_split_pct(10, 0), 35); // zero width -> default, no panic
     }
 
     #[test]

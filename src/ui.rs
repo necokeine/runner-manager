@@ -88,7 +88,10 @@ pub fn render<R: CommandRunner>(
 ) -> Layout {
     let chunks = RtLayout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([
+            Constraint::Percentage(app.split_pct),
+            Constraint::Percentage(100 - app.split_pct),
+        ])
         .split(area);
     let tree_area = chunks[0];
     let right_area = chunks[1];
