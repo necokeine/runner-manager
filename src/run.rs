@@ -29,6 +29,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let tmux = Tmux::new(socket.clone(), SystemRunner);
     let mut app = App::new(root, tmux);
 
+    // Create the project-local config dir (`<root>/.pjma`) up front: the tmux
+    // socket lives inside it, so it must exist before any tmux command runs.
+    let _ = app.config.ensure_dir();
+
     // Recovery: attach the embedded client to the session the user was last
     // active in rather than a throwaway scratch session. If no sessions exist
     // (fresh start, nothing to recover), spawn nothing — the right pane stays
@@ -79,6 +83,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         let _ = app.tmux.set_global_option("mouse", "on");
     }
     let _ = app.sync();
+    // Re-expand the directories the user had open last session.
+    app.restore_expanded();
 
     let mut last_term_size: (u16, u16) = (0, 0);
     let mut last_sync = Instant::now();

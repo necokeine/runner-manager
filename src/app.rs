@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::rows::{build_rows, Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
@@ -55,6 +56,7 @@ pub struct App<R: CommandRunner> {
     pub tree: Tree,
     pub store: SessionStore,
     pub tmux: Tmux<R>,
+    pub config: Config,
     pub root: PathBuf,
     pub selected: usize,
     pub rows: Vec<Row>,
@@ -80,10 +82,12 @@ pub struct App<R: CommandRunner> {
 impl<R: CommandRunner> App<R> {
     pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
+        let config = Config::new(root.clone());
         let mut app = Self {
             tree,
             store: SessionStore::new(),
             tmux,
+            config,
             root,
             selected: 0,
             rows: Vec::new(),
@@ -99,6 +103,20 @@ impl<R: CommandRunner> App<R> {
         };
         app.rebuild_rows();
         app
+    }
+
+    /// Re-expand the directories saved in the config dir from a previous run.
+    /// Called once at startup, after the tree is built.
+    pub fn restore_expanded(&mut self) {
+        let dirs = self.config.load_expanded();
+        self.tree.apply_expanded(&dirs);
+        self.rebuild_rows();
+    }
+
+    /// Persist the current set of expanded directories to the config dir.
+    /// Best-effort: a write failure leaves the tree usable, just not saved.
+    pub fn persist_expanded(&self) {
+        let _ = self.config.save_expanded(&self.tree.expanded_dirs());
     }
 
     pub fn rebuild_rows(&mut self) {
@@ -135,6 +153,7 @@ impl<R: CommandRunner> App<R> {
                     node.toggle();
                 }
                 self.rebuild_rows();
+                self.persist_expanded();
             }
             RowKind::Session { slug, .. } => {
                 self.switch_to(&slug)?;
@@ -397,6 +416,31 @@ mod tests {
         let tmux = Tmux::new("runner", MockRunner::new());
         let app = App::new(dir.path().to_path_buf(), tmux);
         (dir, app)
+    }
+
+    #[test]
+    fn expand_state_persists_across_app_instances() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src").join("a.rs"), "x").unwrap();
+        let root = dir.path().to_path_buf();
+
+        // First instance: expanding src/ persists to <root>/.pjma/expanded
+        // (activate calls persist_expanded).
+        {
+            let mut app = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+            let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+            app.selected = src_idx;
+            app.activate().unwrap();
+            assert!(app.rows.iter().any(|r| r.label == "a.rs"));
+        }
+
+        // A fresh instance over the same root starts collapsed, then restores
+        // the saved expand state on startup.
+        let mut app2 = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+        assert!(!app2.rows.iter().any(|r| r.label == "a.rs"));
+        app2.restore_expanded();
+        assert!(app2.rows.iter().any(|r| r.label == "a.rs"));
     }
 
     #[test]
