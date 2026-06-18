@@ -259,6 +259,10 @@ impl<R: CommandRunner> App<R> {
 
     fn switch_to(&mut self, slug: &str) -> io::Result<()> {
         self.viewer = None;
+        // Selecting a session means the user wants to work in it, so hand
+        // keyboard focus to the terminal pane right away (bug: focus used to
+        // stay on the tree after picking a session).
+        self.focus = Focus::Right;
         if let Some(tty) = self.ensure_host_tty()? {
             self.tmux.switch_client(&tty, slug)?;
             self.status = format!("switched to {slug}");
@@ -669,6 +673,46 @@ mod tests {
         app.tmux.runner.push(true, ""); // switch-client
         app.chooser_activate().unwrap();
         assert_eq!(app.pending_respawn, None);
+    }
+
+    #[test]
+    fn activating_a_session_row_moves_focus_to_terminal() {
+        // Bug: after selecting a session in the tree, focus must jump to the
+        // right (terminal) pane so the user can type into it immediately.
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        app.focus = Focus::Tree;
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+        app.selected = sess_idx;
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.activate().unwrap();
+        assert_eq!(app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn activating_a_dir_or_file_keeps_focus_on_tree() {
+        // Focus only moves for sessions; expanding a dir or opening a file must
+        // leave focus on the tree so the user can keep navigating.
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.activate().unwrap(); // expand dir
+        assert_eq!(app.focus, Focus::Tree);
+        let file_idx = app.rows.iter().position(|r| r.label == "a.rs").unwrap();
+        app.selected = file_idx;
+        app.activate().unwrap(); // open file in viewer
+        assert_eq!(app.focus, Focus::Tree);
     }
 
     #[test]
