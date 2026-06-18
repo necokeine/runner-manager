@@ -8,6 +8,7 @@ pub mod ui;
 pub mod app;
 pub mod run;
 pub mod viewer;
+pub mod rows;
 
 #[cfg(test)]
 mod tests {
