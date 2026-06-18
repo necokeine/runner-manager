@@ -2,59 +2,64 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::session::SessionRegistry;
+use crate::rows::{build_rows, Row, RowKind};
+use crate::session::{SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
-use crate::tree::{Row, Tree};
+use crate::tree::Tree;
+use crate::viewer::FileView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Tree,
-    Terminal,
+    Right,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Popup {
+    None,
+    Help,
+    Chooser { dir: PathBuf, selected: usize },
+}
+
+/// The kinds offered by the chooser, in display order.
+pub const CHOOSER_KINDS: [SessionKind; 2] = [SessionKind::Shell, SessionKind::Claude];
 
 pub struct App<R: CommandRunner> {
     pub tree: Tree,
-    pub registry: SessionRegistry,
+    pub store: SessionStore,
     pub tmux: Tmux<R>,
     pub root: PathBuf,
     pub selected: usize,
     pub rows: Vec<Row>,
-    pub active: HashSet<PathBuf>,
     pub host_tty: Option<String>,
-    pub editor: String,
-    pub status: String,
-    pub should_quit: bool,
+    pub viewer: Option<FileView>,
     pub focus: Focus,
-    pub show_help: bool,
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    pub popup: Popup,
+    pub status: String,
 }
 
 impl<R: CommandRunner> App<R> {
-    pub fn new(root: PathBuf, tmux: Tmux<R>, editor: String) -> Self {
+    pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
-        let rows = tree.visible_rows();
-        Self {
+        let mut app = Self {
             tree,
-            registry: SessionRegistry::new(),
+            store: SessionStore::new(),
             tmux,
             root,
             selected: 0,
-            rows,
-            active: HashSet::new(),
+            rows: Vec::new(),
             host_tty: None,
-            editor,
-            status: String::new(),
-            should_quit: false,
+            viewer: None,
             focus: Focus::Tree,
-            show_help: false,
-        }
+            popup: Popup::None,
+            status: String::new(),
+        };
+        app.rebuild_rows();
+        app
     }
 
-    pub fn refresh_rows(&mut self) {
-        self.rows = self.tree.visible_rows();
+    pub fn rebuild_rows(&mut self) {
+        self.rows = build_rows(&self.tree.root, &self.store.by_dir());
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
@@ -76,94 +81,73 @@ impl<R: CommandRunner> App<R> {
         }
     }
 
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Tree => Focus::Terminal,
-            Focus::Terminal => Focus::Tree,
-        };
-    }
-
+    /// Enter/click on the selected row, dispatched by kind.
     pub fn activate(&mut self) -> io::Result<()> {
         let Some(row) = self.selected_row().cloned() else {
             return Ok(());
         };
-        if row.is_dir {
-            if let Some(node) = self.tree.node_at_mut(&row.path) {
-                node.toggle();
-            }
-            self.refresh_rows();
-        } else {
-            self.open_file(&row.path)?;
-        }
-        Ok(())
-    }
-
-    pub fn open_session(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected_row().cloned() else {
-            return Ok(());
-        };
-        if row.is_dir {
-            self.open_dir(&row.path)?;
-        } else {
-            self.open_file(&row.path)?;
-        }
-        Ok(())
-    }
-
-    pub fn kill_selected(&mut self) -> io::Result<()> {
-        let Some(row) = self.selected_row().cloned() else {
-            return Ok(());
-        };
-        if !row.is_dir {
-            return Ok(());
-        }
-        let slug = self.registry.slug_for(&row.path, &self.root);
-        self.tmux.kill_session(&slug)?;
-        self.active.remove(&row.path);
-        self.status = format!("killed {slug}");
-        Ok(())
-    }
-
-    pub fn sync_active(&mut self) -> io::Result<()> {
-        let sessions: HashSet<String> = self.tmux.list_sessions()?.into_iter().collect();
-        let rows = self.rows.clone();
-        let mut active = HashSet::new();
-        for row in rows {
-            if row.is_dir {
-                let slug = self.registry.slug_for(&row.path, &self.root);
-                if sessions.contains(&slug) {
-                    active.insert(row.path.clone());
+        match row.kind {
+            RowKind::Dir { .. } => {
+                if let Some(node) = self.tree.node_at_mut(&row.path) {
+                    node.toggle();
                 }
+                self.rebuild_rows();
+            }
+            RowKind::Session { slug, .. } => {
+                self.switch_to(&slug)?;
+            }
+            RowKind::File => {
+                self.open_file(&row.path);
             }
         }
-        self.active = active;
         Ok(())
     }
 
-    /// True once the inner tmux server reports at least one client (the embedded
-    /// PTY). Used at startup to avoid switching before that client has attached.
-    pub fn host_client_ready(&mut self) -> bool {
-        matches!(self.tmux.host_tty(), Ok(Some(_)))
-    }
-
-    fn ensure_host_tty(&mut self) -> io::Result<Option<String>> {
-        self.host_tty = self.tmux.host_tty()?;
-        Ok(self.host_tty.clone())
-    }
-
-    fn ensure_session(&mut self, dir: &Path) -> io::Result<String> {
-        let slug = self.registry.slug_for(dir, &self.root);
-        if !self.tmux.has_session(&slug)? {
-            self.tmux.new_session(&slug, dir, None)?;
+    /// Open the shell/claude chooser for the selected directory row.
+    pub fn open_chooser(&mut self) {
+        if let Some(row) = self.selected_row() {
+            if matches!(row.kind, RowKind::Dir { .. }) {
+                self.popup = Popup::Chooser {
+                    dir: row.path.clone(),
+                    selected: 0,
+                };
+            }
         }
-        self.active.insert(dir.to_path_buf());
-        Ok(slug)
     }
 
-    fn open_dir(&mut self, dir: &Path) -> io::Result<()> {
-        let slug = self.ensure_session(dir)?;
+    pub fn chooser_move(&mut self, delta: i32) {
+        if let Popup::Chooser { selected, .. } = &mut self.popup {
+            let n = CHOOSER_KINDS.len() as i32;
+            *selected = (((*selected as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    pub fn chooser_confirm(&mut self) -> io::Result<()> {
+        if let Popup::Chooser { dir, selected } = self.popup.clone() {
+            let kind = CHOOSER_KINDS[selected];
+            self.popup = Popup::None;
+            self.create_session(&dir, kind)?;
+        }
+        Ok(())
+    }
+
+    pub fn chooser_cancel(&mut self) {
+        self.popup = Popup::None;
+    }
+
+    fn create_session(&mut self, dir: &Path, kind: SessionKind) -> io::Result<()> {
+        let slug = self.store.create(dir, &self.root, kind);
+        self.tmux.new_session(&slug, dir, kind.command())?;
+        self.rebuild_rows();
+        self.switch_to(&slug)?;
+        self.status = format!("started {}", kind.label_base());
+        Ok(())
+    }
+
+    fn switch_to(&mut self, slug: &str) -> io::Result<()> {
+        self.viewer = None;
         if let Some(tty) = self.ensure_host_tty()? {
-            self.tmux.switch_client(&tty, &slug)?;
+            self.tmux.switch_client(&tty, slug)?;
             self.status = format!("switched to {slug}");
         } else {
             self.status = "no host client to switch".to_string();
@@ -171,16 +155,43 @@ impl<R: CommandRunner> App<R> {
         Ok(())
     }
 
-    fn open_file(&mut self, file: &Path) -> io::Result<()> {
-        let dir = file.parent().unwrap_or(&self.root).to_path_buf();
-        let slug = self.ensure_session(&dir)?;
-        let cmd = format!("{} -- {}", self.editor, shell_quote(&file.to_string_lossy()));
-        self.tmux.send_keys(&slug, &cmd)?;
-        if let Some(tty) = self.ensure_host_tty()? {
-            self.tmux.switch_client(&tty, &slug)?;
+    pub fn open_file(&mut self, path: &Path) {
+        self.viewer = Some(FileView::load(path));
+        self.status = format!("viewing {}", path.display());
+    }
+
+    pub fn viewer_scroll(&mut self, delta: i32, page: bool) {
+        if let Some(v) = &mut self.viewer {
+            let step = if page { 10 } else { 1 };
+            if delta < 0 {
+                v.scroll_up(step);
+            } else {
+                v.scroll_down(step);
+            }
         }
-        self.status = format!("opened {}", file.display());
+    }
+
+    pub fn sync(&mut self) -> io::Result<()> {
+        let live: HashSet<String> = self.tmux.list_sessions()?.into_iter().collect();
+        self.store.sync(&live);
+        self.rebuild_rows();
         Ok(())
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Tree => Focus::Right,
+            Focus::Right => Focus::Tree,
+        };
+    }
+
+    pub fn host_client_ready(&mut self) -> bool {
+        matches!(self.tmux.host_tty(), Ok(Some(_)))
+    }
+
+    fn ensure_host_tty(&mut self) -> io::Result<Option<String>> {
+        self.host_tty = self.tmux.host_tty()?;
+        Ok(self.host_tty.clone())
     }
 }
 
@@ -196,100 +207,86 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src").join("a.rs"), "x").unwrap();
         let tmux = Tmux::new("runner", MockRunner::new());
-        let app = App::new(dir.path().to_path_buf(), tmux, "vi".to_string());
+        let app = App::new(dir.path().to_path_buf(), tmux);
         (dir, app)
     }
 
     #[test]
-    fn open_session_creates_when_absent_then_switches() {
-        let (_dir, mut app) = app_over_tempdir();
-        // rows[0] = root, rows[1] = src
-        app.selected = 1;
-        app.tmux.runner.push(false, "");                 // has-session -> false
-        app.tmux.runner.push(true, "");                  // new-session
-        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients (host tty)
-        app.tmux.runner.push(true, "");                  // switch-client
-        app.open_session().unwrap();
-        assert_eq!(app.tmux.runner.nth_call(0)[2], "has-session");
-        assert_eq!(app.tmux.runner.nth_call(1)[2], "new-session");
-        assert_eq!(app.tmux.runner.nth_call(2)[2], "list-clients");
-        assert_eq!(app.tmux.runner.nth_call(3)[2], "switch-client");
+    fn activate_dir_toggles_expand() {
+        let (_d, mut app) = app_over_tempdir();
+        // rows[0] = root dir (expanded). Select the 'src' dir row.
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.activate().unwrap();
+        assert!(app.rows.iter().any(|r| r.label == "a.rs"));
+        assert_eq!(app.tmux.runner.call_count(), 0); // no tmux for expand
     }
 
     #[test]
-    fn open_session_skips_create_when_present() {
-        let (_dir, mut app) = app_over_tempdir();
-        app.selected = 1;
-        app.tmux.runner.push(true, "");                  // has-session -> true
-        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients
-        app.tmux.runner.push(true, "");                  // switch-client
-        app.open_session().unwrap();
-        assert_eq!(app.tmux.runner.nth_call(0)[2], "has-session");
+    fn chooser_confirm_creates_shell_and_switches() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        assert!(matches!(app.popup, Popup::Chooser { selected: 0, .. }));
+        // shell (index 0): new-session (no command), then list-clients, then switch-client
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_confirm().unwrap();
+        assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
+        assert!(!app.tmux.runner.nth_call(0).contains(&"claude".to_string()));
         assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
         assert_eq!(app.tmux.runner.nth_call(2)[2], "switch-client");
-        assert_eq!(app.tmux.runner.call_count(), 3);
+        // a 'shell' session row now exists under src
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. }) && r.label == "shell"));
     }
 
     #[test]
-    fn activate_toggles_directory() {
-        let (_dir, mut app) = app_over_tempdir();
-        app.selected = 1; // src
+    fn chooser_confirm_claude_appends_command() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.chooser_move(1); // select claude (index 1)
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_confirm().unwrap();
+        assert!(app.tmux.runner.nth_call(0).contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn activate_file_opens_viewer_no_tmux() {
+        let (_d, mut app) = app_over_tempdir();
+        // expand src so a.rs is visible
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
         app.activate().unwrap();
-        assert!(app.rows.iter().any(|r| r.name == "a.rs"));
-        assert_eq!(app.tmux.runner.call_count(), 0); // no tmux for toggle
-    }
-
-    #[test]
-    fn activate_on_file_opens_editor_in_session() {
-        let (_dir, mut app) = app_over_tempdir();
-        app.selected = 1;
-        app.activate().unwrap(); // expand src, no tmux calls
-        let file_idx = app.rows.iter().position(|r| r.name == "a.rs").unwrap();
+        let file_idx = app.rows.iter().position(|r| r.label == "a.rs").unwrap();
         app.selected = file_idx;
-        app.tmux.runner.push(false, "");                 // has-session(src) -> false
-        app.tmux.runner.push(true, "");                  // new-session
-        app.tmux.runner.push(true, "");                  // send-keys
-        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients
-        app.tmux.runner.push(true, "");                  // switch-client
         app.activate().unwrap();
-        let send = app.tmux.runner.nth_call(2);
-        assert_eq!(send[2], "send-keys");
-        assert!(send.iter().any(|a| a.contains("vi -- ")));
+        assert!(app.viewer.is_some());
+        assert_eq!(app.tmux.runner.call_count(), 0);
     }
 
     #[test]
-    fn kill_selected_kills_dir_session() {
-        let (_dir, mut app) = app_over_tempdir();
-        app.selected = 1;
-        app.tmux.runner.push(true, "");
-        app.kill_selected().unwrap();
-        let call = app.tmux.runner.nth_call(0);
-        assert_eq!(call[2], "kill-session");
-        assert!(call.contains(&"-t".to_string()), "kill-session must target a session");
-    }
-
-    #[test]
-    fn host_client_ready_reflects_list_clients() {
-        let (_dir, mut app) = app_over_tempdir();
-        app.tmux.runner.push(false, "");                // list-clients fails -> no client
-        assert!(!app.host_client_ready());
-        app.tmux.runner.push(true, "/dev/ttys009\n");   // a client present
-        assert!(app.host_client_ready());
-    }
-
-    #[test]
-    fn shell_quote_wraps_and_escapes() {
-        assert_eq!(shell_quote("a b.rs"), "'a b.rs'");
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn focus_starts_on_tree_and_toggles() {
-        let (_dir, mut app) = app_over_tempdir();
-        assert_eq!(app.focus, Focus::Tree);
-        app.toggle_focus();
-        assert_eq!(app.focus, Focus::Terminal);
-        app.toggle_focus();
-        assert_eq!(app.focus, Focus::Tree);
+    fn sync_prunes_dead_session_rows() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_confirm().unwrap();
+        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        // sync with an empty live set -> the session is gone
+        app.tmux.runner.push(true, ""); // list-sessions returns nothing
+        app.sync().unwrap();
+        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
     }
 }

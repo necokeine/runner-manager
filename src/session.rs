@@ -24,35 +24,6 @@ pub fn slugify(rel: &str) -> String {
     }
 }
 
-#[derive(Default)]
-pub struct SessionRegistry {
-    by_slug: HashMap<String, PathBuf>,
-    by_path: HashMap<PathBuf, String>,
-}
-
-impl SessionRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn slug_for(&mut self, path: &Path, root: &Path) -> String {
-        if let Some(existing) = self.by_path.get(path) {
-            return existing.clone();
-        }
-        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-        let base = slugify(&rel);
-        let mut slug = base.clone();
-        let mut n = 2;
-        while self.by_slug.contains_key(&slug) {
-            slug = format!("{base}-{n}");
-            n += 1;
-        }
-        self.by_slug.insert(slug.clone(), path.to_path_buf());
-        self.by_path.insert(path.to_path_buf(), slug.clone());
-        slug
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
     Shell,
@@ -159,26 +130,6 @@ mod tests {
     #[test]
     fn slugify_keeps_unicode_letters() {
         assert_eq!(slugify("café"), "café");
-    }
-
-    #[test]
-    fn registry_is_stable_per_path() {
-        let mut reg = SessionRegistry::new();
-        let root = Path::new("/p");
-        let a = reg.slug_for(Path::new("/p/src"), root);
-        let b = reg.slug_for(Path::new("/p/src"), root);
-        assert_eq!(a, b);
-        assert_eq!(a, "src");
-    }
-
-    #[test]
-    fn registry_disambiguates_collisions() {
-        let mut reg = SessionRegistry::new();
-        let root = Path::new("/p");
-        let a = reg.slug_for(Path::new("/p/a.b"), root); // -> a_b
-        let b = reg.slug_for(Path::new("/p/a:b"), root); // also -> a_b, must differ
-        assert_eq!(a, "a_b");
-        assert_eq!(b, "a_b-2");
     }
 
     #[test]
