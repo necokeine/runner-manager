@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -11,6 +12,7 @@ pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<RwLock<vt100::Parser>>,
+    alive: Arc<AtomicBool>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -44,7 +46,9 @@ impl Pty {
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
+        let alive = Arc::new(AtomicBool::new(true));
         let reader_parser = Arc::clone(&parser);
+        let reader_alive = Arc::clone(&alive);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -52,10 +56,12 @@ impl Pty {
                     Ok(0) | Err(_) => {
                         // The embedded tmux client exited (e.g. the last session
                         // was destroyed). Blank the screen so the pane shows an
-                        // empty terminal instead of a stale frame.
+                        // empty terminal instead of a stale frame, and mark the
+                        // PTY dead so the caller can respawn it for a new session.
                         if let Ok(mut p) = reader_parser.write() {
                             p.process(b"\x1b[2J\x1b[H");
                         }
+                        reader_alive.store(false, Ordering::SeqCst);
                         break;
                     }
                     Ok(n) => {
@@ -71,8 +77,15 @@ impl Pty {
             master: pair.master,
             writer,
             parser,
+            alive,
             _child: child,
         })
+    }
+
+    /// False once the embedded tmux client has exited (PTY hit EOF). When dead,
+    /// the right pane is blank and a new session needs a freshly spawned PTY.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
