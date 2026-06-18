@@ -7,6 +7,7 @@ pub mod keys;
 pub mod ui;
 pub mod app;
 pub mod run;
+pub mod viewer;
 
 #[cfg(test)]
 mod tests {
