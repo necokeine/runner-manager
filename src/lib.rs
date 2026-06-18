@@ -1,3 +1,4 @@
+pub mod pty;
 pub mod tmux;
 pub mod session;
 pub mod tree;
