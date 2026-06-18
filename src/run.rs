@@ -179,7 +179,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         if on_border {
                             dragging_split = true;
                         } else {
-                            match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree) {
+                            match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree, &app.rows) {
                                 PaneHit::Right => app.focus = Focus::Right,
                                 PaneHit::Tree(hit) => {
                                     app.focus = Focus::Tree;

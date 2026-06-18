@@ -43,6 +43,15 @@ impl SessionKind {
             SessionKind::Claude => "claude",
         }
     }
+
+    /// Parse the kind from a session's `@rm` tag; anything but "claude" (including
+    /// an empty/missing tag) is treated as a shell.
+    pub fn from_tag(tag: &str) -> SessionKind {
+        match tag {
+            "claude" => SessionKind::Claude,
+            _ => SessionKind::Shell,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +97,22 @@ impl SessionStore {
 
     pub fn sync(&mut self, live: &HashSet<String>) {
         self.entries.retain(|e| live.contains(&e.slug));
+    }
+
+    /// Pull live sessions that this tool created on a previous run (they carry a
+    /// `@rm` dir tag) back into the store. Sessions already tracked, or without a
+    /// directory tag (the embedded client, hand-made sessions), are skipped.
+    /// Returns the slugs newly adopted.
+    pub fn adopt(&mut self, sessions: &[(String, PathBuf, SessionKind)]) -> Vec<String> {
+        let mut adopted = Vec::new();
+        for (slug, dir, kind) in sessions {
+            if self.entries.iter().any(|e| &e.slug == slug) {
+                continue;
+            }
+            self.entries.push(Entry { dir: dir.clone(), kind: *kind, slug: slug.clone() });
+            adopted.push(slug.clone());
+        }
+        adopted
     }
 
     pub fn by_dir(&self) -> HashMap<PathBuf, Vec<SessionRow>> {
@@ -155,6 +180,35 @@ mod tests {
         let rows = &by[&PathBuf::from("/p/src")];
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(labels, vec!["shell", "shell 2", "claude"]);
+    }
+
+    #[test]
+    fn adopt_adds_untracked_sessions_and_skips_known() {
+        let mut s = SessionStore::new();
+        let root = Path::new("/p");
+        let existing = s.create(Path::new("/p/src"), root, SessionKind::Shell);
+        // a prior-run session (would come back from tmux on restart) plus the
+        // already-tracked one; only the new one should be adopted.
+        let adopted = s.adopt(&[
+            (existing.clone(), PathBuf::from("/p/src"), SessionKind::Shell),
+            ("p-claude".into(), PathBuf::from("/p"), SessionKind::Claude),
+        ]);
+        assert_eq!(adopted, vec!["p-claude".to_string()]);
+        let by = s.by_dir();
+        assert_eq!(by[&PathBuf::from("/p/src")].len(), 1);
+        let root_rows = &by[&PathBuf::from("/p")];
+        assert_eq!(root_rows.len(), 1);
+        assert_eq!(root_rows[0].slug, "p-claude");
+        assert_eq!(root_rows[0].kind, SessionKind::Claude);
+        // a re-adopt of the same set is a no-op (slugs already present)
+        assert!(s.adopt(&[("p-claude".into(), PathBuf::from("/p"), SessionKind::Claude)]).is_empty());
+    }
+
+    #[test]
+    fn kind_from_tag_defaults_to_shell() {
+        assert_eq!(SessionKind::from_tag("claude"), SessionKind::Claude);
+        assert_eq!(SessionKind::from_tag("shell"), SessionKind::Shell);
+        assert_eq!(SessionKind::from_tag(""), SessionKind::Shell);
     }
 
     #[test]

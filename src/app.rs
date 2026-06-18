@@ -249,6 +249,8 @@ impl<R: CommandRunner> App<R> {
     fn create_session(&mut self, dir: &Path, kind: SessionKind, command: Option<&str>) -> io::Result<()> {
         let slug = self.store.create(dir, &self.root, kind);
         self.tmux.new_session(&slug, dir, command)?;
+        // Tag the session so a later run can re-adopt it into the tree.
+        let _ = self.tmux.tag_session(&slug, dir, kind.label_base());
         self.rebuild_rows();
         self.switch_to(&slug)?;
         self.status = format!("started {}", kind.label_base());
@@ -287,7 +289,17 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
-        let live: HashSet<String> = self.tmux.list_sessions()?.into_iter().collect();
+        let infos = self.tmux.list_sessions_full()?;
+        // Re-adopt sessions this tool created on a prior run (those tagged with a
+        // directory). Untagged ones — the embedded `scratch` client and any
+        // hand-made sessions — are left out of the tree.
+        let adoptable: Vec<(String, PathBuf, SessionKind)> = infos
+            .iter()
+            .filter(|i| !i.dir.is_empty())
+            .map(|i| (i.name.clone(), PathBuf::from(&i.dir), SessionKind::from_tag(&i.kind)))
+            .collect();
+        self.store.adopt(&adoptable);
+        let live: HashSet<String> = infos.into_iter().map(|i| i.name).collect();
         self.store.sync(&live);
         self.rebuild_rows();
         Ok(())
@@ -381,16 +393,18 @@ mod tests {
             app.popup,
             Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
         ));
-        // shell: new-session (no command), then list-clients, then switch-client
+        // shell: new-session, tag (set-option), list-clients, switch-client
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         focus_create(&mut app);
         app.chooser_activate().unwrap();
         assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
         assert!(!app.tmux.runner.nth_call(0).contains(&"claude".to_string()));
-        assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
-        assert_eq!(app.tmux.runner.nth_call(2)[2], "switch-client");
+        assert_eq!(app.tmux.runner.nth_call(1)[2], "set-option");
+        assert_eq!(app.tmux.runner.nth_call(2)[2], "list-clients");
+        assert_eq!(app.tmux.runner.nth_call(3)[2], "switch-client");
         // a 'shell' session row now exists under src
         assert!(app
             .rows
@@ -406,6 +420,7 @@ mod tests {
         app.open_chooser();
         app.chooser_move(1); // focus -> claude
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         focus_create(&mut app);
@@ -495,6 +510,7 @@ mod tests {
         app.selected = src_idx;
         app.open_chooser();
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         focus_create(&mut app);
@@ -504,6 +520,26 @@ mod tests {
         app.tmux.runner.push(true, ""); // list-sessions returns nothing
         app.sync().unwrap();
         assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn sync_adopts_pre_existing_sessions_into_tree() {
+        // Simulates reopening the tool: tmux still has sessions from a prior run.
+        // They carry the `@rm` dir tag, so sync must re-adopt and list them, while
+        // the untagged embedded `scratch` client must stay out of the tree.
+        let (_d, mut app) = app_over_tempdir();
+        let root = app.root.to_str().unwrap().to_string();
+        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        app.tmux.runner.push(true, &format!("root-shell\tshell {root}\nscratch\t\n"));
+        app.sync().unwrap();
+        let sessions: Vec<&Row> = app
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Session { .. }))
+            .collect();
+        assert_eq!(sessions.len(), 1);
+        assert!(matches!(sessions[0].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
+        assert!(!app.rows.iter().any(|r| r.label == "scratch"));
     }
 
     use crate::session::ClaudePerm;
@@ -594,6 +630,7 @@ mod tests {
             *focus = create_idx;
         }
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         app.chooser_activate().unwrap();
@@ -612,11 +649,13 @@ mod tests {
         open_dir_chooser(&mut app);
         focus_create(&mut app);
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, ""); // list-clients -> empty (no host client)
         app.chooser_activate().unwrap();
         assert_eq!(app.pending_respawn.as_deref(), Some("src-shell"));
         assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
-        assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
+        assert_eq!(app.tmux.runner.nth_call(1)[2], "set-option");
+        assert_eq!(app.tmux.runner.nth_call(2)[2], "list-clients");
     }
 
     #[test]
@@ -625,6 +664,7 @@ mod tests {
         open_dir_chooser(&mut app);
         focus_create(&mut app);
         app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients -> a client
         app.tmux.runner.push(true, ""); // switch-client
         app.chooser_activate().unwrap();

@@ -8,6 +8,16 @@ pub struct CmdOutput {
     pub stdout: String,
 }
 
+/// A live tmux session plus the metadata this tool tags it with at creation
+/// (`@rm` = "<kind> <dir>"). `kind`/`dir` are empty for sessions we did not
+/// create (the embedded `scratch` client, or anything made by hand).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub name: String,
+    pub dir: String,
+    pub kind: String,
+}
+
 pub trait CommandRunner {
     fn run(&self, args: &[&str]) -> io::Result<CmdOutput>;
 }
@@ -69,6 +79,41 @@ impl<R: CommandRunner> Tmux<R> {
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
+            .collect())
+    }
+
+    /// Tag a session with its directory and kind so it can be re-adopted into
+    /// the tree on a later run. Stored as one user option `@rm` = "<kind> <dir>"
+    /// (kind has no spaces, so the dir is everything after the first space).
+    pub fn tag_session(&self, slug: &str, dir: &Path, kind: &str) -> io::Result<()> {
+        let dir = dir.to_str().unwrap_or(".");
+        let value = format!("{kind} {dir}");
+        self.run(&["set-option", "-t", slug, "@rm", &value])?;
+        Ok(())
+    }
+
+    /// List live sessions with their `@rm` tag split back into kind + dir.
+    pub fn list_sessions_full(&self) -> io::Result<Vec<SessionInfo>> {
+        let out = self.run(&["list-sessions", "-F", "#{session_name}\t#{@rm}"])?;
+        if !out.success {
+            return Ok(Vec::new());
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut cols = l.splitn(2, '\t');
+                let name = cols.next()?.trim().to_string();
+                if name.is_empty() {
+                    return None;
+                }
+                let tag = cols.next().unwrap_or("").trim();
+                let (kind, dir) = match tag.split_once(' ') {
+                    Some((k, d)) => (k.to_string(), d.to_string()),
+                    None => (String::new(), String::new()),
+                };
+                Some(SessionInfo { name, dir, kind })
+            })
             .collect())
     }
 
@@ -224,6 +269,36 @@ mod tests {
         runner.push(true, "/dev/ttys005\n");
         let tmux = Tmux::new("runner", runner);
         assert_eq!(tmux.host_tty().unwrap(), Some("/dev/ttys005".to_string()));
+    }
+
+    #[test]
+    fn tag_session_sets_rm_option() {
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell").unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "set-option", "-t", "src-shell", "@rm", "shell /tmp/proj/src"]
+        );
+    }
+
+    #[test]
+    fn list_sessions_full_splits_tag_into_kind_and_dir() {
+        let runner = MockRunner::new();
+        // a tagged claude session, a tagged shell session, and the untagged scratch client
+        runner.push(true, "src-claude\tclaude /tmp/proj/src\nroot-shell\tshell /tmp/proj\nscratch\t\n");
+        let tmux = Tmux::new("runner", runner);
+        let infos = tmux.list_sessions_full().unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}"]
+        );
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0], SessionInfo { name: "src-claude".into(), dir: "/tmp/proj/src".into(), kind: "claude".into() });
+        assert_eq!(infos[1], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into() });
+        // scratch (no tag) -> empty dir/kind so it won't be adopted into the tree
+        assert_eq!(infos[2], SessionInfo { name: "scratch".into(), dir: String::new(), kind: String::new() });
     }
 
     #[test]

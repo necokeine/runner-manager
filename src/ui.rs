@@ -16,8 +16,10 @@ use crate::tmux::CommandRunner;
 
 pub struct ListLayout {
     pub origin_y: u16,
-    pub button_col_start: u16,
-    pub button_col_end: u16,
+    /// Left column of the tree content (inside the border). The `[+]` button sits
+    /// right after each directory's name, so its column span is per-row, derived
+    /// from the label width relative to this origin.
+    pub content_x: u16,
     pub row_count: usize,
     /// First row index shown (scroll offset) and the visible row count. Needed
     /// to map a screen row back to its absolute row index when the tree scrolls.
@@ -43,7 +45,7 @@ pub struct Layout {
     pub term_area: Rect,
 }
 
-pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
+pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> Option<Hit> {
     if row < layout.origin_y {
         return None;
     }
@@ -55,18 +57,25 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
     if idx >= layout.row_count {
         return None;
     }
-    if col >= layout.button_col_start && col <= layout.button_col_end {
-        Some(Hit::Button(idx))
-    } else {
-        Some(Hit::Row(idx))
+    // The `[+]` button is drawn right after a directory's name (see `row_line`),
+    // so its hit region is per-row: `content_x + <left width> + 1 ..= + 3`.
+    if let Some(r) = rows.get(idx) {
+        if matches!(r.kind, RowKind::Dir { .. }) {
+            let left = dir_left(r).chars().count() as u16;
+            let bstart = layout.content_x + left + 1;
+            if col >= bstart && col <= bstart + 2 {
+                return Some(Hit::Button(idx));
+            }
+        }
     }
+    Some(Hit::Row(idx))
 }
 
-pub fn resolve_pane_click(col: u16, row: u16, split_col: u16, tree_layout: &ListLayout) -> PaneHit {
+pub fn resolve_pane_click(col: u16, row: u16, split_col: u16, tree_layout: &ListLayout, rows: &[Row]) -> PaneHit {
     if col >= split_col {
         PaneHit::Right
     } else {
-        PaneHit::Tree(resolve_click(col, row, tree_layout))
+        PaneHit::Tree(resolve_click(col, row, tree_layout, rows))
     }
 }
 
@@ -78,17 +87,32 @@ fn border_style(focused: bool) -> Style {
     }
 }
 
-fn row_line(row: &Row, width: usize) -> String {
+/// The text of a directory row up to (but not including) the `[+]` button:
+/// indent + expand icon + name. Shared by the renderer and the click hit-test
+/// so the button's column always lines up with what's drawn.
+fn dir_left(row: &Row) -> String {
+    let indent = "  ".repeat(row.depth);
+    let icon = match &row.kind {
+        RowKind::Dir { expanded: true } => "▾ ",
+        RowKind::Dir { expanded: false } => "▸ ",
+        _ => "",
+    };
+    format!("{indent}{icon}{}", row.label)
+}
+
+fn row_line(row: &Row) -> String {
     let indent = "  ".repeat(row.depth);
     match &row.kind {
-        RowKind::Dir { expanded } => {
-            let icon = if *expanded { "▾ " } else { "▸ " };
-            let left = format!("{indent}{icon}{}", row.label);
-            let btn = "[+]";
-            let pad = width.saturating_sub(left.chars().count() + btn.len());
-            format!("{left}{}{btn}", " ".repeat(pad))
+        // The button sits right after the directory name rather than far right.
+        RowKind::Dir { .. } => format!("{} [+]", dir_left(row)),
+        // A distinct prefix mark per kind so sessions don't read like files.
+        RowKind::Session { kind, .. } => {
+            let mark = match kind {
+                SessionKind::Shell => "$ ",
+                SessionKind::Claude => "✦ ",
+            };
+            format!("{indent}{mark}{}", row.label)
         }
-        RowKind::Session { .. } => format!("{indent}• {}", row.label),
         RowKind::File => format!("{indent}  {}", row.label),
     }
 }
@@ -117,10 +141,9 @@ pub fn render<R: CommandRunner>(
     let inner = tree_block.inner(tree_area);
     f.render_widget(tree_block, tree_area);
 
-    let width = inner.width as usize;
     let view_h = inner.height as usize;
     let total = app.rows.len();
-    let items: Vec<ListItem> = app.rows.iter().map(|r| ListItem::new(row_line(r, width))).collect();
+    let items: Vec<ListItem> = app.rows.iter().map(|r| ListItem::new(row_line(r))).collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     if total > 0 {
@@ -155,8 +178,7 @@ pub fn render<R: CommandRunner>(
 
     let tree_layout = ListLayout {
         origin_y: inner.y,
-        button_col_start: inner.x + inner.width.saturating_sub(3),
-        button_col_end: inner.x + inner.width.saturating_sub(1),
+        content_x: inner.x,
         row_count: total,
         offset: app.tree_offset,
         view_h: inner.height,
@@ -298,30 +320,58 @@ pub fn render_chooser(
 mod tests {
     use super::*;
 
+    fn dir_row(label: &str, depth: usize) -> Row {
+        Row { path: std::path::PathBuf::from("/"), label: label.to_string(), depth, kind: RowKind::Dir { expanded: true } }
+    }
+    fn file_row(label: &str) -> Row {
+        Row { path: std::path::PathBuf::from("/"), label: label.to_string(), depth: 0, kind: RowKind::File }
+    }
+
+    #[test]
+    fn row_line_places_button_after_name_and_marks_sessions() {
+        let dir = dir_row("src", 0);
+        assert_eq!(row_line(&dir), "▾ src [+]");
+        let shell = Row { path: std::path::PathBuf::from("/"), label: "shell".into(), depth: 1, kind: RowKind::Session { slug: "s".into(), kind: SessionKind::Shell } };
+        assert_eq!(row_line(&shell), "  $ shell");
+        let claude = Row { path: std::path::PathBuf::from("/"), label: "claude".into(), depth: 1, kind: RowKind::Session { slug: "c".into(), kind: SessionKind::Claude } };
+        assert_eq!(row_line(&claude), "  ✦ claude");
+        assert_eq!(row_line(&file_row("a.rs")), "  a.rs");
+    }
+
     #[test]
     fn resolve_click_distinguishes_row_and_button() {
-        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 3, offset: 0, view_h: 10 };
-        assert_eq!(resolve_click(5, 1, &layout), Some(Hit::Row(0)));
-        assert_eq!(resolve_click(21, 2, &layout), Some(Hit::Button(1)));
-        assert_eq!(resolve_click(5, 0, &layout), None);
-        assert_eq!(resolve_click(5, 10, &layout), None);
+        // content_x=0; row 1 is depth-0 dir "src": left = "▾ src" (5 chars), so
+        // "[+]" occupies columns 6,7,8 (left+1 ..= left+3).
+        let rows = vec![file_row("a"), dir_row("src", 0), file_row("c")];
+        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 3, offset: 0, view_h: 10 };
+        assert_eq!(resolve_click(2, 1, &layout, &rows), Some(Hit::Row(0)));
+        assert_eq!(resolve_click(7, 2, &layout, &rows), Some(Hit::Button(1)));
+        // clicking the dir name (not the button) toggles, not opens the chooser
+        assert_eq!(resolve_click(2, 2, &layout, &rows), Some(Hit::Row(1)));
+        // a file row has no button anywhere
+        assert_eq!(resolve_click(7, 3, &layout, &rows), Some(Hit::Row(2)));
+        assert_eq!(resolve_click(5, 0, &layout, &rows), None);
+        assert_eq!(resolve_click(5, 11, &layout, &rows), None);
     }
 
     #[test]
     fn resolve_click_accounts_for_scroll_offset() {
         // Scrolled down by 5 rows: the top visible screen row maps to row index 5.
-        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 30, offset: 5, view_h: 8 };
-        assert_eq!(resolve_click(5, 1, &layout), Some(Hit::Row(5)));
-        assert_eq!(resolve_click(21, 1, &layout), Some(Hit::Button(5)));
+        let mut rows: Vec<Row> = (0..30).map(|i| file_row(&format!("f{i}"))).collect();
+        rows[5] = dir_row("src", 0); // "▾ src" -> button at cols 6,7,8
+        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 30, offset: 5, view_h: 8 };
+        assert_eq!(resolve_click(2, 1, &layout, &rows), Some(Hit::Row(5)));
+        assert_eq!(resolve_click(7, 1, &layout, &rows), Some(Hit::Button(5)));
         // a click past the visible window height is ignored
-        assert_eq!(resolve_click(5, 1 + 8, &layout), None);
+        assert_eq!(resolve_click(5, 1 + 8, &layout, &rows), None);
     }
 
     #[test]
     fn resolve_pane_click_splits_on_column() {
-        let layout = ListLayout { origin_y: 1, button_col_start: 38, button_col_end: 40, row_count: 3, offset: 0, view_h: 10 };
-        assert_eq!(resolve_pane_click(5, 2, 50, &layout), PaneHit::Tree(Some(Hit::Row(1))));
-        assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Right);
+        let rows = vec![file_row("a"), file_row("b"), file_row("c")];
+        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 3, offset: 0, view_h: 10 };
+        assert_eq!(resolve_pane_click(5, 2, 50, &layout, &rows), PaneHit::Tree(Some(Hit::Row(1))));
+        assert_eq!(resolve_pane_click(50, 2, 50, &layout, &rows), PaneHit::Right);
     }
 
     #[test]
