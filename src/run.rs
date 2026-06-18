@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use crate::app::App;
 use crate::input::{map_key, Action};
 use crate::tmux::{SystemRunner, Tmux};
-use crate::ui::{self, Hit, ListLayout};
+use crate::ui::{self, Hit, Layout, ListLayout};
 
 pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
     enable_raw_mode()?;
@@ -28,6 +28,8 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
     let mut app = App::new(root, tmux, editor);
     let _ = app.sync_active();
 
+    // TODO(Task 6): wire up PTY and use the new Layout type
+    let _ = Layout { tree: ListLayout { origin_y: 0, button_col_start: 0, button_col_end: 0, row_count: 0 }, split_col: 0, term_area: ratatui::layout::Rect::default() };
     let mut layout = ListLayout {
         origin_y: 0,
         button_col_start: 0,
@@ -37,7 +39,15 @@ pub fn run(root: PathBuf, socket: String, editor: String) -> io::Result<()> {
 
     let result = loop {
         if let Err(e) = terminal.draw(|f| {
-            layout = ui::render(f, f.area(), &app.rows, app.selected, &app.active);
+            // TODO(Task 6): pass Focus and PTY screen; placeholder keeps Task 5 ui tests green
+            let parser = tui_term::vt100::Parser::new(24, 80, 0);
+            let full = ui::render(f, f.area(), &app.rows, app.selected, &app.active, app.focus, parser.screen());
+            layout = ListLayout {
+                origin_y: full.tree.origin_y,
+                button_col_start: full.tree.button_col_start,
+                button_col_end: full.tree.button_col_end,
+                row_count: full.tree.row_count,
+            };
         }) {
             break Err(e);
         }
