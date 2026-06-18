@@ -37,7 +37,7 @@ runner-manager
 | `q`            | quit (tree focus)                                   |
 | `Ctrl-q`       | toggle focus between tree and the right pane        |
 | left-click     | focus a pane; in the tree, act on the clicked row   |
-| scroll wheel   | scroll the tree pane (scrollbar shows when needed)  |
+| scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
 | drag border    | resize the tree/terminal split                      |
 
 In the new-session form: `↑`/`↓`/`j`/`k` move between rows (selecting `claude`

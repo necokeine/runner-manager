@@ -9,6 +9,11 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 // tui_term re-exports vt100, so Screen types unify with the renderer (Task 5).
 use tui_term::vt100;
 
+/// Shared handle to the embedded terminal's vt100 parser. Held by both the
+/// reader thread (which feeds bytes into it) and the render loop (which reads
+/// the screen out). Optional in `run.rs`: `None` when no embedded client exists.
+pub type ParserHandle = Arc<RwLock<vt100::Parser>>;
+
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -22,7 +27,7 @@ pub struct Pty {
 /// tmux emits during rapid PTY resizes (e.g. dragging the pane splitter); if
 /// that ever poisons the lock, the screen it left behind is still renderable,
 /// so the UI keeps drawing instead of crashing.
-pub fn read_screen(parser: &Arc<RwLock<vt100::Parser>>) -> RwLockReadGuard<'_, vt100::Parser> {
+pub fn read_screen(parser: &ParserHandle) -> RwLockReadGuard<'_, vt100::Parser> {
     parser.read().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -127,7 +132,7 @@ impl Pty {
         Ok(())
     }
 
-    pub fn parser(&self) -> Arc<RwLock<vt100::Parser>> {
+    pub fn parser(&self) -> ParserHandle {
         Arc::clone(&self.parser)
     }
 }
