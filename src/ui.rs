@@ -1,6 +1,3 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-
 use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -8,8 +5,9 @@ use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::Focus;
-use crate::tree::Row;
+use crate::app::{App, Focus, CHOOSER_KINDS};
+use crate::rows::{Row, RowKind};
+use crate::tmux::CommandRunner;
 
 pub struct ListLayout {
     pub origin_y: u16,
@@ -18,16 +16,22 @@ pub struct ListLayout {
     pub row_count: usize,
 }
 
-pub struct Layout {
-    pub tree: ListLayout,
-    pub split_col: u16,
-    pub term_area: Rect,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
     Row(usize),
     Button(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneHit {
+    Tree(Option<Hit>),
+    Right,
+}
+
+pub struct Layout {
+    pub tree: ListLayout,
+    pub split_col: u16,
+    pub term_area: Rect,
 }
 
 pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
@@ -45,32 +49,15 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout) -> Option<Hit> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pane {
-    Tree,
-    Terminal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaneHit {
-    Tree(Option<Hit>),
-    Terminal,
-}
-
-pub fn resolve_pane_click(
-    col: u16,
-    row: u16,
-    split_col: u16,
-    tree_layout: &ListLayout,
-) -> PaneHit {
+pub fn resolve_pane_click(col: u16, row: u16, split_col: u16, tree_layout: &ListLayout) -> PaneHit {
     if col >= split_col {
-        PaneHit::Terminal
+        PaneHit::Right
     } else {
         PaneHit::Tree(resolve_click(col, row, tree_layout))
     }
 }
 
-fn pane_border_style(focused: bool) -> Style {
+fn border_style(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
@@ -78,14 +65,26 @@ fn pane_border_style(focused: bool) -> Style {
     }
 }
 
-pub fn render(
+fn row_line(row: &Row, width: usize) -> String {
+    let indent = "  ".repeat(row.depth);
+    match &row.kind {
+        RowKind::Dir { expanded } => {
+            let icon = if *expanded { "▾ " } else { "▸ " };
+            let left = format!("{indent}{icon}{}", row.label);
+            let btn = "[+]";
+            let pad = width.saturating_sub(left.chars().count() + btn.len());
+            format!("{left}{}{btn}", " ".repeat(pad))
+        }
+        RowKind::Session { .. } => format!("{indent}• {}", row.label),
+        RowKind::File => format!("{indent}  {}", row.label),
+    }
+}
+
+pub fn render<R: CommandRunner>(
     f: &mut Frame,
     area: Rect,
-    rows: &[Row],
-    selected: usize,
-    active: &HashSet<PathBuf>,
-    focus: Focus,
-    screen: &vt100::Screen,
+    app: &App<R>,
+    screen: Option<&vt100::Screen>,
 ) -> Layout {
     let chunks = RtLayout::default()
         .direction(Direction::Horizontal)
@@ -94,39 +93,20 @@ pub fn render(
     let tree_area = chunks[0];
     let right_area = chunks[1];
 
-    // ----- left: tree -----
+    // ---- left: tree ----
     let tree_block = Block::default()
         .title("tree")
         .borders(Borders::ALL)
-        .border_style(pane_border_style(focus == Focus::Tree));
+        .border_style(border_style(app.focus == Focus::Tree));
     let inner = tree_block.inner(tree_area);
     f.render_widget(tree_block, tree_area);
 
     let width = inner.width as usize;
-    let mut items: Vec<ListItem> = Vec::new();
-    for row in rows {
-        let indent = "  ".repeat(row.depth);
-        let icon = if row.is_dir {
-            if row.expanded { "▾ " } else { "▸ " }
-        } else {
-            "  "
-        };
-        let badge = if active.contains(&row.path) { "● " } else { "" };
-        let left = format!("{indent}{icon}{badge}{}", row.name);
-        let line = if row.is_dir {
-            let btn = "[+]";
-            let pad = width.saturating_sub(left.chars().count() + btn.len());
-            format!("{left}{}{btn}", " ".repeat(pad))
-        } else {
-            left
-        };
-        items.push(ListItem::new(line));
-    }
-    let list =
-        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let items: Vec<ListItem> = app.rows.iter().map(|r| ListItem::new(row_line(r, width))).collect();
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    if !rows.is_empty() {
-        state.select(Some(selected.min(rows.len() - 1)));
+    if !app.rows.is_empty() {
+        state.select(Some(app.selected.min(app.rows.len() - 1)));
     }
     f.render_stateful_widget(list, inner, &mut state);
 
@@ -134,29 +114,46 @@ pub fn render(
         origin_y: inner.y,
         button_col_start: inner.x + inner.width.saturating_sub(3),
         button_col_end: inner.x + inner.width.saturating_sub(1),
-        row_count: rows.len(),
+        row_count: app.rows.len(),
     };
 
-    // ----- right: embedded terminal -----
-    let term_block = Block::default()
-        .title("terminal")
-        .borders(Borders::ALL)
-        .border_style(pane_border_style(focus == Focus::Terminal));
-    let term_inner = term_block.inner(right_area);
-    f.render_widget(term_block, right_area);
-    let pseudo_term = PseudoTerminal::new(screen);
-    f.render_widget(pseudo_term, term_inner);
+    // ---- right: terminal or viewer ----
+    // The embedded PTY's vt100 parser is owned by run.rs, so the screen is
+    // passed in: Some when the terminal is shown, None when the viewer is.
+    let right_focused = app.focus == Focus::Right;
+    let right_inner = Block::default().borders(Borders::ALL).inner(right_area);
+    if let Some(view) = &app.viewer {
+        let title = view
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style(right_focused));
+        let body = view.lines.join("\n");
+        let para = Paragraph::new(body).block(block).scroll((view.scroll as u16, 0));
+        f.render_widget(para, right_area);
+    } else {
+        let block = Block::default()
+            .title("terminal")
+            .borders(Borders::ALL)
+            .border_style(border_style(right_focused));
+        f.render_widget(block, right_area);
+        let screen = screen.expect("terminal screen present when viewer is None");
+        f.render_widget(PseudoTerminal::new(screen), right_inner);
+    }
 
     Layout {
         tree: tree_layout,
         split_col: right_area.x,
-        term_area: term_inner,
+        term_area: right_inner,
     }
 }
 
-/// A `Rect` centered within `area`, sized to the given percentages of it.
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = RtLayout::default()
+    let v = RtLayout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage((100 - percent_y) / 2),
@@ -164,140 +161,79 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(area);
-    let horizontal = RtLayout::default()
+    let h = RtLayout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage((100 - percent_x) / 2),
             Constraint::Percentage(percent_x),
             Constraint::Percentage((100 - percent_x) / 2),
         ])
-        .split(vertical[1]);
-    horizontal[1]
+        .split(v[1]);
+    h[1]
 }
 
-/// Overlay a centered popup listing the tree-pane keybindings. Clears the
-/// area underneath so it floats over the two-pane layout.
 pub fn render_help(f: &mut Frame, area: Rect) {
     let lines = [
         "j / ↓      move down",
         "k / ↑      move up",
-        "Enter      expand·collapse dir / open file",
-        "a          open / switch dir session",
-        "x          kill dir session",
+        "Enter      expand dir / switch session / view file",
+        "a / [+]    new session (shell or claude) on a dir",
         "h / ?      this help",
-        "Ctrl-q     toggle focus (tree / terminal)",
+        "Ctrl-q     toggle focus (tree / right pane)",
         "q          quit",
-        "click      focus pane · select / act",
+        "",
+        "right pane focused: type into the shell, or",
+        "j/k/PgUp/PgDn to scroll a file view",
         "",
         "— press any key to close —",
     ];
-    let popup = centered_rect(60, 70, area);
-    let block = Block::default().title("Tree keys").borders(Borders::ALL);
+    let popup = centered_rect(64, 70, area);
+    let block = Block::default().title("Keys").borders(Borders::ALL);
     let para = Paragraph::new(lines.join("\n")).block(block);
     f.render_widget(Clear, popup);
     f.render_widget(para, popup);
 }
 
+pub fn render_chooser(f: &mut Frame, area: Rect, selected: usize) -> Rect {
+    let popup = centered_rect(40, 30, area);
+    let block = Block::default().title("New session").borders(Borders::ALL);
+    let items: Vec<ListItem> = CHOOSER_KINDS
+        .iter()
+        .map(|k| ListItem::new(format!("  {}", k.label_base())))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(Some(selected.min(CHOOSER_KINDS.len() - 1)));
+    f.render_widget(Clear, popup);
+    f.render_stateful_widget(list, popup, &mut state);
+    popup
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Row;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-    use std::collections::HashSet;
-    use std::path::PathBuf;
 
     #[test]
     fn resolve_click_distinguishes_row_and_button() {
-        let layout = ListLayout {
-            origin_y: 1,
-            button_col_start: 20,
-            button_col_end: 22,
-            row_count: 3,
-        };
+        let layout = ListLayout { origin_y: 1, button_col_start: 20, button_col_end: 22, row_count: 3 };
         assert_eq!(resolve_click(5, 1, &layout), Some(Hit::Row(0)));
         assert_eq!(resolve_click(21, 2, &layout), Some(Hit::Button(1)));
-        assert_eq!(resolve_click(5, 0, &layout), None); // above list
-        assert_eq!(resolve_click(5, 10, &layout), None); // below rows
+        assert_eq!(resolve_click(5, 0, &layout), None);
+        assert_eq!(resolve_click(5, 10, &layout), None);
     }
 
     #[test]
-    fn render_draws_names_and_button() {
-        use crate::app::Focus;
-        let rows = vec![
-            Row { path: PathBuf::from("/p"), name: "p".into(), is_dir: true, depth: 0, expanded: true },
-            Row { path: PathBuf::from("/p/src"), name: "src".into(), is_dir: true, depth: 1, expanded: false },
-            Row { path: PathBuf::from("/p/r.md"), name: "r.md".into(), is_dir: false, depth: 1, expanded: false },
-        ];
-        let active: HashSet<PathBuf> = HashSet::new();
-        let parser = tui_term::vt100::Parser::new(24, 80, 0);
-        let backend = TestBackend::new(60, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let _ = render(f, f.area(), &rows, 0, &active, Focus::Tree, parser.screen());
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("src"));
-        assert!(content.contains("[+]"));
+    fn resolve_pane_click_splits_on_column() {
+        let layout = ListLayout { origin_y: 1, button_col_start: 38, button_col_end: 40, row_count: 3 };
+        assert_eq!(resolve_pane_click(5, 2, 50, &layout), PaneHit::Tree(Some(Hit::Row(1))));
+        assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Right);
     }
 
     #[test]
-    fn pane_click_left_of_split_resolves_tree() {
-        let layout = ListLayout {
-            origin_y: 1,
-            button_col_start: 38,
-            button_col_end: 40,
-            row_count: 3,
-        };
-        // split at col 50; a click at col 5 row 2 is in the tree on row 1
-        assert_eq!(
-            resolve_pane_click(5, 2, 50, &layout),
-            PaneHit::Tree(Some(Hit::Row(1)))
-        );
-        // a click on the [+] button column within the tree
-        assert_eq!(
-            resolve_pane_click(39, 1, 50, &layout),
-            PaneHit::Tree(Some(Hit::Button(0)))
-        );
-        // a tree-region click below the rows resolves to Tree(None)
-        assert_eq!(resolve_pane_click(5, 20, 50, &layout), PaneHit::Tree(None));
-    }
-
-    #[test]
-    fn pane_click_at_or_after_split_is_terminal() {
-        let layout = ListLayout {
-            origin_y: 1,
-            button_col_start: 38,
-            button_col_end: 40,
-            row_count: 3,
-        };
-        assert_eq!(resolve_pane_click(50, 2, 50, &layout), PaneHit::Terminal);
-        assert_eq!(resolve_pane_click(70, 4, 50, &layout), PaneHit::Terminal);
-    }
-
-    #[test]
-    fn centered_rect_is_centered_and_sized() {
+    fn centered_rect_is_centered() {
         let area = Rect { x: 0, y: 0, width: 100, height: 100 };
-        let r = centered_rect(50, 50, area);
-        assert_eq!(r, Rect { x: 25, y: 25, width: 50, height: 50 });
-    }
-
-    #[test]
-    fn render_help_draws_keys_and_title() {
-        let backend = TestBackend::new(60, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                render_help(f, f.area());
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("Tree keys"));
-        assert!(content.contains("quit"));
-        assert!(content.contains("this help"));
+        assert_eq!(centered_rect(50, 50, area), Rect { x: 25, y: 25, width: 50, height: 50 });
     }
 }

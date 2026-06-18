@@ -53,15 +53,6 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-    pub depth: usize,
-    pub expanded: bool,
-}
-
 pub struct Tree {
     pub root: Node,
 }
@@ -72,29 +63,6 @@ impl Tree {
         root.load_children();
         root.expanded = true;
         Self { root }
-    }
-
-    pub fn visible_rows(&self) -> Vec<Row> {
-        let mut out = Vec::new();
-        Self::collect(&self.root, 0, &mut out);
-        out
-    }
-
-    fn collect(node: &Node, depth: usize, out: &mut Vec<Row>) {
-        out.push(Row {
-            path: node.path.clone(),
-            name: node.name.clone(),
-            is_dir: node.is_dir,
-            depth,
-            expanded: node.expanded,
-        });
-        if node.is_dir && node.expanded {
-            if let Some(children) = &node.children {
-                for c in children {
-                    Self::collect(c, depth + 1, out);
-                }
-            }
-        }
     }
 
     pub fn node_at_mut(&mut self, path: &Path) -> Option<&mut Node> {
@@ -131,17 +99,21 @@ mod tests {
         dir
     }
 
+    fn rows_of(tree: &Tree) -> Vec<crate::rows::Row> {
+        crate::rows::build_rows(&tree.root, &std::collections::HashMap::new())
+    }
+
     #[test]
     fn root_expands_and_orders_dirs_first_then_alpha() {
         let dir = setup();
         let tree = Tree::new(dir.path().to_path_buf());
-        let rows = tree.visible_rows();
+        let rows = rows_of(&tree);
         // row 0 is the root itself; children follow
-        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
         let child_names = &names[1..];
         assert_eq!(child_names, &["asub", "zsub", "readme.md"]);
-        assert!(rows[1].is_dir);
-        assert!(!rows.iter().any(|r| r.name == "inner.txt")); // not expanded yet
+        assert!(matches!(rows[1].kind, crate::rows::RowKind::Dir { .. }));
+        assert!(!rows.iter().any(|r| r.label == "inner.txt")); // not expanded yet
     }
 
     #[test]
@@ -150,9 +122,9 @@ mod tests {
         let mut tree = Tree::new(dir.path().to_path_buf());
         let zsub = dir.path().join("zsub");
         tree.node_at_mut(&zsub).unwrap().toggle(); // expand
-        assert!(tree.visible_rows().iter().any(|r| r.name == "inner.txt"));
+        assert!(rows_of(&tree).iter().any(|r| r.label == "inner.txt"));
         tree.node_at_mut(&zsub).unwrap().toggle(); // collapse
-        assert!(!tree.visible_rows().iter().any(|r| r.name == "inner.txt"));
+        assert!(!rows_of(&tree).iter().any(|r| r.label == "inner.txt"));
     }
 
     #[test]
@@ -161,7 +133,7 @@ mod tests {
         let mut tree = Tree::new(dir.path().to_path_buf());
         let zsub = dir.path().join("zsub");
         tree.node_at_mut(&zsub).unwrap().toggle();
-        let inner = tree.visible_rows().into_iter().find(|r| r.name == "inner.txt").unwrap();
+        let inner = rows_of(&tree).into_iter().find(|r| r.label == "inner.txt").unwrap();
         assert_eq!(inner.depth, 2);
     }
 }
