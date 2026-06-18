@@ -43,12 +43,6 @@ impl SessionKind {
             SessionKind::Claude => "claude",
         }
     }
-    pub fn command(&self) -> Option<&'static str> {
-        match self {
-            SessionKind::Shell => None,
-            SessionKind::Claude => Some("claude"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -185,7 +185,8 @@ impl<R: CommandRunner> App<R> {
 
     /// Apply the radio-follows-focus rule for the given row.
     fn chooser_apply_focus(&mut self, row: ChooserRow) {
-        if let Popup::Chooser { kind, perm, focus, .. } = &mut self.popup {
+        // Apply radio selection first (this may change `kind`, which changes the row set).
+        if let Popup::Chooser { kind, perm, .. } = &mut self.popup {
             match row {
                 ChooserRow::KindShell => *kind = SessionKind::Shell,
                 ChooserRow::KindClaude => *kind = SessionKind::Claude,
@@ -193,8 +194,10 @@ impl<R: CommandRunner> App<R> {
                 ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
                 _ => {}
             }
-            // Switching to Shell removes the perm rows; re-clamp focus.
-            let row_count = if *kind == SessionKind::Claude { 6 } else { 4 };
+        }
+        // Re-clamp focus against the (possibly shrunken) row set.
+        let row_count = self.chooser_rows().len();
+        if let Popup::Chooser { focus, .. } = &mut self.popup {
             if *focus >= row_count {
                 *focus = row_count - 1;
             }
