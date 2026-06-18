@@ -11,5 +11,6 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let root = env::current_dir()?;
-    run::run(root, "runner".to_string())
+    let socket = env::var("RM_SOCKET").unwrap_or_else(|_| "runner".to_string());
+    run::run(root, socket)
 }

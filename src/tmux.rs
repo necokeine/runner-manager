@@ -69,6 +69,13 @@ impl<R: CommandRunner> Tmux<R> {
         Ok(())
     }
 
+    /// Detach the given client (by its tty) from the server without destroying
+    /// any session. Used on quit so the server and its sessions outlive us.
+    pub fn detach_client(&self, tty: &str) -> io::Result<()> {
+        self.run(&["detach-client", "-t", tty])?;
+        Ok(())
+    }
+
     pub fn list_sessions(&self) -> io::Result<Vec<String>> {
         let out = self.run(&["list-sessions", "-F", "#{session_name}"])?;
         if !out.success {
@@ -247,6 +254,18 @@ mod tests {
         assert_eq!(
             tmux.runner.nth_call(0),
             vec!["-L", "runner", "switch-client", "-c", "/dev/ttys003", "-t", "src"]
+        );
+    }
+
+    #[test]
+    fn detach_client_targets_tty() {
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        tmux.detach_client("/dev/ttys003").unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "detach-client", "-t", "/dev/ttys003"]
         );
     }
 

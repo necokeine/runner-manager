@@ -46,7 +46,14 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    // Keep every session alive across our own lifetime: never detach a client
+    // just because its session was destroyed, and never destroy a session just
+    // because it has no attached client (which is exactly what happens to the
+    // session we were viewing when we quit). Only `exit` inside a session ends
+    // it. `destroy-unattached` defaults to off but a user's tmux config can
+    // turn it on, so we force it off on our socket to be safe.
     let _ = app.tmux.set_global_option("detach-on-destroy", "off");
+    let _ = app.tmux.set_global_option("destroy-unattached", "off");
     let _ = app.sync();
 
     let mut last_term_size: (u16, u16) = (0, 0);
@@ -241,13 +248,21 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     pty = p;
                     parser = pty.parser();
                     last_term_size = (0, 0); // force a resize so the session fills the pane
-                    // A brand-new tmux server lost the global option; re-apply it.
+                    // A brand-new tmux server lost the global options; re-apply.
                     let _ = app.tmux.set_global_option("detach-on-destroy", "off");
+                    let _ = app.tmux.set_global_option("destroy-unattached", "off");
                     app.status = format!("reopened terminal for {slug}");
                 }
             }
         }
     };
+
+    // Detach the embedded client cleanly instead of letting the PTY close yank
+    // it away. The tmux server and all of its sessions keep running; reopening
+    // re-attaches and re-lists them.
+    if let Ok(Some(tty)) = app.tmux.host_tty() {
+        let _ = app.tmux.detach_client(&tty);
+    }
 
     let restore_raw = disable_raw_mode();
     let restore_screen = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
