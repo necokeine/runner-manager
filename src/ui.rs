@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout as RtLayout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{
@@ -117,6 +117,70 @@ fn row_line(row: &Row) -> String {
     }
 }
 
+/// The tool's display name shown in the tree-pane banner. Placeholder until the
+/// project is named; `big_name` spells it out in 3-row block glyphs.
+const APP_NAME: &str = "PJ MA";
+/// Rows reserved at the top of the tree pane for the banner: 3 rows of block
+/// glyphs plus one hint line.
+const BANNER_HEIGHT: u16 = 4;
+
+/// 3-row block-letter glyphs (half-block style) for the characters used by
+/// `APP_NAME`. Each entry is the three rows (top→bottom) of one character;
+/// unknown chars render blank. Widths differ per letter and are joined with a
+/// one-column gap by `big_name`.
+fn glyph(c: char) -> [&'static str; 3] {
+    match c.to_ascii_uppercase() {
+        'P' => ["█▀▀█", "█▀▀▀", "█   "],
+        'J' => ["▀▀█▀", "  █ ", "█▄█ "],
+        'M' => ["██▄▄██", "█ ▀▀ █", "█    █"],
+        'A' => ["▄▀▀▄", "█▄▄█", "█  █"],
+        ' ' => ["   ", "   ", "   "],
+        _ => ["   ", "   ", "   "],
+    }
+}
+
+/// Composes `name` into three rows of block glyphs joined by single-space gaps.
+fn big_name(name: &str) -> [String; 3] {
+    let mut rows = [String::new(), String::new(), String::new()];
+    for (i, c) in name.chars().enumerate() {
+        if i > 0 {
+            for r in rows.iter_mut() {
+                r.push(' ');
+            }
+        }
+        for (r, part) in rows.iter_mut().zip(glyph(c).iter()) {
+            r.push_str(part);
+        }
+    }
+    rows
+}
+
+/// Renders the tree-pane banner: the tool name in large block letters when the
+/// pane is wide enough, otherwise a plain bold name, plus a "press h for help"
+/// hint. Centered horizontally; falls back gracefully on narrow/short panes.
+fn render_banner(f: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let name_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(Color::DarkGray);
+
+    let big = big_name(APP_NAME);
+    let big_w = big[0].chars().count() as u16;
+    let mut lines: Vec<Line> = Vec::new();
+    if big_w <= area.width && area.height >= BANNER_HEIGHT {
+        for row in big {
+            lines.push(Line::styled(row, name_style));
+        }
+    } else {
+        lines.push(Line::styled(APP_NAME, name_style));
+    }
+    lines.push(Line::styled("press h for help", hint_style));
+
+    let para = Paragraph::new(lines).alignment(Alignment::Center);
+    f.render_widget(para, area);
+}
+
 pub fn render<R: CommandRunner>(
     f: &mut Frame,
     area: Rect,
@@ -130,10 +194,20 @@ pub fn render<R: CommandRunner>(
             Constraint::Percentage(100 - app.split_pct),
         ])
         .split(area);
-    let tree_area = chunks[0];
+    let left_area = chunks[0];
     let right_area = chunks[1];
 
-    // ---- left: tree ----
+    // ---- left: banner on top, tree below ----
+    // Reserve the top rows of the left column for the banner; the tree block
+    // (and all its derived geometry) sits in whatever remains, so click and
+    // scroll hit-testing follow `inner.y` automatically.
+    let left_chunks = RtLayout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(BANNER_HEIGHT), Constraint::Min(0)])
+        .split(left_area);
+    render_banner(f, left_chunks[0]);
+    let tree_area = left_chunks[1];
+
     let tree_block = Block::default()
         .title("tree")
         .borders(Borders::ALL)
@@ -447,7 +521,7 @@ mod tests {
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             app.tree_offset = offset;
             app.selected = selected;
-            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT)).unwrap();
             terminal
                 .draw(|f| {
                     render(f, f.area(), &mut app, None);
@@ -467,15 +541,18 @@ mod tests {
             (min_y, max_y)
         };
 
-        // The track lives inside a 1-cell vertical margin of the 10-row pane,
-        // so it spans rows 1..=8.
+        // The tree pane sits below the banner (BANNER_HEIGHT rows). Its track
+        // lives inside a 1-cell vertical margin, so it spans rows
+        // BANNER_HEIGHT+1 ..= BANNER_HEIGHT+8.
+        let top = BANNER_HEIGHT + 1;
+        let bottom = BANNER_HEIGHT + 8;
         let (top_min, _) = thumb_span(0, 0);
-        assert_eq!(top_min, 1, "at the top the thumb should touch the first track cell");
+        assert_eq!(top_min, top, "at the top the thumb should touch the first track cell");
 
         // Scrolled to the bottom (max_off = 40 - 8 = 32), the thumb must reach
-        // the last track cell (row 8).
+        // the last track cell.
         let (_, bot_max) = thumb_span(32, 39);
-        assert_eq!(bot_max, 8, "at the bottom the thumb should touch the last track cell");
+        assert_eq!(bot_max, bottom, "at the bottom the thumb should touch the last track cell");
     }
 
     #[test]
@@ -504,8 +581,9 @@ mod tests {
             .collect();
         app.viewer = Some(FileView::load(Path::new("/nonexistent")));
 
-        // 40x10 -> tree inner height is 8 rows after the border.
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        // 40 wide; height is BANNER_HEIGHT taller than the tree so that after the
+        // banner + border the tree inner height is still 8 rows.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT)).unwrap();
         let view_h = 8usize;
         let draw = |app: &mut App<MockRunner>, t: &mut Terminal<TestBackend>| {
             t.draw(|f| {
@@ -533,6 +611,66 @@ mod tests {
             app.selected - app.tree_offset < view_h - 1,
             "cursor should be in the viewport interior, not pinned to the bottom"
         );
+    }
+
+    #[test]
+    fn big_name_has_three_aligned_rows() {
+        let rows = big_name("PJ MA");
+        // Three rows of identical display width so the banner stays rectangular.
+        let w0 = rows[0].chars().count();
+        assert_eq!(w0, rows[1].chars().count());
+        assert_eq!(w0, rows[2].chars().count());
+        assert!(w0 > 0);
+        // Unknown characters render as blanks rather than panicking.
+        let blank = big_name("?");
+        assert!(blank.iter().all(|r| r.trim().is_empty()));
+    }
+
+    #[test]
+    fn render_banner_shows_name_and_help_hint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // Wide enough for the block-letter name plus the hint line.
+        let mut terminal = Terminal::new(TestBackend::new(30, BANNER_HEIGHT)).unwrap();
+        terminal
+            .draw(|f| {
+                render_banner(f, f.area());
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("press h for help"));
+        // The large name is drawn with block glyphs.
+        assert!(content.contains('█'));
+    }
+
+    #[test]
+    fn render_banner_falls_back_to_plain_name_when_narrow() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // Too narrow for the block letters -> the plain name is shown instead,
+        // but still wide enough for the hint line.
+        let mut terminal = Terminal::new(TestBackend::new(18, BANNER_HEIGHT)).unwrap();
+        terminal
+            .draw(|f| {
+                render_banner(f, f.area());
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("PJ MA"));
+        assert!(content.contains("press h for help"));
+        assert!(!content.contains('█'));
     }
 
     #[test]
