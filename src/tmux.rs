@@ -44,9 +44,13 @@ impl<R: CommandRunner> Tmux<R> {
         Ok(self.run(&["has-session", "-t", slug])?.success)
     }
 
-    pub fn new_session(&self, slug: &str, dir: &Path) -> io::Result<()> {
+    pub fn new_session(&self, slug: &str, dir: &Path, command: Option<&str>) -> io::Result<()> {
         let dir = dir.to_str().unwrap_or(".");
-        self.run(&["new-session", "-d", "-s", slug, "-c", dir])?;
+        let mut args: Vec<&str> = vec!["new-session", "-d", "-s", slug, "-c", dir];
+        if let Some(cmd) = command {
+            args.push(cmd);
+        }
+        self.run(&args)?;
         Ok(())
     }
 
@@ -169,10 +173,23 @@ mod tests {
         let runner = MockRunner::new();
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
-        tmux.new_session("src", Path::new("/tmp/proj/src")).unwrap();
+        tmux.new_session("src", Path::new("/tmp/proj/src"), None).unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
             vec!["-L", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src"]
+        );
+    }
+
+    #[test]
+    fn new_session_with_command_appends_it() {
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        tmux.new_session("src", Path::new("/tmp/proj/src"), Some("claude"))
+            .unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src", "claude"]
         );
     }
 

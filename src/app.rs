@@ -154,7 +154,7 @@ impl<R: CommandRunner> App<R> {
     fn ensure_session(&mut self, dir: &Path) -> io::Result<String> {
         let slug = self.registry.slug_for(dir, &self.root);
         if !self.tmux.has_session(&slug)? {
-            self.tmux.new_session(&slug, dir)?;
+            self.tmux.new_session(&slug, dir, None)?;
         }
         self.active.insert(dir.to_path_buf());
         Ok(slug)
