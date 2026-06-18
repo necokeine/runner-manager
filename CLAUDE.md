@@ -16,7 +16,7 @@ There is no separate lint config; use `cargo clippy` and `cargo fmt`.
 
 A ratatui/crossterm TUI with a NERDTree-style file tree (left) and a right pane that is **either** an embedded terminal **or** a read-only file viewer. The non-obvious design is how the terminal pane works:
 
-- `runner-manager` runs on the alternate screen *outside* tmux. At startup (`run.rs`) it spawns one PTY (`pty.rs`) running `tmux -L runner new-session -A -s scratch`. That single embedded tmux **client** is what the right pane renders, via `tui-term`'s vt100 parser.
+- `runner-manager` runs on the alternate screen *outside* tmux. At startup (`run.rs`) it queries the `-L runner` socket for the most recently active session (`Tmux::latest_session`) and, if one exists, spawns one PTY (`pty.rs`) attached to it (`tmux -L runner new-session -A -s <latest>`) — recovery into whatever the user was last working in. If there are **no** sessions (fresh start), no PTY is spawned: the right pane shows a hint and `pty`/`parser` stay `None` until the first session is created, which the run loop then attaches to via `pending_respawn`. There is no dedicated "scratch" session. That single embedded tmux **client** is what the right pane renders, via `tui-term`'s vt100 parser.
 - Task sessions are **separate** detached tmux sessions on the same `-L runner` socket. Selecting a session row does **not** spawn a new pane — it calls `tmux switch-client -c <host_tty> -t <slug>` so the one embedded client *switches* to display that session. `host_tty` is discovered via `tmux list-clients` (`Tmux::host_tty`); without it, switching can't happen.
 - `set -g detach-on-destroy off` is set globally so the embedded client survives when a task session's shell exits.
 

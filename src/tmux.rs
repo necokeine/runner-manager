@@ -76,6 +76,28 @@ impl<R: CommandRunner> Tmux<R> {
         Ok(())
     }
 
+    /// The live session most recently active (highest `session_activity`). Used
+    /// at startup to attach the embedded client to whatever the user was last
+    /// working in, instead of a throwaway scratch session. `None` if no sessions
+    /// exist (a fresh start with nothing to recover).
+    pub fn latest_session(&self) -> io::Result<Option<String>> {
+        let out = self.run(&["list-sessions", "-F", "#{session_activity} #{session_name}"])?;
+        if !out.success {
+            return Ok(None);
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut cols = l.trim().splitn(2, ' ');
+                let activity: i64 = cols.next()?.trim().parse().ok()?;
+                let name = cols.next()?.trim().to_string();
+                (!name.is_empty()).then_some((activity, name))
+            })
+            .max_by_key(|(activity, _)| *activity)
+            .map(|(_, name)| name))
+    }
+
     pub fn list_sessions(&self) -> io::Result<Vec<String>> {
         let out = self.run(&["list-sessions", "-F", "#{session_name}"])?;
         if !out.success {
@@ -280,6 +302,30 @@ mod tests {
         runner.push(false, "no server running");
         let tmux = Tmux::new("runner", runner);
         assert!(tmux.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_session_picks_highest_activity_and_none_on_failure() {
+        let runner = MockRunner::new();
+        // tests-shell has the newest activity, so it's the one to recover into.
+        runner.push(true, "100 src-claude\n145 tests-shell\n90 root-shell\n");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), Some("tests-shell".to_string()));
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-L", "runner", "list-sessions", "-F", "#{session_activity} #{session_name}"]
+        );
+
+        // No server / no sessions -> None so the caller spawns nothing.
+        let runner = MockRunner::new();
+        runner.push(false, "no server running");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), None);
+
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), None);
     }
 
     #[test]

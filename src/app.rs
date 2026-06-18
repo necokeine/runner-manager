@@ -295,8 +295,8 @@ impl<R: CommandRunner> App<R> {
     pub fn sync(&mut self) -> io::Result<()> {
         let infos = self.tmux.list_sessions_full()?;
         // Re-adopt sessions this tool created on a prior run (those tagged with a
-        // directory). Untagged ones — the embedded `scratch` client and any
-        // hand-made sessions — are left out of the tree.
+        // directory). Untagged ones — any hand-made sessions — are left out of
+        // the tree.
         let adoptable: Vec<(String, PathBuf, SessionKind)> = infos
             .iter()
             .filter(|i| !i.dir.is_empty())
@@ -530,7 +530,7 @@ mod tests {
     fn sync_adopts_pre_existing_sessions_into_tree() {
         // Simulates reopening the tool: tmux still has sessions from a prior run.
         // They carry the `@rm` dir tag, so sync must re-adopt and list them, while
-        // the untagged embedded `scratch` client must stay out of the tree.
+        // an untagged hand-made session must stay out of the tree.
         let (_d, mut app) = app_over_tempdir();
         let root = app.root.to_str().unwrap().to_string();
         assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
