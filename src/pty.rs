@@ -49,7 +49,15 @@ impl Pty {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        // The embedded tmux client exited (e.g. the last session
+                        // was destroyed). Blank the screen so the pane shows an
+                        // empty terminal instead of a stale frame.
+                        if let Ok(mut p) = reader_parser.write() {
+                            p.process(b"\x1b[2J\x1b[H");
+                        }
+                        break;
+                    }
                     Ok(n) => {
                         if let Ok(mut p) = reader_parser.write() {
                             p.process(&buf[..n]);
