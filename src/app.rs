@@ -6,6 +6,12 @@ use crate::session::SessionRegistry;
 use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::{Row, Tree};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Tree,
+    Terminal,
+}
+
 pub struct App<R: CommandRunner> {
     pub tree: Tree,
     pub registry: SessionRegistry,
@@ -18,6 +24,7 @@ pub struct App<R: CommandRunner> {
     pub editor: String,
     pub status: String,
     pub should_quit: bool,
+    pub focus: Focus,
 }
 
 fn shell_quote(s: &str) -> String {
@@ -40,6 +47,7 @@ impl<R: CommandRunner> App<R> {
             editor,
             status: String::new(),
             should_quit: false,
+            focus: Focus::Tree,
         }
     }
 
@@ -64,6 +72,13 @@ impl<R: CommandRunner> App<R> {
         if self.selected + 1 < self.rows.len() {
             self.selected += 1;
         }
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Tree => Focus::Terminal,
+            Focus::Terminal => Focus::Tree,
+        };
     }
 
     pub fn activate(&mut self) -> io::Result<()> {
@@ -121,6 +136,12 @@ impl<R: CommandRunner> App<R> {
         }
         self.active = active;
         Ok(())
+    }
+
+    /// True once the inner tmux server reports at least one client (the embedded
+    /// PTY). Used at startup to avoid switching before that client has attached.
+    pub fn host_client_ready(&mut self) -> bool {
+        matches!(self.tmux.host_tty(), Ok(Some(_)))
     }
 
     fn ensure_host_tty(&mut self) -> io::Result<Option<String>> {
@@ -246,8 +267,27 @@ mod tests {
     }
 
     #[test]
+    fn host_client_ready_reflects_list_clients() {
+        let (_dir, mut app) = app_over_tempdir();
+        app.tmux.runner.push(false, "");                // list-clients fails -> no client
+        assert!(!app.host_client_ready());
+        app.tmux.runner.push(true, "/dev/ttys009\n");   // a client present
+        assert!(app.host_client_ready());
+    }
+
+    #[test]
     fn shell_quote_wraps_and_escapes() {
         assert_eq!(shell_quote("a b.rs"), "'a b.rs'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn focus_starts_on_tree_and_toggles() {
+        let (_dir, mut app) = app_over_tempdir();
+        assert_eq!(app.focus, Focus::Tree);
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Terminal);
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Tree);
     }
 }
