@@ -20,6 +20,10 @@ pub struct App<R: CommandRunner> {
     pub should_quit: bool,
 }
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 impl<R: CommandRunner> App<R> {
     pub fn new(root: PathBuf, tmux: Tmux<R>, editor: String) -> Self {
         let tree = Tree::new(root.clone());
@@ -120,9 +124,7 @@ impl<R: CommandRunner> App<R> {
     }
 
     fn ensure_host_tty(&mut self) -> io::Result<Option<String>> {
-        if self.host_tty.is_none() {
-            self.host_tty = self.tmux.host_tty()?;
-        }
+        self.host_tty = self.tmux.host_tty()?;
         Ok(self.host_tty.clone())
     }
 
@@ -149,7 +151,7 @@ impl<R: CommandRunner> App<R> {
     fn open_file(&mut self, file: &Path) -> io::Result<()> {
         let dir = file.parent().unwrap_or(&self.root).to_path_buf();
         let slug = self.ensure_session(&dir)?;
-        let cmd = format!("{} -- {}", self.editor, file.to_string_lossy());
+        let cmd = format!("{} -- {}", self.editor, shell_quote(&file.to_string_lossy()));
         self.tmux.send_keys(&slug, &cmd)?;
         if let Some(tty) = self.ensure_host_tty()? {
             self.tmux.switch_client(&tty, &slug)?;
@@ -171,8 +173,7 @@ mod tests {
         fs::create_dir(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src").join("a.rs"), "x").unwrap();
         let tmux = Tmux::new("runner", MockRunner::new());
-        let mut app = App::new(dir.path().to_path_buf(), tmux, "vi".to_string());
-        app.host_tty = Some("/dev/ttys009".to_string());
+        let app = App::new(dir.path().to_path_buf(), tmux, "vi".to_string());
         (dir, app)
     }
 
@@ -181,26 +182,29 @@ mod tests {
         let (_dir, mut app) = app_over_tempdir();
         // rows[0] = root, rows[1] = src
         app.selected = 1;
-        // has-session -> false, new-session -> ok, switch -> ok
-        app.tmux.runner.push(false, "");
-        app.tmux.runner.push(true, "");
-        app.tmux.runner.push(true, "");
+        app.tmux.runner.push(false, "");                 // has-session -> false
+        app.tmux.runner.push(true, "");                  // new-session
+        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients (host tty)
+        app.tmux.runner.push(true, "");                  // switch-client
         app.open_session().unwrap();
         assert_eq!(app.tmux.runner.nth_call(0)[2], "has-session");
         assert_eq!(app.tmux.runner.nth_call(1)[2], "new-session");
-        assert_eq!(app.tmux.runner.nth_call(2)[2], "switch-client");
+        assert_eq!(app.tmux.runner.nth_call(2)[2], "list-clients");
+        assert_eq!(app.tmux.runner.nth_call(3)[2], "switch-client");
     }
 
     #[test]
     fn open_session_skips_create_when_present() {
         let (_dir, mut app) = app_over_tempdir();
         app.selected = 1;
-        app.tmux.runner.push(true, ""); // has-session -> true
-        app.tmux.runner.push(true, ""); // switch
+        app.tmux.runner.push(true, "");                  // has-session -> true
+        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients
+        app.tmux.runner.push(true, "");                  // switch-client
         app.open_session().unwrap();
         assert_eq!(app.tmux.runner.nth_call(0)[2], "has-session");
-        assert_eq!(app.tmux.runner.nth_call(1)[2], "switch-client");
-        assert_eq!(app.tmux.runner.call_count(), 2);
+        assert_eq!(app.tmux.runner.nth_call(1)[2], "list-clients");
+        assert_eq!(app.tmux.runner.nth_call(2)[2], "switch-client");
+        assert_eq!(app.tmux.runner.call_count(), 3);
     }
 
     #[test]
@@ -219,10 +223,11 @@ mod tests {
         app.activate().unwrap(); // expand src, no tmux calls
         let file_idx = app.rows.iter().position(|r| r.name == "a.rs").unwrap();
         app.selected = file_idx;
-        app.tmux.runner.push(false, ""); // has-session(src) -> false
-        app.tmux.runner.push(true, "");  // new-session
-        app.tmux.runner.push(true, "");  // send-keys
-        app.tmux.runner.push(true, "");  // switch
+        app.tmux.runner.push(false, "");                 // has-session(src) -> false
+        app.tmux.runner.push(true, "");                  // new-session
+        app.tmux.runner.push(true, "");                  // send-keys
+        app.tmux.runner.push(true, "/dev/ttys009\n");    // list-clients
+        app.tmux.runner.push(true, "");                  // switch-client
         app.activate().unwrap();
         let send = app.tmux.runner.nth_call(2);
         assert_eq!(send[2], "send-keys");
@@ -235,6 +240,14 @@ mod tests {
         app.selected = 1;
         app.tmux.runner.push(true, "");
         app.kill_selected().unwrap();
-        assert_eq!(app.tmux.runner.nth_call(0)[2], "kill-session");
+        let call = app.tmux.runner.nth_call(0);
+        assert_eq!(call[2], "kill-session");
+        assert!(call.contains(&"-t".to_string()), "kill-session must target a session");
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        assert_eq!(shell_quote("a b.rs"), "'a b.rs'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 }

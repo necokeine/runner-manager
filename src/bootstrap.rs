@@ -72,7 +72,14 @@ fn execute(cmds: &[TmuxCmd]) -> io::Result<()> {
             command.arg("-L").arg(sock);
         }
         command.args(&c.args);
-        command.status()?;
+        let status = command.status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "tmux command failed ({:?}): {:?}",
+                status.code(),
+                c.args
+            )));
+        }
     }
     Ok(())
 }
