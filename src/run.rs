@@ -60,7 +60,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         let draw_res = terminal.draw(|f| {
             area_width = f.area().width;
             let screen_guard = if app.viewer.is_none() {
-                Some(parser.read().unwrap())
+                Some(crate::pty::read_screen(&parser))
             } else {
                 None
             };
