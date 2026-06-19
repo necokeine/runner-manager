@@ -13,7 +13,9 @@ if [[ "${1:-}" == "--release" || "${1:-}" == "-r" ]]; then
   PROFILE="release"
   CARGO_ARGS+=(--release)
 fi
-cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" "${CARGO_ARGS[@]}"
+# Note: `${CARGO_ARGS[@]+...}` guards against macOS's bash 3.2, where expanding
+# an empty array under `set -u` errors with "unbound variable".
+cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
 
 # Resolve and verify the full path of the built binary.
 BIN="$SCRIPT_DIR/target/$PROFILE/runner-manager"
