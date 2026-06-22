@@ -12,6 +12,8 @@ multiple tmux sessions (shell or claude), shown as rows under it.
   a **shell** or **claude** session in that directory, on the `tmux -L runner`
   server. Sessions appear as rows under the directory (prefixed `$` for shell,
   `✦` for claude) and disappear when their shell exits.
+- `x` (or clicking the `[×]` next to a session name) closes that session,
+  killing it on the `-L runner` server and removing its row.
 - Quitting the tool does **not** close your tmux sessions — they keep running on
   the `-L runner` socket. Reopen runner-manager and they are listed again under
   their directories.
@@ -32,6 +34,7 @@ runner-manager
 | `k` / `up`     | move up (tree focus)                                |
 | `Enter`        | expand/collapse dir · switch to session · view file |
 | `a` / `[+]`    | new session form (shell/claude) on a directory      |
+| `x` / `[×]`    | close the selected session (tree focus)             |
 | `<` / `>`      | narrow / widen the tree pane (tree focus)           |
 | `h` / `?`      | help popup                                          |
 | `q`            | quit (tree focus)                                   |

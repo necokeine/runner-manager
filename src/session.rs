@@ -99,6 +99,12 @@ impl SessionStore {
         self.entries.retain(|e| live.contains(&e.slug));
     }
 
+    /// Drop a single session by slug. Used when the user closes a session so the
+    /// row disappears immediately, ahead of the next `sync` reconciliation.
+    pub fn remove(&mut self, slug: &str) {
+        self.entries.retain(|e| e.slug != slug);
+    }
+
     /// Pull live sessions that this tool created on a previous run (they carry a
     /// `@rm` dir tag) back into the store. Sessions already tracked, or without a
     /// directory tag (the embedded client, hand-made sessions), are skipped.
