@@ -121,6 +121,13 @@ impl SessionStore {
         adopted
     }
 
+    /// The directory a tracked session was created in, looked up by slug.
+    /// `None` for an untracked slug (e.g. an untagged hand-made session that
+    /// was never adopted into the store).
+    pub fn dir_of(&self, slug: &str) -> Option<&Path> {
+        self.entries.iter().find(|e| e.slug == slug).map(|e| e.dir.as_path())
+    }
+
     pub fn by_dir(&self) -> HashMap<PathBuf, Vec<SessionRow>> {
         let mut map: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
         let mut counts: HashMap<(PathBuf, SessionKind), usize> = HashMap::new();
@@ -215,6 +222,15 @@ mod tests {
         assert_eq!(SessionKind::from_tag("claude"), SessionKind::Claude);
         assert_eq!(SessionKind::from_tag("shell"), SessionKind::Shell);
         assert_eq!(SessionKind::from_tag(""), SessionKind::Shell);
+    }
+
+    #[test]
+    fn dir_of_returns_session_dir_or_none() {
+        let mut s = SessionStore::new();
+        let root = Path::new("/p");
+        let slug = s.create(Path::new("/p/src/proto"), root, SessionKind::Shell);
+        assert_eq!(s.dir_of(&slug), Some(Path::new("/p/src/proto")));
+        assert_eq!(s.dir_of("nope"), None);
     }
 
     #[test]

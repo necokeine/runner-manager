@@ -35,6 +35,9 @@ impl CommandRunner for SystemRunner {
 }
 
 pub struct Tmux<R: CommandRunner> {
+    /// Filesystem path of the tmux socket, passed as `-S <path>`. This is a
+    /// project-local socket (`<root>/pjma.sock`), not a named `-L` socket in
+    /// tmux's shared per-user tmpdir, so each project's sessions are isolated.
     socket: String,
     pub runner: R,
 }
@@ -45,7 +48,7 @@ impl<R: CommandRunner> Tmux<R> {
     }
 
     fn run(&self, extra: &[&str]) -> io::Result<CmdOutput> {
-        let mut args: Vec<&str> = vec!["-L", &self.socket];
+        let mut args: Vec<&str> = vec!["-S", &self.socket];
         args.extend_from_slice(extra);
         self.runner.run(&args)
     }
@@ -74,6 +77,28 @@ impl<R: CommandRunner> Tmux<R> {
     pub fn detach_client(&self, tty: &str) -> io::Result<()> {
         self.run(&["detach-client", "-t", tty])?;
         Ok(())
+    }
+
+    /// The live session most recently active (highest `session_activity`). Used
+    /// at startup to attach the embedded client to whatever the user was last
+    /// working in, instead of a throwaway scratch session. `None` if no sessions
+    /// exist (a fresh start with nothing to recover).
+    pub fn latest_session(&self) -> io::Result<Option<String>> {
+        let out = self.run(&["list-sessions", "-F", "#{session_activity} #{session_name}"])?;
+        if !out.success {
+            return Ok(None);
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut cols = l.trim().splitn(2, ' ');
+                let activity: i64 = cols.next()?.trim().parse().ok()?;
+                let name = cols.next()?.trim().to_string();
+                (!name.is_empty()).then_some((activity, name))
+            })
+            .max_by_key(|(activity, _)| *activity)
+            .map(|(_, name)| name))
     }
 
     pub fn list_sessions(&self) -> io::Result<Vec<String>> {
@@ -126,6 +151,22 @@ impl<R: CommandRunner> Tmux<R> {
 
     pub fn host_tty(&self) -> io::Result<Option<String>> {
         let out = self.run(&["list-clients", "-F", "#{client_tty}"])?;
+        if !out.success {
+            return Ok(None);
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .find(|l| !l.is_empty()))
+    }
+
+    /// The session the (first) embedded client is currently attached to. Unlike
+    /// the slug we set when issuing `switch-client`, this reflects tmux's real
+    /// state — including an auto-switch to another session when the viewed one
+    /// is destroyed (`detach-on-destroy off`). `None` if no client is attached.
+    pub fn client_session(&self) -> io::Result<Option<String>> {
+        let out = self.run(&["list-clients", "-F", "#{client_session}"])?;
         if !out.success {
             return Ok(None);
         }
@@ -204,7 +245,7 @@ mod tests {
         assert!(tmux.has_session("src").unwrap());
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "has-session", "-t", "src"]
+            vec!["-S", "runner", "has-session", "-t", "src"]
         );
     }
 
@@ -216,7 +257,7 @@ mod tests {
         tmux.set_global_option("detach-on-destroy", "off").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "set", "-g", "detach-on-destroy", "off"]
+            vec!["-S", "runner", "set", "-g", "detach-on-destroy", "off"]
         );
     }
 
@@ -228,7 +269,7 @@ mod tests {
         tmux.new_session("src", Path::new("/tmp/proj/src"), None).unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src"]
+            vec!["-S", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src"]
         );
     }
 
@@ -241,7 +282,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src", "claude"]
+            vec!["-S", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src", "claude"]
         );
     }
 
@@ -253,7 +294,7 @@ mod tests {
         tmux.switch_client("/dev/ttys003", "src").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "switch-client", "-c", "/dev/ttys003", "-t", "src"]
+            vec!["-S", "runner", "switch-client", "-c", "/dev/ttys003", "-t", "src"]
         );
     }
 
@@ -265,7 +306,7 @@ mod tests {
         tmux.detach_client("/dev/ttys003").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "detach-client", "-t", "/dev/ttys003"]
+            vec!["-S", "runner", "detach-client", "-t", "/dev/ttys003"]
         );
     }
 
@@ -280,6 +321,30 @@ mod tests {
         runner.push(false, "no server running");
         let tmux = Tmux::new("runner", runner);
         assert!(tmux.list_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_session_picks_highest_activity_and_none_on_failure() {
+        let runner = MockRunner::new();
+        // tests-shell has the newest activity, so it's the one to recover into.
+        runner.push(true, "100 src-claude\n145 tests-shell\n90 root-shell\n");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), Some("tests-shell".to_string()));
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-S", "runner", "list-sessions", "-F", "#{session_activity} #{session_name}"]
+        );
+
+        // No server / no sessions -> None so the caller spawns nothing.
+        let runner = MockRunner::new();
+        runner.push(false, "no server running");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), None);
+
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.latest_session().unwrap(), None);
     }
 
     #[test]
@@ -298,7 +363,7 @@ mod tests {
         tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "set-option", "-t", "src-shell", "@rm", "shell /tmp/proj/src"]
+            vec!["-S", "runner", "set-option", "-t", "src-shell", "@rm", "shell /tmp/proj/src"]
         );
     }
 
@@ -311,13 +376,31 @@ mod tests {
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}"]
+            vec!["-S", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}"]
         );
         assert_eq!(infos.len(), 3);
         assert_eq!(infos[0], SessionInfo { name: "src-claude".into(), dir: "/tmp/proj/src".into(), kind: "claude".into() });
         assert_eq!(infos[1], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into() });
         // scratch (no tag) -> empty dir/kind so it won't be adopted into the tree
         assert_eq!(infos[2], SessionInfo { name: "scratch".into(), dir: String::new(), kind: String::new() });
+    }
+
+    #[test]
+    fn client_session_returns_first_nonempty() {
+        let runner = MockRunner::new();
+        runner.push(true, "src-shell\n");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.client_session().unwrap(), Some("src-shell".to_string()));
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-S", "runner", "list-clients", "-F", "#{client_session}"]
+        );
+
+        // No client attached / no server -> None.
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        assert_eq!(tmux.client_session().unwrap(), None);
     }
 
     #[test]
@@ -328,7 +411,7 @@ mod tests {
         tmux.send_keys("src", "vi -- a.rs").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-L", "runner", "send-keys", "-t", "src", "vi -- a.rs", "Enter"]
+            vec!["-S", "runner", "send-keys", "-t", "src", "vi -- a.rs", "Enter"]
         );
     }
 }

@@ -9,16 +9,20 @@ multiple tmux sessions (shell or claude), shown as rows under it.
 - Runs directly in your terminal (NOT inside tmux); draws a fixed two-pane
   layout on the alternate screen.
 - `a` (or clicking the `[+]` next to a directory name) opens a chooser to start
-  a **shell** or **claude** session in that directory, on the `tmux -L runner`
-  server. Sessions appear as rows under the directory (prefixed `$` for shell,
-  `✦` for claude) and disappear when their shell exits.
+  a **shell** or **claude** session in that directory, on a project-local
+  `pjma.sock` tmux server (`tmux -S <root>/.pjma/pjma.sock`). Sessions appear as
+  rows under the directory (prefixed `$` for shell, `✦` for claude) and disappear
+  when their shell exits.
 - `x` (or clicking the `[×]` next to a session name) closes that session,
-  killing it on the `-L runner` server and removing its row.
+  killing it on the `pjma.sock` server and removing its row.
 - Quitting the tool does **not** close your tmux sessions — they keep running on
-  the `-L runner` socket. Reopen runner-manager and they are listed again under
-  their directories.
+  the `<root>/.pjma/pjma.sock` socket. Reopen runner-manager and they are listed
+  again under their directories.
 - Selecting a session row shows it in the right pane (embedded terminal).
   Selecting a file shows it in a read-only viewer in the right pane.
+- Per-project state lives in a `<root>/.pjma/` config directory (the tmux socket
+  plus the saved tree state). Which directories you have expanded is remembered
+  across runs.
 
 ## Usage
 
@@ -40,7 +44,7 @@ runner-manager
 | `q`            | quit (tree focus)                                   |
 | `Ctrl-q`       | toggle focus between tree and the right pane        |
 | left-click     | focus a pane; in the tree, act on the clicked row   |
-| scroll wheel   | scroll the tree pane (scrollbar shows when needed)  |
+| scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
 | drag border    | resize the tree/terminal split                      |
 
 In the new-session form: `↑`/`↓`/`j`/`k` move between rows (selecting `claude`

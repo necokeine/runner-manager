@@ -27,6 +27,17 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
     }
 }
 
+/// Encode a mouse-wheel tick as an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`)
+/// for the PTY. The right pane is an embedded tmux client with `mouse on`, so
+/// forwarding the wheel lets tmux scroll its own scrollback (copy-mode) — i.e.
+/// show the old logs — or hand the wheel to a full-screen app that grabbed the
+/// mouse. Wheel-up is button 64, wheel-down 65; `col`/`row` are 1-based and
+/// relative to the terminal pane's top-left.
+pub fn encode_wheel(up: bool, col: u16, row: u16) -> Vec<u8> {
+    let button = if up { 64 } else { 65 };
+    format!("\x1b[<{button};{col};{row}M").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +85,13 @@ mod tests {
     fn unmapped_keys_produce_no_bytes() {
         assert!(encode_key(k(KeyCode::F(5))).is_empty());
         assert!(encode_key(k(KeyCode::Insert)).is_empty());
+    }
+
+    #[test]
+    fn wheel_encodes_sgr_with_button_and_coords() {
+        // Wheel-up at column 3, row 7 (1-based, pane-relative).
+        assert_eq!(encode_wheel(true, 3, 7), b"\x1b[<64;3;7M".to_vec());
+        // Wheel-down uses button 65.
+        assert_eq!(encode_wheel(false, 12, 1), b"\x1b[<65;12;1M".to_vec());
     }
 }

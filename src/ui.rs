@@ -298,12 +298,22 @@ pub fn render<R: CommandRunner>(
         f.render_widget(para, right_area);
     } else {
         let block = Block::default()
-            .title("terminal")
+            .title(app.terminal_title())
             .borders(Borders::ALL)
             .border_style(border_style(right_focused));
         f.render_widget(block, right_area);
-        let screen = screen.expect("terminal screen present when viewer is None");
-        f.render_widget(PseudoTerminal::new(screen), right_inner);
+        match screen {
+            // The embedded client is live: render its vt100 screen.
+            Some(screen) => f.render_widget(PseudoTerminal::new(screen), right_inner),
+            // No embedded session yet (fresh start, nothing to recover). Show a
+            // hint instead of a live terminal until the user starts one.
+            None => {
+                let hint = Paragraph::new("no active session\n\nselect a directory and press 'a' to start one")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+                f.render_widget(hint, right_inner);
+            }
+        }
     }
 
     Layout {
@@ -347,6 +357,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "",
         "right pane focused: type into the shell, or",
         "j/k/PgUp/PgDn to scroll a file view",
+        "wheel over the terminal scrolls its history (old logs)",
         "",
         "— press any key to close —",
     ];

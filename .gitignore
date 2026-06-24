@@ -1,0 +1,4 @@
+/target
+# Project-local config dir created at runtime under the tree root: holds the
+# tmux socket (pjma.sock) and the saved tree state.
+.pjma/
