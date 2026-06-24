@@ -304,6 +304,27 @@ impl<R: CommandRunner> App<R> {
         Ok(())
     }
 
+    /// Close (kill) the session at row `idx`, if that row is a session. As long
+    /// as another session remains, the embedded client survives —
+    /// `detach-on-destroy off` makes tmux switch it to one of them rather than
+    /// detaching, and the next `sync` reconciles `current_session`. The row is
+    /// dropped from the store immediately for instant feedback; the periodic
+    /// `sync` would otherwise prune it a beat later.
+    pub fn close_session(&mut self, idx: usize) -> io::Result<()> {
+        let Some(row) = self.rows.get(idx) else {
+            return Ok(());
+        };
+        let RowKind::Session { slug, .. } = &row.kind else {
+            return Ok(());
+        };
+        let slug = slug.clone();
+        self.tmux.kill_session(&slug)?;
+        self.store.remove(&slug);
+        self.status = format!("closed {slug}");
+        self.rebuild_rows();
+        Ok(())
+    }
+
     pub fn open_file(&mut self, path: &Path) {
         self.viewer = Some(FileView::load(path));
         self.status = format!("viewing {}", path.display());
@@ -791,6 +812,41 @@ mod tests {
         app.selected = file_idx;
         app.activate().unwrap(); // open file in viewer
         assert_eq!(app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn close_session_kills_tmux_and_drops_the_row() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+        let calls_before = app.tmux.runner.call_count();
+        app.tmux.runner.push(true, ""); // kill-session
+        app.close_session(sess_idx).unwrap();
+        // the kill-session call targets the session's slug
+        let kill = app.tmux.runner.nth_call(calls_before);
+        assert_eq!(kill[2], "kill-session");
+        assert_eq!(kill[4], "src-shell");
+        // and the session row is gone immediately
+        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn close_session_on_a_non_session_row_is_a_noop() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        // src is a directory row, not a session -> nothing happens, no tmux call
+        app.close_session(src_idx).unwrap();
+        assert_eq!(app.tmux.runner.call_count(), 0);
     }
 
     #[test]

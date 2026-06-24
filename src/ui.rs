@@ -31,6 +31,7 @@ pub struct ListLayout {
 pub enum Hit {
     Row(usize),
     Button(usize),
+    Close(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,15 +58,26 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> O
     if idx >= layout.row_count {
         return None;
     }
-    // The `[+]` button is drawn right after a directory's name (see `row_line`),
-    // so its hit region is per-row: `content_x + <left width> + 1 ..= + 3`.
+    // The `[+]` (dir) and `[×]` (session) buttons are drawn right after the
+    // row's name (see `row_line`), so each hit region is per-row:
+    // `content_x + <left width> + 1 ..= + 3`.
     if let Some(r) = rows.get(idx) {
-        if matches!(r.kind, RowKind::Dir { .. }) {
-            let left = dir_left(r).chars().count() as u16;
-            let bstart = layout.content_x + left + 1;
-            if col >= bstart && col <= bstart + 2 {
-                return Some(Hit::Button(idx));
+        match &r.kind {
+            RowKind::Dir { .. } => {
+                let left = dir_left(r).chars().count() as u16;
+                let bstart = layout.content_x + left + 1;
+                if col >= bstart && col <= bstart + 2 {
+                    return Some(Hit::Button(idx));
+                }
             }
+            RowKind::Session { .. } => {
+                let left = session_left(r).chars().count() as u16;
+                let bstart = layout.content_x + left + 1;
+                if col >= bstart && col <= bstart + 2 {
+                    return Some(Hit::Close(idx));
+                }
+            }
+            RowKind::File => {}
         }
     }
     Some(Hit::Row(idx))
@@ -100,19 +112,27 @@ fn dir_left(row: &Row) -> String {
     format!("{indent}{icon}{}", row.label)
 }
 
+/// A session row's text up to (but not including) the `[×]` close button:
+/// indent + kind mark + name. A distinct prefix mark per kind keeps sessions
+/// from reading like files. Shared by the renderer and the click hit-test so
+/// the close button's column always lines up with what's drawn.
+fn session_left(row: &Row) -> String {
+    let indent = "  ".repeat(row.depth);
+    let mark = match &row.kind {
+        RowKind::Session { kind: SessionKind::Shell, .. } => "$ ",
+        RowKind::Session { kind: SessionKind::Claude, .. } => "✦ ",
+        _ => "",
+    };
+    format!("{indent}{mark}{}", row.label)
+}
+
 fn row_line(row: &Row) -> String {
     let indent = "  ".repeat(row.depth);
     match &row.kind {
         // The button sits right after the directory name rather than far right.
         RowKind::Dir { .. } => format!("{} [+]", dir_left(row)),
-        // A distinct prefix mark per kind so sessions don't read like files.
-        RowKind::Session { kind, .. } => {
-            let mark = match kind {
-                SessionKind::Shell => "$ ",
-                SessionKind::Claude => "✦ ",
-            };
-            format!("{indent}{mark}{}", row.label)
-        }
+        // A close button sits right after the session name, mirroring `[+]`.
+        RowKind::Session { .. } => format!("{} [×]", session_left(row)),
         RowKind::File => format!("{indent}  {}", row.label),
     }
 }
@@ -329,6 +349,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "k / ↑      move up",
         "Enter      expand dir / switch session / view file",
         "a / [+]    new session (shell or claude) on a dir",
+        "x / [×]    close the selected session",
         "wheel      scroll the tree (scrollbar shows when needed)",
         "h / ?      this help",
         "Ctrl-q     toggle focus (tree / right pane)",
@@ -416,11 +437,32 @@ mod tests {
     fn row_line_places_button_after_name_and_marks_sessions() {
         let dir = dir_row("src", 0);
         assert_eq!(row_line(&dir), "▾ src [+]");
+        // Sessions carry a per-kind mark and a `[×]` close button after the name.
         let shell = Row { path: std::path::PathBuf::from("/"), label: "shell".into(), depth: 1, kind: RowKind::Session { slug: "s".into(), kind: SessionKind::Shell } };
-        assert_eq!(row_line(&shell), "  $ shell");
+        assert_eq!(row_line(&shell), "  $ shell [×]");
         let claude = Row { path: std::path::PathBuf::from("/"), label: "claude".into(), depth: 1, kind: RowKind::Session { slug: "c".into(), kind: SessionKind::Claude } };
-        assert_eq!(row_line(&claude), "  ✦ claude");
+        assert_eq!(row_line(&claude), "  ✦ claude [×]");
         assert_eq!(row_line(&file_row("a.rs")), "  a.rs");
+    }
+
+    #[test]
+    fn resolve_click_hits_session_close_button() {
+        // content_x=0; row 1 is a depth-1 shell session "shell": session_left is
+        // "  $ shell" (9 chars), so "[×]" occupies columns 10,11,12.
+        let sess = Row {
+            path: std::path::PathBuf::from("/"),
+            label: "shell".into(),
+            depth: 1,
+            kind: RowKind::Session { slug: "src-shell".into(), kind: SessionKind::Shell },
+        };
+        let rows = vec![file_row("a"), sess];
+        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 2, offset: 0, view_h: 10 };
+        // clicking the name (not the cross) selects the row
+        assert_eq!(resolve_click(3, 2, &layout, &rows), Some(Hit::Row(1)));
+        // clicking the cross closes the session
+        assert_eq!(resolve_click(11, 2, &layout, &rows), Some(Hit::Close(1)));
+        // just past the cross is still the row, not the close button
+        assert_eq!(resolve_click(13, 2, &layout, &rows), Some(Hit::Row(1)));
     }
 
     #[test]

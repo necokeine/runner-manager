@@ -169,6 +169,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                         app.popup = Popup::Help;
                                     }
                                     KeyCode::Char('a') => app.open_chooser(),
+                                    KeyCode::Char('x') => {
+                                        let _ = app.close_session(app.selected);
+                                    }
                                     KeyCode::Char('j') | KeyCode::Down => app.down(),
                                     KeyCode::Char('k') | KeyCode::Up => app.up(),
                                     KeyCode::Enter => {
@@ -230,6 +233,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                         Some(Hit::Button(idx)) => {
                                             app.selected = idx;
                                             app.open_chooser();
+                                        }
+                                        Some(Hit::Close(idx)) => {
+                                            app.selected = idx;
+                                            let _ = app.close_session(idx);
                                         }
                                         None => {}
                                     }
