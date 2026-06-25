@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::claude::{self, ResumeSession};
 use crate::config::Config;
 use crate::rows::{build_rows, Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
@@ -36,6 +37,10 @@ pub enum ChooserRow {
     KindClaude,
     PermNormal,
     PermSkip,
+    /// Start a fresh claude session (the default when resumes are offered).
+    ResumeNew,
+    /// Resume the i-th discovered session in `App::chooser_resumes`.
+    Resume(usize),
     Cancel,
     Create,
 }
@@ -48,6 +53,9 @@ pub enum Popup {
         dir: PathBuf,
         kind: SessionKind,
         perm: ClaudePerm,
+        /// Which existing Claude session to resume: `None` = start fresh,
+        /// `Some(i)` = resume `App::chooser_resumes[i]`.
+        resume: Option<usize>,
         focus: usize,
     },
     /// "Really close this session?" — opened by `x`/`[×]`, resolved by
@@ -70,6 +78,9 @@ pub struct App<R: CommandRunner> {
     pub viewer: Option<FileView>,
     pub focus: Focus,
     pub popup: Popup,
+    /// Resumable Claude sessions for the directory the chooser is open on,
+    /// discovered when the chooser opens. Indexed by `ChooserRow::Resume`.
+    pub chooser_resumes: Vec<ResumeSession>,
     pub status: String,
     pub split_pct: u16,
     /// Index of the first tree row shown (scroll position). Reconciled against
@@ -101,6 +112,7 @@ impl<R: CommandRunner> App<R> {
             viewer: None,
             focus: Focus::Tree,
             popup: Popup::None,
+            chooser_resumes: Vec::new(),
             status: String::new(),
             split_pct: DEFAULT_SPLIT,
             tree_offset: 0,
@@ -175,10 +187,17 @@ impl<R: CommandRunner> App<R> {
     pub fn open_chooser(&mut self) {
         if let Some(row) = self.selected_row() {
             if matches!(row.kind, RowKind::Dir { .. }) {
+                let dir = row.path.clone();
+                // Discover any resumable Claude sessions for this directory now,
+                // so the chooser can offer them once the user picks "claude".
+                self.chooser_resumes = claude::projects_base()
+                    .map(|base| claude::list_sessions(&base, &dir))
+                    .unwrap_or_default();
                 self.popup = Popup::Chooser {
-                    dir: row.path.clone(),
+                    dir,
                     kind: SessionKind::Shell,
                     perm: ClaudePerm::Normal,
+                    resume: None,
                     focus: 0,
                 };
             }
@@ -191,6 +210,13 @@ impl<R: CommandRunner> App<R> {
         if let Popup::Chooser { kind: SessionKind::Claude, .. } = self.popup {
             rows.push(ChooserRow::PermNormal);
             rows.push(ChooserRow::PermSkip);
+            // Offer the resume picker only when there is history to resume.
+            if !self.chooser_resumes.is_empty() {
+                rows.push(ChooserRow::ResumeNew);
+                for i in 0..self.chooser_resumes.len() {
+                    rows.push(ChooserRow::Resume(i));
+                }
+            }
         }
         rows.push(ChooserRow::Cancel);
         rows.push(ChooserRow::Create);
@@ -225,12 +251,14 @@ impl<R: CommandRunner> App<R> {
     /// Apply the radio-follows-focus rule for the given row.
     fn chooser_apply_focus(&mut self, row: ChooserRow) {
         // Apply radio selection first (this may change `kind`, which changes the row set).
-        if let Popup::Chooser { kind, perm, .. } = &mut self.popup {
+        if let Popup::Chooser { kind, perm, resume, .. } = &mut self.popup {
             match row {
                 ChooserRow::KindShell => *kind = SessionKind::Shell,
                 ChooserRow::KindClaude => *kind = SessionKind::Claude,
                 ChooserRow::PermNormal => *perm = ClaudePerm::Normal,
                 ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
+                ChooserRow::ResumeNew => *resume = None,
+                ChooserRow::Resume(i) => *resume = Some(i),
                 _ => {}
             }
         }
@@ -244,7 +272,7 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn chooser_activate(&mut self) -> io::Result<()> {
-        let Popup::Chooser { dir, kind, perm, focus } = self.popup.clone() else {
+        let Popup::Chooser { dir, kind, perm, resume, focus } = self.popup.clone() else {
             return Ok(());
         };
         let rows = self.chooser_rows();
@@ -253,7 +281,10 @@ impl<R: CommandRunner> App<R> {
                 self.popup = Popup::None;
             }
             Some(ChooserRow::Create) => {
-                let cmd = Self::chooser_command(kind, perm);
+                let resume_id = resume
+                    .and_then(|i| self.chooser_resumes.get(i))
+                    .map(|s| s.id.as_str());
+                let cmd = Self::chooser_command(kind, perm, resume_id);
                 self.popup = Popup::None;
                 self.create_session(&dir, kind, cmd.as_deref())?;
             }
@@ -266,13 +297,27 @@ impl<R: CommandRunner> App<R> {
         self.popup = Popup::None;
     }
 
-    pub fn chooser_command(kind: SessionKind, perm: ClaudePerm) -> Option<String> {
+    /// Build the launch command for a session. Shell sessions run the default
+    /// shell (`None`). Claude sessions run `claude`, optionally resuming an
+    /// existing session (`--resume <id>`) and/or skipping permission prompts.
+    pub fn chooser_command(
+        kind: SessionKind,
+        perm: ClaudePerm,
+        resume_id: Option<&str>,
+    ) -> Option<String> {
         match kind {
             SessionKind::Shell => None,
-            SessionKind::Claude => match perm {
-                ClaudePerm::Normal => Some("claude".to_string()),
-                ClaudePerm::Skip => Some("claude --dangerously-skip-permissions".to_string()),
-            },
+            SessionKind::Claude => {
+                let mut cmd = String::from("claude");
+                if let Some(id) = resume_id {
+                    cmd.push_str(" --resume ");
+                    cmd.push_str(id);
+                }
+                if perm == ClaudePerm::Skip {
+                    cmd.push_str(" --dangerously-skip-permissions");
+                }
+                Some(cmd)
+            }
         }
     }
 
@@ -776,16 +821,86 @@ mod tests {
         }
     }
 
+    fn fake_resume(id: &str, last: &str) -> ResumeSession {
+        ResumeSession {
+            id: id.to_string(),
+            last_command: last.to_string(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn claude_chooser_lists_resume_rows_when_history_exists() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        // Inject discovered sessions (open_chooser found none for the tempdir).
+        app.chooser_resumes = vec![fake_resume("aaa", "do a thing"), fake_resume("bbb", "do another")];
+        app.chooser_move(1); // focus -> claude
+        assert_eq!(
+            app.chooser_rows(),
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::PermNormal,
+                ChooserRow::PermSkip,
+                ChooserRow::ResumeNew,
+                ChooserRow::Resume(0),
+                ChooserRow::Resume(1),
+                ChooserRow::Cancel,
+                ChooserRow::Create,
+            ]
+        );
+        // Switching back to shell hides the resume rows again.
+        app.chooser_click(ChooserRow::KindShell).unwrap();
+        assert_eq!(
+            app.chooser_rows(),
+            vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::Cancel, ChooserRow::Create]
+        );
+    }
+
+    #[test]
+    fn chooser_create_claude_resume_appends_resume_flag() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_resumes = vec![fake_resume("sess-xyz", "fix the parser")];
+        app.chooser_click(ChooserRow::KindClaude).unwrap();
+        app.chooser_click(ChooserRow::Resume(0)).unwrap();
+        if let Popup::Chooser { resume, .. } = app.popup {
+            assert_eq!(resume, Some(0));
+        } else {
+            panic!("expected chooser");
+        }
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_click(ChooserRow::Create).unwrap();
+        assert!(app
+            .tmux
+            .runner
+            .nth_call(0)
+            .contains(&"claude --resume sess-xyz".to_string()));
+    }
+
     #[test]
     fn chooser_command_maps_kind_and_perm() {
-        assert_eq!(App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal), None);
+        assert_eq!(App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal, None), None);
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal).as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, None).as_deref(),
             Some("claude")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip).as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, None).as_deref(),
             Some("claude --dangerously-skip-permissions")
+        );
+        // Resuming an existing session injects --resume <id>, before the perm flag.
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, Some("abc-123")).as_deref(),
+            Some("claude --resume abc-123")
+        );
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, Some("abc-123")).as_deref(),
+            Some("claude --resume abc-123 --dangerously-skip-permissions")
         );
     }
 

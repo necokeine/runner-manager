@@ -107,13 +107,21 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             drop(screen_guard);
             match &app.popup {
                 Popup::Help => ui::render_help(f, f.area()),
-                Popup::Chooser { kind, perm, focus, .. } => {
+                Popup::Chooser { kind, perm, resume, focus, .. } => {
                     let focus_row = app
                         .chooser_rows()
                         .get(*focus)
                         .copied()
                         .unwrap_or(crate::app::ChooserRow::KindShell);
-                    chooser_row_ys = ui::render_chooser(f, f.area(), *kind, *perm, focus_row);
+                    chooser_row_ys = ui::render_chooser(
+                        f,
+                        f.area(),
+                        *kind,
+                        *perm,
+                        &app.chooser_resumes,
+                        *resume,
+                        focus_row,
+                    );
                 }
                 Popup::ConfirmClose { slug } => {
                     confirm_row_ys = ui::render_confirm_close(f, f.area(), slug);
