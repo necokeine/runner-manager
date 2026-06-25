@@ -501,6 +501,8 @@ mod tests {
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
+        // focus starts on the tree before the session is created
+        assert_eq!(app.focus, Focus::Tree);
         focus_create(&mut app);
         app.chooser_activate().unwrap();
         assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
@@ -513,6 +515,28 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(r.kind, RowKind::Session { .. }) && r.label == "shell"));
+        // NEC-13: focus moves to the new session (right pane), not the tree
+        assert_eq!(app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn chooser_create_when_no_client_focuses_new_session() {
+        // Fresh start: no embedded client attached yet (list-clients empty), so
+        // create falls into the respawn path. Focus must still move to the new
+        // session rather than staying on the tree (NEC-13).
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        assert_eq!(app.focus, Focus::Tree);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, ""); // list-clients -> no host tty
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        // no switch-client issued; the run loop will respawn the PTY into this slug
+        assert!(app.pending_respawn.is_some());
+        assert_eq!(app.focus, Focus::Right);
     }
 
     #[test]
