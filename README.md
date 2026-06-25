@@ -23,6 +23,11 @@ multiple tmux sessions (shell or claude), shown as rows under it.
 - Per-project state lives in a `<root>/.pjma/` config directory (the tmux socket
   plus the saved tree state). Which directories you have expanded is remembered
   across runs.
+- Only **one** runner-manager may run per root directory at a time. Launching a
+  second one in the same tree (both would share the one `pjma.sock` and embedded
+  client) is rejected with an error instead of starting. The guard is an
+  advisory lock on `<root>/.pjma/pjma.lock`, released automatically when the
+  process exits — even on a crash — so there is no stale lock to clean up.
 
 ## Usage
 
