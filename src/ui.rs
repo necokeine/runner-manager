@@ -349,7 +349,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "k / ↑      move up",
         "Enter      expand dir / switch session / view file",
         "a / [+]    new session (shell or claude) on a dir",
-        "x / [×]    close the selected session",
+        "x / [×]    close the selected session (asks to confirm)",
         "wheel      scroll the tree (scrollbar shows when needed)",
         "h / ?      this help",
         "Ctrl-q     toggle focus (tree / right pane)",
@@ -416,6 +416,37 @@ pub fn render_chooser(
     y += 1;
     lines.push(Line::from(format!("{}[ Create ]", arrow(ChooserRow::Create))));
     row_ys.push((y, ChooserRow::Create));
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
+    row_ys
+}
+
+/// Draw the "really close this session?" confirmation. Returns the screen `y` of
+/// each clickable button paired with its choice (`true` = Yes), so `run.rs` can
+/// resolve a mouse click the same way it does the chooser's rows.
+pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, bool)> {
+    let popup = centered_rect(50, 30, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default().title("Close session").borders(Borders::ALL);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut row_ys: Vec<(u16, bool)> = Vec::new();
+    let mut y = inner.y;
+
+    lines.push(Line::from(format!("Close session \"{slug}\"?")));
+    y += 1;
+    lines.push(Line::from("This kills its tmux session.".to_string()));
+    y += 1;
+    lines.push(Line::from(String::new()));
+    y += 1;
+    lines.push(Line::from("[ Yes ]   y / Enter".to_string()));
+    row_ys.push((y, true));
+    y += 1;
+    lines.push(Line::from("[ No ]    n / Esc".to_string()));
+    row_ys.push((y, false));
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);

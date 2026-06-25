@@ -91,6 +91,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut area_width: u16 = 0;
     let mut dragging_split = false;
     let mut chooser_row_ys: Vec<(u16, crate::app::ChooserRow)> = Vec::new();
+    let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
 
     let result = loop {
         let mut captured: Option<ui::Layout> = None;
@@ -113,6 +114,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         .copied()
                         .unwrap_or(crate::app::ChooserRow::KindShell);
                     chooser_row_ys = ui::render_chooser(f, f.area(), *kind, *perm, focus_row);
+                }
+                Popup::ConfirmClose { slug } => {
+                    confirm_row_ys = ui::render_confirm_close(f, f.area(), slug);
                 }
                 Popup::None => {}
             }
@@ -156,6 +160,15 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         KeyCode::Up | KeyCode::Char('k') => app.chooser_move(-1),
                         _ => {}
                     },
+                    Popup::ConfirmClose { .. } => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            let _ = app.confirm_close();
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.cancel_close()
+                        }
+                        _ => {}
+                    },
                     Popup::None => {
                         if key.code == KeyCode::Char('q')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -169,9 +182,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                         app.popup = Popup::Help;
                                     }
                                     KeyCode::Char('a') => app.open_chooser(),
-                                    KeyCode::Char('x') => {
-                                        let _ = app.close_session(app.selected);
-                                    }
+                                    KeyCode::Char('x') => app.request_close(app.selected),
                                     KeyCode::Char('j') | KeyCode::Down => app.down(),
                                     KeyCode::Char('k') | KeyCode::Up => app.up(),
                                     KeyCode::Enter => {
@@ -214,6 +225,15 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                             None => app.chooser_cancel(),
                         }
                     }
+                    Popup::ConfirmClose { .. } => {
+                        match confirm_row_ys.iter().find(|(y, _)| *y == m.row) {
+                            Some((_, true)) => {
+                                let _ = app.confirm_close();
+                            }
+                            // The No button or anywhere else dismisses.
+                            _ => app.cancel_close(),
+                        }
+                    }
                     Popup::None => {
                         let border = layout.split_col;
                         let on_border =
@@ -236,7 +256,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                         }
                                         Some(Hit::Close(idx)) => {
                                             app.selected = idx;
-                                            let _ = app.close_session(idx);
+                                            app.request_close(idx);
                                         }
                                         None => {}
                                     }

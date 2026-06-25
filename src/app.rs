@@ -50,6 +50,12 @@ pub enum Popup {
         perm: ClaudePerm,
         focus: usize,
     },
+    /// "Really close this session?" — opened by `x`/`[×]`, resolved by
+    /// `confirm_close`/`cancel_close`. Keyed off the slug (not a row index) so a
+    /// periodic `sync` between opening and confirming can't redirect the kill.
+    ConfirmClose {
+        slug: String,
+    },
 }
 
 pub struct App<R: CommandRunner> {
@@ -323,6 +329,44 @@ impl<R: CommandRunner> App<R> {
         self.status = format!("closed {slug}");
         self.rebuild_rows();
         Ok(())
+    }
+
+    /// Ask before closing: if `idx` is a session row, open the confirmation
+    /// popup keyed off its slug. Non-session rows are a no-op, mirroring
+    /// `close_session`, so no popup ever appears for a dir or file row.
+    pub fn request_close(&mut self, idx: usize) {
+        let Some(row) = self.rows.get(idx) else {
+            return;
+        };
+        let RowKind::Session { slug, .. } = &row.kind else {
+            return;
+        };
+        self.popup = Popup::ConfirmClose { slug: slug.clone() };
+    }
+
+    /// Confirm the pending close: dismiss the popup and kill the session named
+    /// by it. The slug is re-resolved to a current row index rather than trusted
+    /// as-is, so a `sync` that reshuffled rows can't make us kill the wrong one
+    /// (and a session that already exited just no-ops). Not a `ConfirmClose`
+    /// popup -> nothing happens.
+    pub fn confirm_close(&mut self) -> io::Result<()> {
+        let Popup::ConfirmClose { slug } = self.popup.clone() else {
+            return Ok(());
+        };
+        self.popup = Popup::None;
+        let idx = self
+            .rows
+            .iter()
+            .position(|r| matches!(&r.kind, RowKind::Session { slug: s, .. } if *s == slug));
+        match idx {
+            Some(idx) => self.close_session(idx),
+            None => Ok(()),
+        }
+    }
+
+    /// Dismiss the confirmation popup without closing anything.
+    pub fn cancel_close(&mut self) {
+        self.popup = Popup::None;
     }
 
     pub fn open_file(&mut self, path: &Path) {
@@ -862,6 +906,73 @@ mod tests {
         assert_eq!(kill[4], "src-shell");
         // and the session row is gone immediately
         assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn request_close_opens_a_confirm_popup_then_confirm_kills() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+
+        // Requesting a close only opens the popup — no tmux call yet.
+        let calls_before = app.tmux.runner.call_count();
+        app.request_close(sess_idx);
+        assert!(matches!(app.popup, Popup::ConfirmClose { ref slug } if slug == "src-shell"));
+        assert_eq!(app.tmux.runner.call_count(), calls_before);
+        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+
+        // Confirming dismisses the popup and kills the session.
+        app.tmux.runner.push(true, ""); // kill-session
+        app.confirm_close().unwrap();
+        let kill = app.tmux.runner.nth_call(calls_before);
+        assert_eq!(kill[2], "kill-session");
+        assert_eq!(kill[4], "src-shell");
+        assert!(matches!(app.popup, Popup::None));
+        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn cancel_close_dismisses_without_killing() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+
+        app.request_close(sess_idx);
+        let calls_before = app.tmux.runner.call_count();
+        app.cancel_close();
+        // Popup gone, session untouched, no tmux call issued.
+        assert!(matches!(app.popup, Popup::None));
+        assert_eq!(app.tmux.runner.call_count(), calls_before);
+        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn request_close_on_a_non_session_row_opens_no_popup() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.request_close(src_idx);
+        assert!(matches!(app.popup, Popup::None));
+        assert_eq!(app.tmux.runner.call_count(), 0);
     }
 
     #[test]
