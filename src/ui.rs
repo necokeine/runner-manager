@@ -10,6 +10,7 @@ use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, ChooserRow, Focus};
+use crate::claude::ResumeSession;
 use crate::rows::{Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
@@ -373,6 +374,8 @@ pub fn render_chooser(
     area: Rect,
     kind: SessionKind,
     perm: ClaudePerm,
+    resumes: &[ResumeSession],
+    resume_sel: Option<usize>,
     focus_row: ChooserRow,
 ) -> Vec<(u16, ChooserRow)> {
     let popup = centered_rect(50, 60, area);
@@ -407,6 +410,32 @@ pub fn render_chooser(
         lines.push(Line::from(format!("{}{} skip (--dangerously-skip-permissions)", arrow(ChooserRow::PermSkip), radio(perm == ClaudePerm::Skip))));
         row_ys.push((y, ChooserRow::PermSkip));
         y += 1;
+
+        // Resume picker: only shown when this directory has Claude history.
+        if !resumes.is_empty() {
+            lines.push(Line::from("Resume:".to_string()));
+            y += 1;
+            lines.push(Line::from(format!(
+                "{}{} new session",
+                arrow(ChooserRow::ResumeNew),
+                radio(resume_sel.is_none())
+            )));
+            row_ys.push((y, ChooserRow::ResumeNew));
+            y += 1;
+            // Keep the label inside the popup; reserve room for the "> (•) " prefix.
+            let label_width = (inner.width as usize).saturating_sub(7);
+            for (i, s) in resumes.iter().enumerate() {
+                let row = ChooserRow::Resume(i);
+                lines.push(Line::from(format!(
+                    "{}{} {}",
+                    arrow(row),
+                    radio(resume_sel == Some(i)),
+                    resume_label(s, label_width)
+                )));
+                row_ys.push((y, row));
+                y += 1;
+            }
+        }
     }
 
     lines.push(Line::from(String::new()));
@@ -451,6 +480,31 @@ pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
     row_ys
+}
+
+/// One-line label for a resumable session: its last prompt, or a short id when
+/// the transcript has no plain prompt yet, truncated to `max` columns.
+fn resume_label(s: &ResumeSession, max: usize) -> String {
+    let text = if s.last_command.is_empty() {
+        let short: String = s.id.chars().take(8).collect();
+        format!("({short}…)")
+    } else {
+        s.last_command.clone()
+    };
+    truncate(&text, max)
+}
+
+/// Truncate to at most `max` columns, appending '…' when shortened.
+fn truncate(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -772,6 +826,8 @@ mod tests {
                     f.area(),
                     SessionKind::Claude,
                     ClaudePerm::Skip,
+                    &[],
+                    None,
                     ChooserRow::Create,
                 );
                 assert!(rows.iter().any(|(_, r)| *r == ChooserRow::Create));
@@ -784,5 +840,45 @@ mod tests {
         assert!(content.contains("skip"));
         assert!(content.contains("Cancel"));
         assert!(content.contains("Create"));
+    }
+
+    #[test]
+    fn render_chooser_shows_resume_rows() {
+        use crate::app::ChooserRow;
+        use crate::claude::ResumeSession;
+        use crate::session::{ClaudePerm, SessionKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let resumes = vec![ResumeSession {
+            id: "deadbeef-0000".into(),
+            last_command: "refactor the chooser".into(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| {
+                let rows = render_chooser(
+                    f,
+                    f.area(),
+                    SessionKind::Claude,
+                    ClaudePerm::Normal,
+                    &resumes,
+                    Some(0),
+                    ChooserRow::Resume(0),
+                );
+                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::Resume(0)));
+                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::ResumeNew));
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("Resume:"));
+        assert!(content.contains("new session"));
+        assert!(content.contains("refactor the chooser"));
     }
 }
