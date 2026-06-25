@@ -447,6 +447,7 @@ name = "runner-manager"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "serde_json",

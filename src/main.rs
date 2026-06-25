@@ -2,6 +2,8 @@ use std::env;
 use std::io;
 use std::process::Command;
 
+use runner_manager::config::Config;
+use runner_manager::lock::{InstanceLock, LockError};
 use runner_manager::run;
 
 fn main() -> io::Result<()> {
@@ -19,17 +21,56 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
     let root = env::current_dir()?;
+
+    // The config dir (`<root>/.pjma`) holds the tmux socket, the saved tree
+    // state, and the instance lock. Create it here — before the lock and before
+    // `run` touches the terminal — so a failure prints to plain stderr rather
+    // than flickering the alternate screen. `run` also calls `ensure_dir`, but
+    // it is idempotent.
+    let config = Config::new(&root);
+    if let Err(e) = config.ensure_dir() {
+        eprintln!(
+            "runner-manager: could not create config dir {}: {e}",
+            config.dir().display()
+        );
+        std::process::exit(1);
+    }
+
+    // Single-instance guard: refuse to start if another runner-manager already
+    // owns this root. Both would otherwise share one tmux socket and one
+    // embedded client, racing on switch-client/new-session and on the saved
+    // tree state. Held until the process exits, then released by the kernel.
+    let _lock = match InstanceLock::try_acquire(config.dir()) {
+        Ok(lock) => lock,
+        Err(LockError::Held) => {
+            eprintln!(
+                "runner-manager is already running in {}.\n\
+                 Only one instance is allowed per root directory. \
+                 Quit the other instance first.",
+                root.display()
+            );
+            std::process::exit(1);
+        }
+        Err(LockError::Io(e)) => {
+            eprintln!("runner-manager: could not acquire instance lock: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Use a project-local socket file inside the config dir
     // (`<root>/.pjma/pjma.sock`) so each project's tmux sessions live on their
     // own socket rather than a shared named one. `RM_SOCKET` can still override
-    // with an explicit socket path. The config dir is created in `run`.
+    // with an explicit socket path.
     let socket = env::var("RM_SOCKET").unwrap_or_else(|_| {
         root.join(runner_manager::config::DIR_NAME)
             .join("pjma.sock")
             .to_string_lossy()
             .into_owned()
     });
-    run::run(root, socket)
+    let result = run::run(root, socket);
+    // `_lock` lives until here, releasing the flock as the process exits.
+    drop(_lock);
+    result
 }
 
 /// Probe for a usable `tmux` binary before we touch the terminal. tmux is the
