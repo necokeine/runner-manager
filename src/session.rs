@@ -28,6 +28,7 @@ pub fn slugify(rel: &str) -> String {
 pub enum SessionKind {
     Shell,
     Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,14 +42,16 @@ impl SessionKind {
         match self {
             SessionKind::Shell => "shell",
             SessionKind::Claude => "claude",
+            SessionKind::Codex => "codex",
         }
     }
 
-    /// Parse the kind from a session's `@rm` tag; anything but "claude" (including
-    /// an empty/missing tag) is treated as a shell.
+    /// Parse the kind from a session's `@rm` tag; anything but a known agent tag
+    /// (including an empty/missing tag) is treated as a shell.
     pub fn from_tag(tag: &str) -> SessionKind {
         match tag {
             "claude" => SessionKind::Claude,
+            "codex" => SessionKind::Codex,
             _ => SessionKind::Shell,
         }
     }
@@ -220,8 +223,11 @@ mod tests {
     #[test]
     fn kind_from_tag_defaults_to_shell() {
         assert_eq!(SessionKind::from_tag("claude"), SessionKind::Claude);
+        assert_eq!(SessionKind::from_tag("codex"), SessionKind::Codex);
         assert_eq!(SessionKind::from_tag("shell"), SessionKind::Shell);
         assert_eq!(SessionKind::from_tag(""), SessionKind::Shell);
+        // label_base round-trips through from_tag for every agent kind.
+        assert_eq!(SessionKind::from_tag(SessionKind::Codex.label_base()), SessionKind::Codex);
     }
 
     #[test]
