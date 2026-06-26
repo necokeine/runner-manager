@@ -11,6 +11,10 @@ pub const DIR_NAME: &str = ".pjma";
 /// root-relative path per line.
 const EXPANDED_FILE: &str = "expanded";
 
+/// File (under the config dir) holding the tree-pane width percent — a single
+/// integer line. Persists the `<`/`>` and splitter-drag adjustments.
+const SPLIT_FILE: &str = "split";
+
 /// The project-local configuration directory (`<root>/.pjma`) and the state
 /// runner-manager reads/writes there. Paths are always absolute on the API
 /// surface; only the on-disk representation is root-relative so the config
@@ -68,6 +72,24 @@ impl Config {
         lines.sort();
         fs::write(self.expanded_path(), lines.join("\n"))
     }
+
+    fn split_path(&self) -> PathBuf {
+        self.dir.join(SPLIT_FILE)
+    }
+
+    /// Load the saved tree-pane width percent, or `None` if no valid value was
+    /// persisted (missing/unreadable file, or non-numeric contents). The caller
+    /// is responsible for clamping into its allowed range.
+    pub fn load_split(&self) -> Option<u16> {
+        fs::read_to_string(self.split_path()).ok()?.trim().parse().ok()
+    }
+
+    /// Persist the tree-pane width percent. Best-effort: the config dir is
+    /// created first.
+    pub fn save_split(&self, pct: u16) -> io::Result<()> {
+        self.ensure_dir()?;
+        fs::write(self.split_path(), pct.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +132,23 @@ mod tests {
         let d = tempdir().unwrap();
         let cfg = Config::new(d.path());
         assert!(cfg.load_expanded().is_empty());
+    }
+
+    #[test]
+    fn split_roundtrips() {
+        let d = tempdir().unwrap();
+        let cfg = Config::new(d.path());
+        cfg.save_split(42).unwrap();
+        assert_eq!(cfg.load_split(), Some(42));
+    }
+
+    #[test]
+    fn load_split_is_none_when_missing_or_garbage() {
+        let d = tempdir().unwrap();
+        let cfg = Config::new(d.path());
+        assert_eq!(cfg.load_split(), None);
+        cfg.ensure_dir().unwrap();
+        fs::write(d.path().join(".pjma").join("split"), "not-a-number").unwrap();
+        assert_eq!(cfg.load_split(), None);
     }
 }

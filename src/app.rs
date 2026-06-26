@@ -126,6 +126,12 @@ impl<R: CommandRunner> App<R> {
     pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
         let config = Config::new(root.clone());
+        // Restore the saved tree-pane width, clamped into the legal range in
+        // case the file was hand-edited; fall back to the default otherwise.
+        let split_pct = config
+            .load_split()
+            .map(|p| p.clamp(MIN_SPLIT, MAX_SPLIT))
+            .unwrap_or(DEFAULT_SPLIT);
         let mut app = Self {
             tree,
             store: SessionStore::new(),
@@ -142,7 +148,7 @@ impl<R: CommandRunner> App<R> {
             popup: Popup::None,
             chooser_resumes: Vec::new(),
             status: String::new(),
-            split_pct: DEFAULT_SPLIT,
+            split_pct,
             tree_offset: 0,
             pending_respawn: None,
             current_session: None,
@@ -590,10 +596,18 @@ impl<R: CommandRunner> App<R> {
 
     pub fn widen_split(&mut self) {
         self.split_pct = (self.split_pct + SPLIT_STEP).min(MAX_SPLIT);
+        self.persist_split();
     }
 
     pub fn narrow_split(&mut self) {
         self.split_pct = self.split_pct.saturating_sub(SPLIT_STEP).max(MIN_SPLIT);
+        self.persist_split();
+    }
+
+    /// Persist the current tree-pane width to the config dir. Best-effort: a
+    /// write failure leaves the layout usable, just not saved.
+    pub fn persist_split(&self) {
+        let _ = self.config.save_split(self.split_pct);
     }
 
     pub fn host_client_ready(&mut self) -> bool {
@@ -827,6 +841,29 @@ mod tests {
             app.narrow_split();
         }
         assert_eq!(app.split_pct, 15); // clamped low
+    }
+
+    #[test]
+    fn split_width_persists_across_app_instances() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // First instance: a width change is saved to <root>/.pjma/split.
+        {
+            let mut app = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+            app.widen_split(); // 35 -> 40
+            assert_eq!(app.split_pct, 40);
+        }
+
+        // A fresh instance over the same root restores the saved width.
+        let app2 = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+        assert_eq!(app2.split_pct, 40);
+    }
+
+    #[test]
+    fn split_width_falls_back_to_default_when_unsaved() {
+        let (_d, app) = app_over_tempdir();
+        assert_eq!(app.split_pct, 35);
     }
 
     #[test]

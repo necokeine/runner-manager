@@ -290,6 +290,11 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    // Save the dragged width once the drag ends, not on every
+                    // intermediate move.
+                    if dragging_split {
+                        app.persist_split();
+                    }
                     dragging_split = false;
                 }
                 MouseEventKind::ScrollDown => {
