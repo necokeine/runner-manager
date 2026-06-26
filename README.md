@@ -20,6 +20,13 @@ multiple tmux sessions (shell or claude), shown as rows under it.
   again under their directories.
 - Selecting a session row shows it in the right pane (embedded terminal).
   Selecting a file shows it in a read-only viewer in the right pane.
+- Git-changed files (and the directories containing them) are coloured
+  following `git status`'s own policy: staged changes ("Changes to be
+  committed") in green, modified-but-unstaged and untracked paths in red, and
+  git-ignored files and directories in grey. This works whether the tree root is
+  itself a repository or just a parent folder holding several separate
+  checkouts — each directory with its own `.git` is coloured from its own
+  status. The colouring refreshes as sessions edit files.
 - The left pane has two tabs, switched with `Tab` (or by clicking a tab):
   the **directory** view (the file tree above) and the **project** view, a flat
   list of every open session showing its type, directory, and a short brief
