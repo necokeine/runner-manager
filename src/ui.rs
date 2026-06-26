@@ -143,6 +143,7 @@ fn session_left(row: &Row) -> String {
     let mark = match &row.kind {
         RowKind::Session { kind: SessionKind::Shell, .. } => "$ ",
         RowKind::Session { kind: SessionKind::Claude, .. } => "✦ ",
+        RowKind::Session { kind: SessionKind::Codex, .. } => "⌬ ",
         _ => "",
     };
     format!("{indent}{mark}{}", row.label)
@@ -487,6 +488,9 @@ pub fn render_chooser(
     y += 1;
     lines.push(Line::from(format!("{}{} claude", arrow(ChooserRow::KindClaude), radio(kind == SessionKind::Claude))));
     row_ys.push((y, ChooserRow::KindClaude));
+    y += 1;
+    lines.push(Line::from(format!("{}{} codex", arrow(ChooserRow::KindCodex), radio(kind == SessionKind::Codex))));
+    row_ys.push((y, ChooserRow::KindCodex));
     y += 1;
 
     if kind == SessionKind::Claude {

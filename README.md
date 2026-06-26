@@ -2,17 +2,17 @@
 
 A standalone terminal UI: a NERDTree-style file tree (left) plus a live
 embedded terminal or read-only file viewer (right). Each directory can hold
-multiple tmux sessions (shell or claude), shown as rows under it.
+multiple tmux sessions (shell, claude, or codex), shown as rows under it.
 
 ## How it works
 
 - Runs directly in your terminal (NOT inside tmux); draws a fixed two-pane
   layout on the alternate screen.
 - `a` (or clicking the `[+]` next to a directory name) opens a chooser to start
-  a **shell** or **claude** session in that directory, on a project-local
-  `pjma.sock` tmux server (`tmux -S <root>/.pjma/pjma.sock`). Sessions appear as
-  rows under the directory (prefixed `$` for shell, `✦` for claude) and disappear
-  when their shell exits.
+  a **shell**, **claude**, or **codex** session in that directory, on a
+  project-local `pjma.sock` tmux server (`tmux -S <root>/.pjma/pjma.sock`).
+  Sessions appear as rows under the directory (prefixed `$` for shell, `✦` for
+  claude, `⌬` for codex) and disappear when their shell exits.
 - `x` (or clicking the `[×]` next to a session name) closes that session,
   killing it on the `pjma.sock` server and removing its row.
 - Quitting the tool does **not** close your tmux sessions — they keep running on
@@ -55,7 +55,7 @@ runner-manager
 | `k` / `up`     | move up (tree focus)                                |
 | `Tab`          | switch left pane between directory / project view   |
 | `Enter`        | expand/collapse dir · switch to session · view file |
-| `a` / `[+]`    | new session form (shell/claude) on a directory      |
+| `a` / `[+]`    | new session form (shell/claude/codex) on a directory |
 | `x` / `[×]`    | close the selected session (tree focus)             |
 | `<` / `>`      | narrow / widen the tree pane (tree focus)           |
 | `h` / `?`      | help popup                                          |
@@ -67,7 +67,7 @@ runner-manager
 
 In the new-session form: `↑`/`↓`/`j`/`k` move between rows and `Tab`/`Shift-Tab`
 cycle through them (selecting `claude` reveals a permission choice: `normal` or
-`skip` = `--dangerously-skip-permissions`). Selections follow focus, so once the
+`skip` = `--dangerously-skip-permissions`; `codex` just runs `codex`). Selections follow focus, so once the
 right radios are lit, `Enter` creates the session from **any** row — no need to
 move down to `Create` (pressing `Enter` while on `Cancel` cancels instead).
 `Space` activates the focused `Cancel`/`Create` button, and `Esc` cancels.

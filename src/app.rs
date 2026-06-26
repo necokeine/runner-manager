@@ -55,6 +55,7 @@ impl TreeTab {
 pub enum ChooserRow {
     KindShell,
     KindClaude,
+    KindCodex,
     PermNormal,
     PermSkip,
     /// Start a fresh claude session (the default when resumes are offered).
@@ -270,7 +271,7 @@ impl<R: CommandRunner> App<R> {
 
     /// Visible focusable rows for the current chooser kind.
     pub fn chooser_rows(&self) -> Vec<ChooserRow> {
-        let mut rows = vec![ChooserRow::KindShell, ChooserRow::KindClaude];
+        let mut rows = vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::KindCodex];
         if let Popup::Chooser { kind: SessionKind::Claude, .. } = self.popup {
             rows.push(ChooserRow::PermNormal);
             rows.push(ChooserRow::PermSkip);
@@ -333,6 +334,7 @@ impl<R: CommandRunner> App<R> {
             match row {
                 ChooserRow::KindShell => *kind = SessionKind::Shell,
                 ChooserRow::KindClaude => *kind = SessionKind::Claude,
+                ChooserRow::KindCodex => *kind = SessionKind::Codex,
                 ChooserRow::PermNormal => *perm = ClaudePerm::Normal,
                 ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
                 ChooserRow::ResumeNew => *resume = None,
@@ -400,6 +402,7 @@ impl<R: CommandRunner> App<R> {
     /// Build the launch command for a session. Shell sessions run the default
     /// shell (`None`). Claude sessions run `claude`, optionally resuming an
     /// existing session (`--resume <id>`) and/or skipping permission prompts.
+    /// Codex sessions run `codex`.
     pub fn chooser_command(
         kind: SessionKind,
         perm: ClaudePerm,
@@ -407,6 +410,7 @@ impl<R: CommandRunner> App<R> {
     ) -> Option<String> {
         match kind {
             SessionKind::Shell => None,
+            SessionKind::Codex => Some(String::from("codex")),
             SessionKind::Claude => {
                 let mut cmd = String::from("claude");
                 if let Some(id) = resume_id {
@@ -974,7 +978,13 @@ mod tests {
         open_dir_chooser(&mut app);
         assert_eq!(
             app.chooser_rows(),
-            vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::Cancel, ChooserRow::Create]
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
+                ChooserRow::Cancel,
+                ChooserRow::Create
+            ]
         );
     }
 
@@ -993,6 +1003,7 @@ mod tests {
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
                 ChooserRow::PermNormal,
                 ChooserRow::PermSkip,
                 ChooserRow::Cancel,
@@ -1005,8 +1016,9 @@ mod tests {
     fn focusing_skip_sets_perm_then_back_to_shell_reclamps() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
+        // rows after focusing claude: shell(0) claude(1) codex(2) normal(3) skip(4) ...
         app.chooser_move(1); // claude
-        app.chooser_move(1); // normal
+        app.chooser_move(2); // normal
         app.chooser_move(1); // skip
         if let Popup::Chooser { perm, .. } = app.popup {
             assert_eq!(perm, ClaudePerm::Skip);
@@ -1014,7 +1026,7 @@ mod tests {
             panic!();
         }
         // move focus up to shell -> kind becomes Shell, perm rows vanish, focus valid
-        app.chooser_move(-3); // skip(3) -> shell(0)
+        app.chooser_move(-4); // skip(4) -> shell(0)
         if let Popup::Chooser { kind, focus, .. } = app.popup {
             assert_eq!(kind, SessionKind::Shell);
             assert!(focus < app.chooser_rows().len());
@@ -1043,6 +1055,7 @@ mod tests {
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
                 ChooserRow::PermNormal,
                 ChooserRow::PermSkip,
                 ChooserRow::ResumeNew,
@@ -1056,7 +1069,13 @@ mod tests {
         app.chooser_click(ChooserRow::KindShell).unwrap();
         assert_eq!(
             app.chooser_rows(),
-            vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::Cancel, ChooserRow::Create]
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
+                ChooserRow::Cancel,
+                ChooserRow::Create
+            ]
         );
     }
 
@@ -1104,6 +1123,54 @@ mod tests {
             App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, Some("abc-123")).as_deref(),
             Some("claude --resume abc-123 --dangerously-skip-permissions")
         );
+        // Codex ignores the claude-only perm/resume inputs and just runs `codex`.
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Codex, ClaudePerm::Skip, Some("abc-123")).as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn focusing_codex_selects_it_without_perm_rows() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_move(2); // shell(0) -> claude(1) -> codex(2)
+        if let Popup::Chooser { kind, .. } = app.popup {
+            assert_eq!(kind, SessionKind::Codex);
+        } else {
+            panic!("expected chooser");
+        }
+        // Codex offers no permission/resume rows (those are claude-only).
+        assert_eq!(
+            app.chooser_rows(),
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
+                ChooserRow::Cancel,
+                ChooserRow::Create
+            ]
+        );
+    }
+
+    #[test]
+    fn chooser_create_codex_runs_codex_and_tags_session() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.chooser_move(2); // focus -> codex
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        assert!(app.tmux.runner.nth_call(0).contains(&"codex".to_string()));
+        // The @rm tag records the codex kind so a later run re-adopts it.
+        let tag = app.tmux.runner.nth_call(1);
+        assert_eq!(tag[2], "set-option");
+        assert!(tag.iter().any(|a| a.starts_with("codex ")));
     }
 
     #[test]
@@ -1111,8 +1178,8 @@ mod tests {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
         app.chooser_move(1); // claude
-        app.chooser_move(2); // skip
-        // move focus to Create (rows: shell,claude,normal,skip,Cancel,Create => Create index 5)
+        app.chooser_move(3); // skip (past codex + normal)
+        // move focus to Create
         let create_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Create).unwrap();
         if let Popup::Chooser { focus, .. } = &mut app.popup {
             *focus = create_idx;
