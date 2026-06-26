@@ -189,6 +189,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                     KeyCode::Char('h') | KeyCode::Char('?') => {
                                         app.popup = Popup::Help;
                                     }
+                                    KeyCode::Tab => app.toggle_tab(),
                                     KeyCode::Char('a') => app.open_chooser(),
                                     KeyCode::Char('x') => app.request_close(app.selected),
                                     KeyCode::Char('j') | KeyCode::Down => app.down(),
@@ -246,7 +247,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         let border = layout.split_col;
                         let on_border =
                             m.column + 1 >= border && m.column <= border.saturating_add(1);
-                        if on_border {
+                        if let Some(tab) = ui::resolve_tab_click(m.column, m.row, &layout.tabs) {
+                            app.focus = Focus::Tree;
+                            app.set_tab(tab);
+                        } else if on_border {
                             dragging_split = true;
                         } else {
                             match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree, &app.rows) {

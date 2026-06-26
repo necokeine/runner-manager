@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::claude::{self, ResumeSession};
 use crate::config::Config;
-use crate::rows::{build_rows, Row, RowKind};
+use crate::rows::{build_project_rows, build_rows, Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::Tree;
@@ -29,6 +29,25 @@ pub fn col_to_split_pct(col: u16, width: u16) -> u16 {
 pub enum Focus {
     Tree,
     Right,
+}
+
+/// The two views the left pane can show, switched by the tab bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeTab {
+    /// The filesystem tree with sessions nested under their directories.
+    Directory,
+    /// A flat list of every open session (type, directory, brief).
+    Project,
+}
+
+impl TreeTab {
+    /// Human label shown on the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            TreeTab::Directory => "directory",
+            TreeTab::Project => "project",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +93,13 @@ pub struct App<R: CommandRunner> {
     pub root: PathBuf,
     pub selected: usize,
     pub rows: Vec<Row>,
+    /// Which left-pane view is active. The directory tree and the flat session
+    /// list share the `rows`/`selected` machinery; `rebuild_rows` fills `rows`
+    /// from whichever tab is current.
+    pub tab: TreeTab,
+    /// One-word brief per session slug (the active pane's foreground command),
+    /// refreshed each `sync` and shown in the project view.
+    pub briefs: HashMap<String, String>,
     pub host_tty: Option<String>,
     pub viewer: Option<FileView>,
     pub focus: Focus,
@@ -108,6 +134,8 @@ impl<R: CommandRunner> App<R> {
             root,
             selected: 0,
             rows: Vec::new(),
+            tab: TreeTab::Directory,
+            briefs: HashMap::new(),
             host_tty: None,
             viewer: None,
             focus: Focus::Tree,
@@ -138,10 +166,33 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn rebuild_rows(&mut self) {
-        self.rows = build_rows(&self.tree.root, &self.store.by_dir());
+        self.rows = match self.tab {
+            TreeTab::Directory => build_rows(&self.tree.root, &self.store.by_dir()),
+            TreeTab::Project => build_project_rows(&self.store.by_dir(), &self.root, &self.briefs),
+        };
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
+    }
+
+    /// Switch the left pane to `tab`, resetting the selection and scroll since
+    /// the row set changes meaning between views.
+    pub fn set_tab(&mut self, tab: TreeTab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.selected = 0;
+            self.tree_offset = 0;
+            self.rebuild_rows();
+        }
+    }
+
+    /// Cycle between the directory and project views.
+    pub fn toggle_tab(&mut self) {
+        let next = match self.tab {
+            TreeTab::Directory => TreeTab::Project,
+            TreeTab::Project => TreeTab::Directory,
+        };
+        self.set_tab(next);
     }
 
     pub fn selected_row(&self) -> Option<&Row> {
@@ -441,6 +492,13 @@ impl<R: CommandRunner> App<R> {
             .map(|i| (i.name.clone(), PathBuf::from(&i.dir), SessionKind::from_tag(&i.kind)))
             .collect();
         self.store.adopt(&adoptable);
+        // Refresh the per-session briefs shown in the project view from the
+        // live foreground commands.
+        self.briefs = infos
+            .iter()
+            .filter(|i| !i.command.is_empty())
+            .map(|i| (i.name.clone(), i.command.clone()))
+            .collect();
         let live: HashSet<String> = infos.into_iter().map(|i| i.name).collect();
         self.store.sync(&live);
         // Track which session the embedded client actually shows. It can change
@@ -1147,6 +1205,71 @@ mod tests {
         app.sync().unwrap();
         assert_eq!(app.current_session.as_deref(), Some("src-shell"));
         assert_eq!(app.terminal_title(), "terminal — src");
+    }
+
+    #[test]
+    fn toggle_tab_switches_view_and_lists_open_sessions() {
+        let (_d, mut app) = app_over_tempdir();
+        // Open a shell session under src so the project view has something to show.
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        // Give the session a brief, as a sync would.
+        app.briefs.insert("src-shell".into(), "zsh".into());
+
+        assert_eq!(app.tab, TreeTab::Directory);
+        app.toggle_tab();
+        assert_eq!(app.tab, TreeTab::Project);
+        // The project view is a flat list of sessions, no directory rows.
+        assert!(app.rows.iter().all(|r| matches!(r.kind, RowKind::Session { .. })));
+        let row = app.rows.iter().find(|r| matches!(&r.kind, RowKind::Session { slug, .. } if slug == "src-shell")).unwrap();
+        assert_eq!(row.label, "shell  src  — zsh");
+        // Selection resets to the top when switching tabs.
+        assert_eq!(app.selected, 0);
+        // Switching back restores the directory tree (root dir row present).
+        app.toggle_tab();
+        assert_eq!(app.tab, TreeTab::Directory);
+        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Dir { .. })));
+    }
+
+    #[test]
+    fn project_view_session_row_can_be_closed() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        app.set_tab(TreeTab::Project);
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+        app.tmux.runner.push(true, ""); // kill-session
+        app.close_session(sess_idx).unwrap();
+        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn sync_populates_briefs_from_pane_command() {
+        let (_d, mut app) = app_over_tempdir();
+        let root = app.root.to_str().unwrap().to_string();
+        // list-sessions-full: a tagged session whose active pane runs `vim`.
+        app.tmux.runner.push(true, &format!("src-shell\tshell {root}/src\tvim\n"));
+        app.tmux.runner.push(true, "src-shell\n"); // client_session
+        app.sync().unwrap();
+        assert_eq!(app.briefs.get("src-shell").map(String::as_str), Some("vim"));
     }
 
     #[test]

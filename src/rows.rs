@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::session::{SessionKind, SessionRow};
 use crate::tree::Node;
@@ -22,6 +22,45 @@ pub struct Row {
 pub fn build_rows(root: &Node, sessions: &HashMap<PathBuf, Vec<SessionRow>>) -> Vec<Row> {
     let mut out = Vec::new();
     collect(root, 0, sessions, &mut out);
+    out
+}
+
+/// Flat list of every open session for the "project view" tab. Each session is
+/// one depth-0 `Session` row whose label carries the session kind, its directory
+/// relative to `root`, and a short brief (the active pane's foreground command,
+/// looked up by slug in `briefs`). Reusing `RowKind::Session` keeps selection,
+/// switching, and the `[×]` close button working exactly as in the directory
+/// view. Sessions are grouped by directory (sorted) for a stable order.
+pub fn build_project_rows(
+    sessions: &HashMap<PathBuf, Vec<SessionRow>>,
+    root: &Path,
+    briefs: &HashMap<String, String>,
+) -> Vec<Row> {
+    let mut dirs: Vec<&PathBuf> = sessions.keys().collect();
+    dirs.sort();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let rel = dir
+            .strip_prefix(root)
+            .unwrap_or(dir)
+            .to_string_lossy()
+            .into_owned();
+        let rel = if rel.is_empty() { ".".to_string() } else { rel };
+        for s in &sessions[dir] {
+            let brief = briefs.get(&s.slug).map(String::as_str).unwrap_or("");
+            let label = if brief.is_empty() {
+                format!("{}  {rel}", s.label)
+            } else {
+                format!("{}  {rel}  — {brief}", s.label)
+            };
+            out.push(Row {
+                path: dir.clone(),
+                label,
+                depth: 0,
+                kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
+            });
+        }
+    }
     out
 }
 
@@ -87,6 +126,31 @@ mod tests {
         assert_eq!(rows[1].depth, 1);
         assert!(matches!(rows[2].kind, RowKind::File));
         assert_eq!(rows[2].label, "readme.md");
+    }
+
+    #[test]
+    fn project_rows_are_flat_sessions_with_dir_and_brief() {
+        let root = PathBuf::from("/p");
+        let mut sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
+        sessions.insert(
+            PathBuf::from("/p/src"),
+            vec![SessionRow { slug: "src-claude".into(), kind: SessionKind::Claude, label: "claude".into() }],
+        );
+        sessions.insert(
+            PathBuf::from("/p"),
+            vec![SessionRow { slug: "root-shell".into(), kind: SessionKind::Shell, label: "shell".into() }],
+        );
+        let mut briefs: HashMap<String, String> = HashMap::new();
+        briefs.insert("src-claude".into(), "node".into());
+        // root-shell has no brief recorded -> its label omits the dash.
+        let rows = build_project_rows(&sessions, &root, &briefs);
+        // Sorted by dir: "/p" before "/p/src".
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "shell  .");
+        assert!(matches!(rows[0].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].label, "claude  src  — node");
+        assert!(matches!(rows[1].kind, RowKind::Session { kind: SessionKind::Claude, .. }));
     }
 
     #[test]

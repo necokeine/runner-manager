@@ -20,6 +20,11 @@ multiple tmux sessions (shell or claude), shown as rows under it.
   again under their directories.
 - Selecting a session row shows it in the right pane (embedded terminal).
   Selecting a file shows it in a read-only viewer in the right pane.
+- The left pane has two tabs, switched with `Tab` (or by clicking a tab):
+  the **directory** view (the file tree above) and the **project** view, a flat
+  list of every open session showing its type, directory, and a short brief
+  (the command running in it). Selecting, switching, and closing sessions work
+  the same in either view.
 - Per-project state lives in a `<root>/.pjma/` config directory (the tmux socket
   plus the saved tree state). Which directories you have expanded is remembered
   across runs.
@@ -41,6 +46,7 @@ runner-manager
 |----------------|-----------------------------------------------------|
 | `j` / `down`   | move down (tree focus)                              |
 | `k` / `up`     | move up (tree focus)                                |
+| `Tab`          | switch left pane between directory / project view   |
 | `Enter`        | expand/collapse dir · switch to session · view file |
 | `a` / `[+]`    | new session form (shell/claude) on a directory      |
 | `x` / `[×]`    | close the selected session (tree focus)             |

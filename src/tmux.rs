@@ -10,12 +10,15 @@ pub struct CmdOutput {
 
 /// A live tmux session plus the metadata this tool tags it with at creation
 /// (`@rm` = "<kind> <dir>"). `kind`/`dir` are empty for sessions we did not
-/// create (the embedded `scratch` client, or anything made by hand).
+/// create (the embedded `scratch` client, or anything made by hand). `command`
+/// is the foreground command of the session's active pane (`pane_current_command`),
+/// used as a one-word "session brief" in the project view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub name: String,
     pub dir: String,
     pub kind: String,
+    pub command: String,
 }
 
 pub trait CommandRunner {
@@ -124,9 +127,16 @@ impl<R: CommandRunner> Tmux<R> {
         Ok(())
     }
 
-    /// List live sessions with their `@rm` tag split back into kind + dir.
+    /// List live sessions with their `@rm` tag split back into kind + dir, plus
+    /// the active pane's foreground command. The three fields are tab-delimited;
+    /// the `@rm` tag itself is "<kind> <dir>" (space-separated, never a tab) and
+    /// a command never contains a tab, so a three-way `splitn` is unambiguous.
     pub fn list_sessions_full(&self) -> io::Result<Vec<SessionInfo>> {
-        let out = self.run(&["list-sessions", "-F", "#{session_name}\t#{@rm}"])?;
+        let out = self.run(&[
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@rm}\t#{pane_current_command}",
+        ])?;
         if !out.success {
             return Ok(Vec::new());
         }
@@ -134,17 +144,18 @@ impl<R: CommandRunner> Tmux<R> {
             .stdout
             .lines()
             .filter_map(|l| {
-                let mut cols = l.splitn(2, '\t');
+                let mut cols = l.splitn(3, '\t');
                 let name = cols.next()?.trim().to_string();
                 if name.is_empty() {
                     return None;
                 }
                 let tag = cols.next().unwrap_or("").trim();
+                let command = cols.next().unwrap_or("").trim().to_string();
                 let (kind, dir) = match tag.split_once(' ') {
                     Some((k, d)) => (k.to_string(), d.to_string()),
                     None => (String::new(), String::new()),
                 };
-                Some(SessionInfo { name, dir, kind })
+                Some(SessionInfo { name, dir, kind, command })
             })
             .collect())
     }
@@ -371,18 +382,29 @@ mod tests {
     fn list_sessions_full_splits_tag_into_kind_and_dir() {
         let runner = MockRunner::new();
         // a tagged claude session, a tagged shell session, and the untagged scratch client
-        runner.push(true, "src-claude\tclaude /tmp/proj/src\nroot-shell\tshell /tmp/proj\nscratch\t\n");
+        runner.push(true, "src-claude\tclaude /tmp/proj/src\tnode\nroot-shell\tshell /tmp/proj\tvim\nscratch\t\tzsh\n");
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}"]
+            vec!["-S", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}\t#{pane_current_command}"]
         );
         assert_eq!(infos.len(), 3);
-        assert_eq!(infos[0], SessionInfo { name: "src-claude".into(), dir: "/tmp/proj/src".into(), kind: "claude".into() });
-        assert_eq!(infos[1], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into() });
+        assert_eq!(infos[0], SessionInfo { name: "src-claude".into(), dir: "/tmp/proj/src".into(), kind: "claude".into(), command: "node".into() });
+        assert_eq!(infos[1], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into(), command: "vim".into() });
         // scratch (no tag) -> empty dir/kind so it won't be adopted into the tree
-        assert_eq!(infos[2], SessionInfo { name: "scratch".into(), dir: String::new(), kind: String::new() });
+        assert_eq!(infos[2], SessionInfo { name: "scratch".into(), dir: String::new(), kind: String::new(), command: "zsh".into() });
+    }
+
+    #[test]
+    fn list_sessions_full_tolerates_missing_command_column() {
+        // Older tags / mocked rows without the command column still parse, just
+        // with an empty brief.
+        let runner = MockRunner::new();
+        runner.push(true, "root-shell\tshell /tmp/proj\n");
+        let tmux = Tmux::new("runner", runner);
+        let infos = tmux.list_sessions_full().unwrap();
+        assert_eq!(infos[0], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into(), command: String::new() });
     }
 
     #[test]
