@@ -1,6 +1,6 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout as RtLayout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
@@ -9,7 +9,7 @@ use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, ChooserRow, Focus};
+use crate::app::{App, ChooserRow, Focus, TreeTab};
 use crate::claude::ResumeSession;
 use crate::rows::{Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind};
@@ -41,10 +41,30 @@ pub enum PaneHit {
     Right,
 }
 
+/// Clickable geometry of the tab bar: the row it sits on and, per tab, the
+/// inclusive column span of its label. `run.rs` resolves a mouse click against
+/// these to switch views.
+pub struct TabBar {
+    pub y: u16,
+    pub hits: Vec<(u16, u16, TreeTab)>,
+}
+
 pub struct Layout {
     pub tree: ListLayout,
     pub split_col: u16,
     pub term_area: Rect,
+    pub tabs: TabBar,
+}
+
+/// Which tab (if any) a click at `(col, row)` lands on.
+pub fn resolve_tab_click(col: u16, row: u16, tabs: &TabBar) -> Option<TreeTab> {
+    if row != tabs.y {
+        return None;
+    }
+    tabs.hits
+        .iter()
+        .find(|(start, end, _)| col >= *start && col <= *end)
+        .map(|(_, _, tab)| *tab)
 }
 
 pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> Option<Hit> {
@@ -144,6 +164,8 @@ const APP_NAME: &str = "PJ MA";
 /// Rows reserved at the top of the tree pane for the banner: 3 rows of block
 /// glyphs plus one hint line.
 const BANNER_HEIGHT: u16 = 4;
+/// The tab bar (directory / project) is a single row between banner and tree.
+const TAB_HEIGHT: u16 = 1;
 
 /// 3-row block-letter glyphs (half-block style) for the characters used by
 /// `APP_NAME`. Each entry is the three rows (top→bottom) of one character;
@@ -202,6 +224,32 @@ fn render_banner(f: &mut Frame, area: Rect) {
     f.render_widget(para, area);
 }
 
+/// Render the directory/project tab bar and report each tab's clickable span.
+/// The active tab is drawn reversed; inactive tabs are dimmed.
+fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut hits: Vec<(u16, u16, TreeTab)> = Vec::new();
+    let mut x = area.x;
+    for (i, tab) in [TreeTab::Directory, TreeTab::Project].into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+            x += 1;
+        }
+        let text = format!(" {} ", tab.label());
+        let w = text.chars().count() as u16;
+        let style = if tab == active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        hits.push((x, x + w.saturating_sub(1), tab));
+        spans.push(Span::styled(text, style));
+        x += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    TabBar { y: area.y, hits }
+}
+
 pub fn render<R: CommandRunner>(
     f: &mut Frame,
     area: Rect,
@@ -218,19 +266,24 @@ pub fn render<R: CommandRunner>(
     let left_area = chunks[0];
     let right_area = chunks[1];
 
-    // ---- left: banner on top, tree below ----
-    // Reserve the top rows of the left column for the banner; the tree block
-    // (and all its derived geometry) sits in whatever remains, so click and
-    // scroll hit-testing follow `inner.y` automatically.
+    // ---- left: banner, tab bar, then the active view ----
+    // Reserve the top rows for the banner and the one-row tab bar; the tree
+    // block (and all its derived geometry) sits in whatever remains, so click
+    // and scroll hit-testing follow `inner.y` automatically.
     let left_chunks = RtLayout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(BANNER_HEIGHT), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(BANNER_HEIGHT),
+            Constraint::Length(TAB_HEIGHT),
+            Constraint::Min(0),
+        ])
         .split(left_area);
     render_banner(f, left_chunks[0]);
-    let tree_area = left_chunks[1];
+    let tabs = render_tabs(f, left_chunks[1], app.tab);
+    let tree_area = left_chunks[2];
 
     let tree_block = Block::default()
-        .title("tree")
+        .title(app.tab.label())
         .borders(Borders::ALL)
         .border_style(border_style(app.focus == Focus::Tree));
     let inner = tree_block.inner(tree_area);
@@ -250,6 +303,14 @@ pub fn render<R: CommandRunner>(
     *state.offset_mut() = app.tree_offset.min(max_off);
     f.render_stateful_widget(list, inner, &mut state);
     app.tree_offset = state.offset();
+
+    // Project view with nothing open: a hint reads better than a blank pane.
+    if app.tab == TreeTab::Project && total == 0 {
+        let hint = Paragraph::new("no open sessions")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, inner);
+    }
 
     // Scrollbar on the right border, only when the content overflows.
     if total > view_h {
@@ -321,6 +382,7 @@ pub fn render<R: CommandRunner>(
         tree: tree_layout,
         split_col: right_area.x,
         term_area: right_inner,
+        tabs,
     }
 }
 
@@ -348,6 +410,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
     let lines = [
         "j / ↓      move down",
         "k / ↑      move up",
+        "Tab        switch directory / project view",
         "Enter      expand dir / switch session / view file",
         "a / [+]    new session (shell or claude) on a dir",
         "x / [×]    close the selected session (asks to confirm)",
@@ -659,7 +722,7 @@ mod tests {
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             app.tree_offset = offset;
             app.selected = selected;
-            let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
             terminal
                 .draw(|f| {
                     render(f, f.area(), &mut app, None);
@@ -679,11 +742,11 @@ mod tests {
             (min_y, max_y)
         };
 
-        // The tree pane sits below the banner (BANNER_HEIGHT rows). Its track
-        // lives inside a 1-cell vertical margin, so it spans rows
-        // BANNER_HEIGHT+1 ..= BANNER_HEIGHT+8.
-        let top = BANNER_HEIGHT + 1;
-        let bottom = BANNER_HEIGHT + 8;
+        // The tree pane sits below the banner and the tab bar. Its track lives
+        // inside a 1-cell vertical margin, so it spans rows
+        // BANNER_HEIGHT+TAB_HEIGHT+1 ..= BANNER_HEIGHT+TAB_HEIGHT+8.
+        let top = BANNER_HEIGHT + TAB_HEIGHT + 1;
+        let bottom = BANNER_HEIGHT + TAB_HEIGHT + 8;
         let (top_min, _) = thumb_span(0, 0);
         assert_eq!(top_min, top, "at the top the thumb should touch the first track cell");
 
@@ -719,9 +782,10 @@ mod tests {
             .collect();
         app.viewer = Some(FileView::load(Path::new("/nonexistent")));
 
-        // 40 wide; height is BANNER_HEIGHT taller than the tree so that after the
-        // banner + border the tree inner height is still 8 rows.
-        let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT)).unwrap();
+        // 40 wide; height is BANNER_HEIGHT + TAB_HEIGHT taller than the tree so
+        // that after the banner, tab bar, and border the tree inner height is
+        // still 8 rows.
+        let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
         let view_h = 8usize;
         let draw = |app: &mut App<MockRunner>, t: &mut Terminal<TestBackend>| {
             t.draw(|f| {
@@ -809,6 +873,37 @@ mod tests {
         assert!(content.contains("PJ MA"));
         assert!(content.contains("press h for help"));
         assert!(!content.contains('█'));
+    }
+
+    #[test]
+    fn render_tabs_draws_both_labels_and_reports_hits() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut tab_bar = None;
+        let mut terminal = Terminal::new(TestBackend::new(30, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                tab_bar = Some(render_tabs(f, f.area(), TreeTab::Project));
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("directory"));
+        assert!(content.contains("project"));
+        let bar = tab_bar.unwrap();
+        // Clicking inside the "directory" label resolves to that tab; clicking
+        // inside "project" resolves to the other; a miss returns None.
+        let dir_hit = bar.hits.iter().find(|(_, _, t)| *t == TreeTab::Directory).unwrap();
+        assert_eq!(resolve_tab_click(dir_hit.0, bar.y, &bar), Some(TreeTab::Directory));
+        let proj_hit = bar.hits.iter().find(|(_, _, t)| *t == TreeTab::Project).unwrap();
+        assert_eq!(resolve_tab_click(proj_hit.0, bar.y, &bar), Some(TreeTab::Project));
+        // A click on a different row never hits a tab.
+        assert_eq!(resolve_tab_click(dir_hit.0, bar.y + 1, &bar), None);
     }
 
     #[test]
