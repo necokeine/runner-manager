@@ -117,7 +117,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut last_sync = Instant::now();
     let mut area_width: u16 = 0;
     let mut dragging_split = false;
-    let mut chooser_row_ys: Vec<(u16, crate::app::ChooserRow)> = Vec::new();
+    // Clickable chooser regions: (row y, x start, x end inclusive, the row).
+    let mut chooser_row_ys: Vec<(u16, u16, u16, crate::app::ChooserRow)> = Vec::new();
     let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
 
     let result = loop {
@@ -152,12 +153,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             drop(screen_guard);
             match &app.popup {
                 Popup::Help => ui::render_help(f, f.area()),
-                Popup::Chooser { kind, perm, resume, focus, .. } => {
-                    let focus_row = app
-                        .chooser_rows()
-                        .get(*focus)
-                        .copied()
-                        .unwrap_or(crate::app::ChooserRow::KindShell);
+                Popup::Chooser { kind, perm, resume, .. } => {
+                    let focus_row = app.chooser_focus_row();
                     chooser_row_ys = ui::render_chooser(
                         f,
                         f.area(),
@@ -206,18 +203,22 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                     Popup::Chooser { .. } => match key.code {
                         KeyCode::Esc => app.chooser_cancel(),
-                        // Enter commits the form from any row (Cancel still cancels);
-                        // Space acts on the focused button.
+                        // Enter commits the form from any group (Cancel still
+                        // cancels); Space acts on the focused button.
                         KeyCode::Enter => {
                             let _ = app.chooser_commit();
                         }
                         KeyCode::Char(' ') => {
                             let _ = app.chooser_activate();
                         }
-                        KeyCode::Down | KeyCode::Char('j') => app.chooser_move(1),
-                        KeyCode::Up | KeyCode::Char('k') => app.chooser_move(-1),
-                        KeyCode::Tab => app.chooser_cycle(1),
-                        KeyCode::BackTab => app.chooser_cycle(-1),
+                        // Up/Down move between selection groups; Left/Right
+                        // change the option within the focused group.
+                        KeyCode::Down | KeyCode::Char('j') => app.chooser_group_move(1),
+                        KeyCode::Up | KeyCode::Char('k') => app.chooser_group_move(-1),
+                        KeyCode::Right | KeyCode::Char('l') => app.chooser_option_move(1),
+                        KeyCode::Left | KeyCode::Char('h') => app.chooser_option_move(-1),
+                        KeyCode::Tab => app.chooser_group_cycle(1),
+                        KeyCode::BackTab => app.chooser_group_cycle(-1),
                         _ => {}
                     },
                     Popup::ConfirmClose { .. } => match key.code {
@@ -279,8 +280,11 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 MouseEventKind::Down(MouseButton::Left) => match app.popup.clone() {
                     Popup::Help => app.popup = Popup::None,
                     Popup::Chooser { .. } => {
-                        match chooser_row_ys.iter().find(|(y, _)| *y == m.row) {
-                            Some((_, row)) => {
+                        match chooser_row_ys
+                            .iter()
+                            .find(|(y, x0, x1, _)| *y == m.row && m.column >= *x0 && m.column <= *x1)
+                        {
+                            Some((_, _, _, row)) => {
                                 let _ = app.chooser_click(*row);
                             }
                             None => app.chooser_cancel(),

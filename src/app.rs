@@ -66,6 +66,22 @@ pub enum ChooserRow {
     Create,
 }
 
+/// A selection group in the new-session form. The form is navigated in two
+/// axes: **Up/Down** moves between groups, **Left/Right** changes the option
+/// within the focused group. Which groups are present depends on `kind`
+/// (Perm/Resume only show for claude) — see `App::chooser_groups`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChooserGroup {
+    /// shell · claude
+    Kind,
+    /// normal · skip (claude only)
+    Perm,
+    /// new session · one entry per resumable transcript (claude only)
+    Resume,
+    /// [ Cancel ] · [ Create ]
+    Actions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
     None,
@@ -77,7 +93,12 @@ pub enum Popup {
         /// Which existing Claude session to resume: `None` = start fresh,
         /// `Some(i)` = resume `App::chooser_resumes[i]`.
         resume: Option<usize>,
-        focus: usize,
+        /// Which selection group has focus (moved by Up/Down). The selected
+        /// option within each radio group lives in `kind`/`perm`/`resume`; the
+        /// focused button within `Actions` is `action`.
+        group: ChooserGroup,
+        /// Focused action button: `false` = Cancel, `true` = Create.
+        action: bool,
     },
     /// "Really close this session?" — opened by `x`/`[×]`, resolved by
     /// `confirm_close`/`cancel_close`. Keyed off the slug (not a row index) so a
@@ -267,7 +288,8 @@ impl<R: CommandRunner> App<R> {
                     kind: SessionKind::Shell,
                     perm: ClaudePerm::Normal,
                     resume: None,
-                    focus: 0,
+                    group: ChooserGroup::Kind,
+                    action: true,
                 };
             }
         }
@@ -292,92 +314,211 @@ impl<R: CommandRunner> App<R> {
         rows
     }
 
-    pub fn chooser_move(&mut self, delta: i32) {
-        let rows = self.chooser_rows();
-        let Popup::Chooser { focus, .. } = &mut self.popup else {
-            return;
-        };
-        let max = rows.len() as i32 - 1;
-        let new_focus = (*focus as i32 + delta).clamp(0, max) as usize;
-        *focus = new_focus;
-        self.chooser_apply_focus(rows[new_focus]);
-    }
-
-    /// Move focus by `delta`, wrapping past the ends (Tab / Shift-Tab). Unlike
-    /// `chooser_move` (arrows / `j`/`k`, which clamp), tabbing past the last row
-    /// returns to the first so the whole form is reachable with one key.
-    pub fn chooser_cycle(&mut self, delta: i32) {
-        let rows = self.chooser_rows();
-        let Popup::Chooser { focus, .. } = &mut self.popup else {
-            return;
-        };
-        let len = rows.len() as i32;
-        let new_focus = (((*focus as i32 + delta) % len) + len) % len;
-        *focus = new_focus as usize;
-        self.chooser_apply_focus(rows[new_focus as usize]);
-    }
-
-    /// Clicking (or focusing) a row selects radios; clicking a button acts.
-    pub fn chooser_click(&mut self, row: ChooserRow) -> io::Result<()> {
-        if let Some(idx) = self.chooser_rows().iter().position(|r| *r == row) {
-            if let Popup::Chooser { focus, .. } = &mut self.popup {
-                *focus = idx;
+    /// The selection groups present for the current kind, in display order.
+    /// Perm and Resume only exist for claude (and Resume only when this
+    /// directory has history). Up/Down navigation walks this list.
+    pub fn chooser_groups(&self) -> Vec<ChooserGroup> {
+        let mut groups = vec![ChooserGroup::Kind];
+        if let Popup::Chooser { kind: SessionKind::Claude, .. } = self.popup {
+            groups.push(ChooserGroup::Perm);
+            if !self.chooser_resumes.is_empty() {
+                groups.push(ChooserGroup::Resume);
             }
         }
-        self.chooser_apply_focus(row);
+        groups.push(ChooserGroup::Actions);
+        groups
+    }
+
+    /// The currently focused group (defaults to `Kind` when no chooser is open).
+    fn chooser_group(&self) -> ChooserGroup {
+        match self.popup {
+            Popup::Chooser { group, .. } => group,
+            _ => ChooserGroup::Kind,
+        }
+    }
+
+    /// The `ChooserRow` that currently has focus: the selected option of the
+    /// focused radio group, or the focused button in `Actions`. Drives both the
+    /// render highlight and what `Enter`/`Space` act on.
+    pub fn chooser_focus_row(&self) -> ChooserRow {
+        let Popup::Chooser { kind, perm, resume, group, action, .. } = self.popup else {
+            return ChooserRow::KindShell;
+        };
+        match group {
+            ChooserGroup::Kind => match kind {
+                SessionKind::Shell => ChooserRow::KindShell,
+                SessionKind::Claude => ChooserRow::KindClaude,
+                SessionKind::Codex => ChooserRow::KindCodex,
+            },
+            ChooserGroup::Perm => match perm {
+                ClaudePerm::Normal => ChooserRow::PermNormal,
+                ClaudePerm::Skip => ChooserRow::PermSkip,
+            },
+            ChooserGroup::Resume => match resume {
+                None => ChooserRow::ResumeNew,
+                Some(i) => ChooserRow::Resume(i),
+            },
+            ChooserGroup::Actions => {
+                if action {
+                    ChooserRow::Create
+                } else {
+                    ChooserRow::Cancel
+                }
+            }
+        }
+    }
+
+    /// Move focus between groups by `delta` (Up/Down — clamps at the ends).
+    pub fn chooser_group_move(&mut self, delta: i32) {
+        self.chooser_group_step(delta, false);
+    }
+
+    /// Cycle focus between groups by `delta` (Tab/Shift-Tab — wraps past the
+    /// ends so every group is reachable with one key).
+    pub fn chooser_group_cycle(&mut self, delta: i32) {
+        self.chooser_group_step(delta, true);
+    }
+
+    fn chooser_group_step(&mut self, delta: i32, wrap: bool) {
+        let groups = self.chooser_groups();
+        let cur = self.chooser_group();
+        let Some(pos) = groups.iter().position(|g| *g == cur) else {
+            return;
+        };
+        let len = groups.len() as i32;
+        let next = if wrap {
+            (((pos as i32 + delta) % len) + len) % len
+        } else {
+            (pos as i32 + delta).clamp(0, len - 1)
+        } as usize;
+        if let Popup::Chooser { group, .. } = &mut self.popup {
+            *group = groups[next];
+        }
+    }
+
+    /// Change the selected option within the focused group by `delta`
+    /// (Left/Right — clamps within the group). Switching `kind` here may add or
+    /// remove the Perm/Resume groups, which is fine: focus stays on `Kind`.
+    pub fn chooser_option_move(&mut self, delta: i32) {
+        let resume_count = self.chooser_resumes.len() as i32;
+        if let Popup::Chooser { kind, perm, resume, group, action, .. } = &mut self.popup {
+            match group {
+                ChooserGroup::Kind => {
+                    // shell · claude · codex (clamped).
+                    let cur = match *kind {
+                        SessionKind::Shell => 0,
+                        SessionKind::Claude => 1,
+                        SessionKind::Codex => 2,
+                    };
+                    *kind = match (cur + delta).clamp(0, 2) {
+                        0 => SessionKind::Shell,
+                        1 => SessionKind::Claude,
+                        _ => SessionKind::Codex,
+                    };
+                }
+                ChooserGroup::Perm => {
+                    if delta > 0 {
+                        *perm = ClaudePerm::Skip;
+                    } else if delta < 0 {
+                        *perm = ClaudePerm::Normal;
+                    }
+                }
+                ChooserGroup::Resume => {
+                    // Option index: 0 = new (None), 1..=n = Some(i-1).
+                    let cur = match resume {
+                        None => 0,
+                        Some(i) => *i as i32 + 1,
+                    };
+                    let next = (cur + delta).clamp(0, resume_count);
+                    *resume = if next == 0 {
+                        None
+                    } else {
+                        Some((next - 1) as usize)
+                    };
+                }
+                ChooserGroup::Actions => {
+                    if delta > 0 {
+                        *action = true;
+                    } else if delta < 0 {
+                        *action = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clicking a row focuses its group, selects that option, and — for the
+    /// `Cancel`/`Create` buttons — acts immediately.
+    pub fn chooser_click(&mut self, row: ChooserRow) -> io::Result<()> {
+        if let Popup::Chooser { kind, perm, resume, group, action, .. } = &mut self.popup {
+            match row {
+                ChooserRow::KindShell => {
+                    *kind = SessionKind::Shell;
+                    *group = ChooserGroup::Kind;
+                }
+                ChooserRow::KindClaude => {
+                    *kind = SessionKind::Claude;
+                    *group = ChooserGroup::Kind;
+                }
+                ChooserRow::KindCodex => {
+                    *kind = SessionKind::Codex;
+                    *group = ChooserGroup::Kind;
+                }
+                ChooserRow::PermNormal => {
+                    *perm = ClaudePerm::Normal;
+                    *group = ChooserGroup::Perm;
+                }
+                ChooserRow::PermSkip => {
+                    *perm = ClaudePerm::Skip;
+                    *group = ChooserGroup::Perm;
+                }
+                ChooserRow::ResumeNew => {
+                    *resume = None;
+                    *group = ChooserGroup::Resume;
+                }
+                ChooserRow::Resume(i) => {
+                    *resume = Some(i);
+                    *group = ChooserGroup::Resume;
+                }
+                ChooserRow::Cancel => {
+                    *action = false;
+                    *group = ChooserGroup::Actions;
+                }
+                ChooserRow::Create => {
+                    *action = true;
+                    *group = ChooserGroup::Actions;
+                }
+            }
+        }
         if matches!(row, ChooserRow::Cancel | ChooserRow::Create) {
             self.chooser_activate()?;
         }
         Ok(())
     }
 
-    /// Apply the radio-follows-focus rule for the given row.
-    fn chooser_apply_focus(&mut self, row: ChooserRow) {
-        // Apply radio selection first (this may change `kind`, which changes the row set).
-        if let Popup::Chooser { kind, perm, resume, .. } = &mut self.popup {
-            match row {
-                ChooserRow::KindShell => *kind = SessionKind::Shell,
-                ChooserRow::KindClaude => *kind = SessionKind::Claude,
-                ChooserRow::KindCodex => *kind = SessionKind::Codex,
-                ChooserRow::PermNormal => *perm = ClaudePerm::Normal,
-                ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
-                ChooserRow::ResumeNew => *resume = None,
-                ChooserRow::Resume(i) => *resume = Some(i),
-                _ => {}
-            }
-        }
-        // Re-clamp focus against the (possibly shrunken) row set.
-        let row_count = self.chooser_rows().len();
-        if let Popup::Chooser { focus, .. } = &mut self.popup {
-            if *focus >= row_count {
-                *focus = row_count - 1;
-            }
-        }
-    }
-
-    /// Act on the focused row (Space / click): the `Cancel`/`Create` buttons fire;
-    /// radio rows are no-ops here because moving onto them already applied the
-    /// selection. For "Enter anywhere creates", see `chooser_commit`.
+    /// Act on the focused row (Space / click): the `Cancel`/`Create` buttons
+    /// fire; radio options are no-ops here (Left/Right already selected them).
+    /// For "Enter anywhere creates", see `chooser_commit`.
     pub fn chooser_activate(&mut self) -> io::Result<()> {
-        let Popup::Chooser { focus, .. } = self.popup else {
+        if !matches!(self.popup, Popup::Chooser { .. }) {
             return Ok(());
-        };
-        match self.chooser_rows().get(focus) {
-            Some(ChooserRow::Cancel) => self.popup = Popup::None,
-            Some(ChooserRow::Create) => self.create_from_form()?,
+        }
+        match self.chooser_focus_row() {
+            ChooserRow::Cancel => self.popup = Popup::None,
+            ChooserRow::Create => self.create_from_form()?,
             _ => {}
         }
         Ok(())
     }
 
-    /// Commit the form (Enter): create the session with the current selections no
-    /// matter which row has focus, so the user need not travel to `[ Create ]`.
-    /// Enter while parked on `Cancel` still cancels — least surprise.
+    /// Commit the form (Enter): create the session with the current selections
+    /// no matter which group has focus, so the user need not travel to
+    /// `[ Create ]`. Enter while parked on `Cancel` still cancels — least surprise.
     pub fn chooser_commit(&mut self) -> io::Result<()> {
-        let Popup::Chooser { focus, .. } = self.popup else {
+        if !matches!(self.popup, Popup::Chooser { .. }) {
             return Ok(());
-        };
-        if matches!(self.chooser_rows().get(focus), Some(ChooserRow::Cancel)) {
+        }
+        if matches!(self.chooser_focus_row(), ChooserRow::Cancel) {
             self.popup = Popup::None;
             return Ok(());
         }
@@ -729,14 +870,11 @@ mod tests {
         assert_eq!(app.tmux.runner.call_count(), 0); // no tmux for expand
     }
 
+    /// Move focus to the `[ Create ]` button (Actions group, Create selected).
     fn focus_create(app: &mut App<MockRunner>) {
-        let create_idx = app
-            .chooser_rows()
-            .iter()
-            .position(|r| *r == ChooserRow::Create)
-            .unwrap();
-        if let Popup::Chooser { focus, .. } = &mut app.popup {
-            *focus = create_idx;
+        if let Popup::Chooser { group, action, .. } = &mut app.popup {
+            *group = ChooserGroup::Actions;
+            *action = true;
         }
     }
 
@@ -748,7 +886,7 @@ mod tests {
         app.open_chooser();
         assert!(matches!(
             app.popup,
-            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
+            Popup::Chooser { group: ChooserGroup::Kind, kind: SessionKind::Shell, .. }
         ));
         // shell: new-session, tag (set-option), list-clients, switch-client
         app.tmux.runner.push(true, ""); // new-session
@@ -799,7 +937,7 @@ mod tests {
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        app.chooser_move(1); // focus -> claude
+        app.chooser_option_move(1); // Kind group: shell -> claude
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
@@ -811,13 +949,13 @@ mod tests {
 
     #[test]
     fn chooser_commit_creates_without_focusing_create() {
-        // NEC-29: Enter creates from any row — here focus stays on the first
-        // radio (shell), no travelling down to [ Create ].
+        // NEC-29: Enter creates from any group — here focus stays on the Kind
+        // group (shell selected), no travelling down to [ Create ].
         let (_d, mut app) = app_over_tempdir();
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        assert!(matches!(app.popup, Popup::Chooser { focus: 0, .. }));
+        assert!(matches!(app.popup, Popup::Chooser { group: ChooserGroup::Kind, .. }));
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
@@ -838,13 +976,10 @@ mod tests {
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        let cancel_idx = app
-            .chooser_rows()
-            .iter()
-            .position(|r| *r == ChooserRow::Cancel)
-            .unwrap();
-        if let Popup::Chooser { focus, .. } = &mut app.popup {
-            *focus = cancel_idx;
+        // Focus the Actions group on the Cancel button.
+        if let Popup::Chooser { group, action, .. } = &mut app.popup {
+            *group = ChooserGroup::Actions;
+            *action = false;
         }
         app.chooser_commit().unwrap();
         assert!(matches!(app.popup, Popup::None));
@@ -852,21 +987,57 @@ mod tests {
     }
 
     #[test]
-    fn chooser_cycle_wraps_around_ends() {
+    fn chooser_group_move_navigates_groups_and_clamps() {
+        // claude reveals Perm; Up/Down walk groups (Kind -> Perm -> Actions),
+        // and Down at the last group clamps.
         let (_d, mut app) = app_over_tempdir();
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        let last = app.chooser_rows().len() - 1;
-        // Shift-Tab from the first row wraps to the last (Create).
-        app.chooser_cycle(-1);
-        assert!(matches!(app.popup, Popup::Chooser { focus, .. } if focus == last));
-        // Tab from the last row wraps back to the first (shell radio).
-        app.chooser_cycle(1);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
-        ));
+        app.chooser_option_move(1); // Kind -> claude (reveals Perm group)
+        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
+        app.chooser_group_move(1); // -> Perm
+        assert_eq!(app.chooser_group(), ChooserGroup::Perm);
+        app.chooser_group_move(1); // -> Actions (no resumes here)
+        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
+        app.chooser_group_move(1); // clamp at the end
+        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
+        app.chooser_group_move(-10); // clamp at the start
+        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
+    }
+
+    #[test]
+    fn chooser_option_move_changes_selection_within_group() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        // Kind group: Right -> claude, Left -> shell (clamps).
+        app.chooser_option_move(1);
+        assert!(matches!(app.popup, Popup::Chooser { kind: SessionKind::Claude, .. }));
+        app.chooser_option_move(-5);
+        assert!(matches!(app.popup, Popup::Chooser { kind: SessionKind::Shell, .. }));
+        // Back to claude, then walk into Perm and toggle normal -> skip.
+        app.chooser_option_move(1);
+        app.chooser_group_move(1); // -> Perm
+        app.chooser_option_move(1); // normal -> skip
+        assert!(matches!(app.popup, Popup::Chooser { perm: ClaudePerm::Skip, .. }));
+        app.chooser_option_move(-1); // skip -> normal
+        assert!(matches!(app.popup, Popup::Chooser { perm: ClaudePerm::Normal, .. }));
+    }
+
+    #[test]
+    fn chooser_group_cycle_wraps_around_ends() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser(); // shell: groups are [Kind, Actions]
+        // Shift-Tab from the first group wraps to the last (Actions).
+        app.chooser_group_cycle(-1);
+        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
+        // Tab from the last group wraps back to the first (Kind).
+        app.chooser_group_cycle(1);
+        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
     }
 
     #[test]
@@ -1034,7 +1205,7 @@ mod tests {
     fn focusing_claude_reveals_perm_rows_and_selects_it() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_move(1); // focus -> claude
+        app.chooser_option_move(1); // Kind group: shell -> claude
         if let Popup::Chooser { kind, .. } = app.popup {
             assert_eq!(kind, SessionKind::Claude);
         } else {
@@ -1055,26 +1226,28 @@ mod tests {
     }
 
     #[test]
-    fn focusing_skip_sets_perm_then_back_to_shell_reclamps() {
+    fn switching_back_to_shell_drops_perm_group() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        // rows after focusing claude: shell(0) claude(1) codex(2) normal(3) skip(4) ...
-        app.chooser_move(1); // claude
-        app.chooser_move(2); // normal
-        app.chooser_move(1); // skip
+        app.chooser_option_move(1); // Kind -> claude
+        app.chooser_group_move(1); // -> Perm group (normal)
+        app.chooser_option_move(1); // normal -> skip
         if let Popup::Chooser { perm, .. } = app.popup {
             assert_eq!(perm, ClaudePerm::Skip);
         } else {
             panic!();
         }
-        // move focus up to shell -> kind becomes Shell, perm rows vanish, focus valid
-        app.chooser_move(-4); // skip(4) -> shell(0)
-        if let Popup::Chooser { kind, focus, .. } = app.popup {
+        // Back on Kind, switch to shell: the Perm group disappears and the
+        // focused group stays valid (no stale index to reclamp).
+        app.chooser_group_move(-1); // -> Kind
+        app.chooser_option_move(-1); // claude -> shell
+        if let Popup::Chooser { kind, .. } = app.popup {
             assert_eq!(kind, SessionKind::Shell);
-            assert!(focus < app.chooser_rows().len());
         } else {
             panic!();
         }
+        assert!(!app.chooser_groups().contains(&ChooserGroup::Perm));
+        assert!(app.chooser_groups().contains(&app.chooser_group()));
     }
 
     fn fake_resume(id: &str, last: &str) -> ResumeSession {
@@ -1091,7 +1264,7 @@ mod tests {
         open_dir_chooser(&mut app);
         // Inject discovered sessions (open_chooser found none for the tempdir).
         app.chooser_resumes = vec![fake_resume("aaa", "do a thing"), fake_resume("bbb", "do another")];
-        app.chooser_move(1); // focus -> claude
+        app.chooser_option_move(1); // Kind group: shell -> claude
         assert_eq!(
             app.chooser_rows(),
             vec![
@@ -1176,7 +1349,7 @@ mod tests {
     fn focusing_codex_selects_it_without_perm_rows() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_move(2); // shell(0) -> claude(1) -> codex(2)
+        app.chooser_option_move(2); // Kind group: shell -> claude -> codex
         if let Popup::Chooser { kind, .. } = app.popup {
             assert_eq!(kind, SessionKind::Codex);
         } else {
@@ -1201,7 +1374,7 @@ mod tests {
         let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
         app.selected = src_idx;
         app.open_chooser();
-        app.chooser_move(2); // focus -> codex
+        app.chooser_option_move(2); // Kind group: shell -> claude -> codex
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
@@ -1219,13 +1392,10 @@ mod tests {
     fn chooser_activate_create_starts_claude_skip() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_move(1); // claude
-        app.chooser_move(3); // skip (past codex + normal)
-        // move focus to Create
-        let create_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Create).unwrap();
-        if let Popup::Chooser { focus, .. } = &mut app.popup {
-            *focus = create_idx;
-        }
+        app.chooser_option_move(1); // Kind -> claude
+        app.chooser_group_move(1); // -> Perm group
+        app.chooser_option_move(1); // normal -> skip
+        focus_create(&mut app);
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
@@ -1529,9 +1699,10 @@ mod tests {
     fn chooser_activate_cancel_closes_without_tmux() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        let cancel_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Cancel).unwrap();
-        if let Popup::Chooser { focus, .. } = &mut app.popup {
-            *focus = cancel_idx;
+        // Focus the Actions group on the Cancel button.
+        if let Popup::Chooser { group, action, .. } = &mut app.popup {
+            *group = ChooserGroup::Actions;
+            *action = false;
         }
         app.chooser_activate().unwrap();
         assert_eq!(app.popup, Popup::None);
