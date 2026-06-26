@@ -151,7 +151,8 @@ fn session_left(row: &Row) -> String {
 /// The git-status colour for a row, or `None` when it should render plain.
 /// Sessions are never coloured (they aren't tracked paths); directories and
 /// files take the colour of their `git status` entry, following git's own
-/// policy — staged ("Changes to be committed") green, dirty/untracked red.
+/// policy — staged ("Changes to be committed") green, dirty/untracked red,
+/// ignored grey.
 fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
     if matches!(row.kind, RowKind::Session { .. }) {
         return None;
@@ -159,6 +160,7 @@ fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
     let color = match git.get(&row.path)? {
         GitStatus::Staged => Color::Green,
         GitStatus::Modified | GitStatus::Untracked => Color::Red,
+        GitStatus::Ignored => Color::DarkGray,
     };
     Some(Style::default().fg(color))
 }
@@ -611,18 +613,22 @@ mod tests {
 
         let staged = PathBuf::from("/repo/staged.rs");
         let dirty = PathBuf::from("/repo/dirty");
+        let ignored = PathBuf::from("/repo/ignored.log");
         let git = GitStatuses::from_entries([
             (staged.clone(), GitStatus::Staged),
             (dirty.clone(), GitStatus::Untracked),
+            (ignored.clone(), GitStatus::Ignored),
         ]);
 
         let path_row = |path: PathBuf, kind: RowKind| Row { path, label: "x".into(), depth: 0, kind };
 
-        // Staged path renders green; untracked (dirty) renders red.
+        // Staged path renders green; untracked (dirty) renders red; ignored grey.
         let r = path_row(staged.clone(), RowKind::File);
         assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::Green)));
         let r = path_row(dirty.clone(), RowKind::Dir { expanded: false });
         assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::Red)));
+        let r = path_row(ignored.clone(), RowKind::File);
+        assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::DarkGray)));
 
         // A path git didn't report stays uncoloured.
         let r = path_row(PathBuf::from("/repo/clean.rs"), RowKind::File);
@@ -727,9 +733,11 @@ mod tests {
                 })
                 .collect()
         };
-        // viewer Some lets render skip the embedded terminal screen.
+        // viewer Some lets render skip the embedded terminal screen. Root at an
+        // empty tempdir (not `/`) so App::new's git scan finds nothing instantly.
         let has_thumb = |rows: Vec<Row>| -> bool {
-            let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
             app.rows = rows;
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -769,7 +777,8 @@ mod tests {
         // Render at a given scroll offset and return the inclusive (min_y, max_y)
         // of the scrollbar thumb cells.
         let thumb_span = |offset: usize, selected: usize| -> (u16, u16) {
-            let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
             app.rows = rows.clone();
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             app.tree_offset = offset;
@@ -823,7 +832,8 @@ mod tests {
         use ratatui::Terminal;
         use std::path::{Path, PathBuf};
 
-        let mut app = App::new(PathBuf::from("/"), Tmux::new("runner", MockRunner::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
         app.rows = (0..30)
             .map(|i| Row {
                 path: PathBuf::from("/"),

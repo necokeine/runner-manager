@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +27,8 @@ pub enum GitStatus {
     Modified,
     /// Not tracked by git at all.
     Untracked,
+    /// Matched by a `.gitignore` rule — rendered grey.
+    Ignored,
 }
 
 impl GitStatus {
@@ -43,50 +45,71 @@ impl GitStatus {
 /// colour a collapsed directory without re-scanning its subtree every frame.
 #[derive(Debug, Default, Clone)]
 pub struct GitStatuses {
+    /// Per-path status for changed paths (and their rolled-up ancestor dirs),
+    /// plus individually-ignored files. Exact lookup.
     map: HashMap<PathBuf, GitStatus>,
+    /// Ignored *directories* (e.g. `target/`, `node_modules/`). git collapses an
+    /// ignored directory into one entry instead of listing every file inside, so
+    /// these are kept as path prefixes: any path at or under one is [`Ignored`].
+    ///
+    /// [`Ignored`]: GitStatus::Ignored
+    ignored_dirs: Vec<PathBuf>,
 }
 
 impl GitStatuses {
     /// An empty snapshot — what callers get when `root` is not in a git repo,
     /// `git` is missing, or the command fails. No path is ever coloured.
     pub fn empty() -> Self {
-        Self { map: HashMap::new() }
+        Self { map: HashMap::new(), ignored_dirs: Vec::new() }
     }
 
-    /// The status of `path`, if git reported a change at or under it.
+    /// The status of `path`: an exact change/ignored-file entry, else [`Ignored`]
+    /// if it sits under an ignored directory, else `None`.
+    ///
+    /// [`Ignored`]: GitStatus::Ignored
     pub fn get(&self, path: &Path) -> Option<GitStatus> {
-        self.map.get(path).copied()
+        if let Some(status) = self.map.get(path) {
+            return Some(*status);
+        }
+        if self.ignored_dirs.iter().any(|dir| path.starts_with(dir)) {
+            return Some(GitStatus::Ignored);
+        }
+        None
     }
 
     /// Build a snapshot directly from `(path, status)` pairs. Test-only: the
     /// real path comes from [`GitStatuses::load`].
     #[cfg(test)]
     pub fn from_entries(entries: impl IntoIterator<Item = (PathBuf, GitStatus)>) -> Self {
-        Self { map: entries.into_iter().collect() }
+        Self { map: entries.into_iter().collect(), ignored_dirs: Vec::new() }
     }
 
-    /// Build a `git status` snapshot for the tree `root`. Two cases:
+    /// Build a `git status` snapshot for the tree `root`, combining two sources
+    /// so colouring works no matter how the tree is rooted:
     ///
-    /// * `root` is itself inside a git work tree — colour its whole visible
-    ///   subtree from that one repository.
-    /// * `root` is not in a repo — walk downward and treat every directory that
-    ///   holds its own `.git` as an independent repository, colouring each
-    ///   repo's subtree from its own status. This covers a parent folder that
-    ///   holds several unrelated checkouts.
+    /// * If `root` is inside a git work tree (its `.git` is at or above it), that
+    ///   repository's status colours its visible subtree.
+    /// * Unless `root` is *itself* a repository top, the tree is also scanned
+    ///   downward and every directory holding its own `.git` is coloured from its
+    ///   own status. This is the common case the tree pane is rooted at a parent
+    ///   folder (e.g. `~/Projects`) holding many independent checkouts — and it
+    ///   still works when that parent happens to live inside an unrelated repo.
     ///
     /// Best-effort throughout: a missing `git`, a non-repo, or unreadable output
     /// just contributes nothing, so the tree renders without colour rather than
     /// failing. Only paths under `root` are ever recorded.
     pub fn load(root: &Path) -> Self {
         let mut statuses = Self::empty();
-        match repo_toplevel(root) {
-            // `root` is in a repo (at or above it): one status covers everything.
-            Some(toplevel) => statuses.merge_containing_repo(root, &toplevel),
-            // `root` is not in a repo: each nested `.git` is its own repo.
-            None => {
-                for repo in find_nested_repos(root) {
-                    statuses.merge_nested_repo(root, &repo);
-                }
+        // The repository containing `root` (could be `root` itself or an ancestor).
+        if let Some(toplevel) = repo_toplevel(root) {
+            statuses.merge_containing_repo(root, &toplevel);
+        }
+        // Repositories nested under `root`. Skip this when `root` is itself a
+        // repo top: its whole subtree is one repo (already handled above), so
+        // there is no point walking it hunting for submodules.
+        if !root.join(".git").exists() {
+            for repo in find_nested_repos(root) {
+                statuses.merge_nested_repo(root, &repo);
             }
         }
         statuses
@@ -115,7 +138,7 @@ impl GitStatuses {
             let Ok(under_root) = rel.strip_prefix(&prefix) else {
                 continue;
             };
-            self.insert_path(&root.join(under_root), status, root);
+            self.record(root.join(under_root), status, root);
         }
     }
 
@@ -129,7 +152,25 @@ impl GitStatuses {
             return;
         };
         for (rel, status) in parse_porcelain(&output) {
-            self.insert_path(&repo.join(rel), status, root);
+            self.record(repo.join(rel), status, root);
+        }
+    }
+
+    /// Route one re-anchored entry into the snapshot. Ignored directories become
+    /// path prefixes (git collapses them, so their contents aren't listed);
+    /// ignored files are stored as exact entries; everything else is a change and
+    /// rolls up into its ancestor directories. Ignored paths never roll up — a
+    /// directory is only grey if it is itself ignored, not because it contains
+    /// an ignored child.
+    fn record(&mut self, abs: PathBuf, status: GitStatus, root: &Path) {
+        if status == GitStatus::Ignored {
+            if abs.is_dir() {
+                self.ignored_dirs.push(abs);
+            } else {
+                self.map.insert(abs, GitStatus::Ignored);
+            }
+        } else {
+            self.insert_path(&abs, status, root);
         }
     }
 
@@ -184,58 +225,64 @@ fn repo_toplevel(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Directories under `root` that are their own git repository (they hold a
-/// `.git`). The scan descends only through non-repo directories: once a repo is
+/// `.git`). Searched **breadth-first** so the shallowest repositories — the
+/// usual case, repos sitting directly under a `~/Projects`-style parent — are
+/// found first and within budget even when a sibling holds a huge non-repo
+/// subtree. The scan descends only through non-repo directories: once a repo is
 /// found it is recorded and **not** entered, so a repo's internals (and its
 /// `node_modules`/`target`/etc.) are never walked. Paths are returned in
-/// `root`-anchored form, matching the tree's row paths. Called only when `root`
-/// itself is not in a repo.
+/// `root`-anchored form, matching the tree's row paths.
 fn find_nested_repos(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut budget = MAX_REPO_SCAN_DIRS;
-    collect_repos(root, 0, &mut budget, &mut out);
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+    while let Some((dir, depth)) = queue.pop_front() {
+        if depth > MAX_REPO_SCAN_DEPTH {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return out;
+            }
+            // `file_type()` does not follow symlinks, so symlinked directories
+            // are skipped — that avoids both cycles and wandering outside the tree.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() || entry.file_name() == ".git" {
+                continue;
+            }
+            budget -= 1;
+            let path = entry.path();
+            // `.git` is a directory for a normal clone and a file for a submodule
+            // or linked work tree; either marks `path` as a repository root.
+            // Prune there — a repo's own subtree is covered by its status.
+            if path.join(".git").exists() {
+                out.push(path);
+            } else {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
     out
 }
 
-fn collect_repos(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<PathBuf>) {
-    if depth > MAX_REPO_SCAN_DEPTH || *budget == 0 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if *budget == 0 {
-            return;
-        }
-        // `file_type()` does not follow symlinks, so symlinked directories are
-        // skipped — that avoids both cycles and wandering outside the tree.
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() || entry.file_name() == ".git" {
-            continue;
-        }
-        *budget -= 1;
-        let path = entry.path();
-        // `.git` is a directory for a normal clone and a file for a submodule or
-        // linked work tree; either marks `path` as a repository root. Prune
-        // there — a repo's own subtree is covered by its status, never re-scanned.
-        if path.join(".git").exists() {
-            out.push(path);
-        } else {
-            collect_repos(&path, depth + 1, budget, out);
-        }
-    }
-}
-
-/// `git -C <dir> status --porcelain -z --untracked-files=all` output, or `None`
-/// on failure. `-z` keeps paths intact (NUL-separated, no quoting) so names with
-/// spaces or newlines parse correctly.
+/// `git -C <dir> status --porcelain -z --untracked-files=all --ignored=matching`
+/// output, or `None` on failure. `-z` keeps paths intact (NUL-separated, no
+/// quoting) so names with spaces or newlines parse correctly. `--ignored=matching`
+/// adds `!!` records for ignored paths while keeping a wholly-ignored directory
+/// collapsed to one `dir/` entry (plain `--ignored` would expand it into every
+/// file under it once `--untracked-files=all` is set), so an ignored directory
+/// can be greyed as a unit.
 fn porcelain(dir: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+        .args(["status", "--porcelain", "-z", "--untracked-files=all", "--ignored=matching"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -272,11 +319,13 @@ fn parse_porcelain(data: &str) -> Vec<(PathBuf, GitStatus)> {
 }
 
 /// Map a porcelain `XY` status pair to a single [`GitStatus`], following git's
-/// own colour grouping: untracked (`??`) and any worktree change (`Y` set) are
-/// red; an index-only change (`X` set, clean worktree) is the green "staged"
-/// state.
+/// own colour grouping: ignored (`!!`) is grey; untracked (`??`) and any
+/// worktree change (`Y` set) are red; an index-only change (`X` set, clean
+/// worktree) is the green "staged" state.
 fn classify(x: char, y: char) -> GitStatus {
-    if x == '?' && y == '?' {
+    if x == '!' && y == '!' {
+        GitStatus::Ignored
+    } else if x == '?' && y == '?' {
         GitStatus::Untracked
     } else if y != ' ' {
         GitStatus::Modified
@@ -303,6 +352,8 @@ mod tests {
         assert_eq!(classify(' ', 'M'), GitStatus::Modified);
         assert_eq!(classify('M', 'M'), GitStatus::Modified);
         assert_eq!(classify(' ', 'D'), GitStatus::Modified);
+        // Ignored -> grey.
+        assert_eq!(classify('!', '!'), GitStatus::Ignored);
     }
 
     #[test]
@@ -392,6 +443,37 @@ mod tests {
         assert_eq!(st.get(&root.join("mix").join("a.rs")), Some(GitStatus::Staged));
         assert_eq!(st.get(&root.join("mix").join("b.rs")), Some(GitStatus::Untracked));
         assert!(st.get(&root.join("mix")).unwrap().is_red());
+    }
+
+    #[test]
+    fn ignored_files_and_directories_render_as_ignored() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        // Ignore a whole directory and a single file.
+        fs::write(root.join(".gitignore"), "ignored_dir/\nsecret.txt\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-q", "-m", "ignore"]);
+
+        // An ignored directory holding a file (git collapses it to one entry).
+        fs::create_dir(root.join("ignored_dir")).unwrap();
+        fs::write(root.join("ignored_dir").join("a.log"), "x").unwrap();
+        // A single ignored file, plus a normal untracked file as a control.
+        fs::write(root.join("secret.txt"), "s").unwrap();
+        fs::write(root.join("visible.txt"), "v").unwrap();
+
+        let st = GitStatuses::load(root);
+
+        // The ignored directory and everything under it are grey (Ignored),
+        // even though git only reported the collapsed directory entry.
+        assert_eq!(st.get(&root.join("ignored_dir")), Some(GitStatus::Ignored));
+        assert_eq!(st.get(&root.join("ignored_dir").join("a.log")), Some(GitStatus::Ignored));
+        // The single ignored file is grey too.
+        assert_eq!(st.get(&root.join("secret.txt")), Some(GitStatus::Ignored));
+        // The untracked control file stays red, not grey.
+        assert_eq!(st.get(&root.join("visible.txt")), Some(GitStatus::Untracked));
+        // Containing an ignored child does not grey the parent (here, the root).
+        assert_eq!(st.get(root), None);
     }
 
     #[test]
