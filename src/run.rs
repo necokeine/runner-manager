@@ -161,11 +161,18 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                     Popup::Chooser { .. } => match key.code {
                         KeyCode::Esc => app.chooser_cancel(),
-                        KeyCode::Enter | KeyCode::Char(' ') => {
+                        // Enter commits the form from any row (Cancel still cancels);
+                        // Space acts on the focused button.
+                        KeyCode::Enter => {
+                            let _ = app.chooser_commit();
+                        }
+                        KeyCode::Char(' ') => {
                             let _ = app.chooser_activate();
                         }
                         KeyCode::Down | KeyCode::Char('j') => app.chooser_move(1),
                         KeyCode::Up | KeyCode::Char('k') => app.chooser_move(-1),
+                        KeyCode::Tab => app.chooser_cycle(1),
+                        KeyCode::BackTab => app.chooser_cycle(-1),
                         _ => {}
                     },
                     Popup::ConfirmClose { .. } => match key.code {
@@ -283,6 +290,11 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    // Save the dragged width once the drag ends, not on every
+                    // intermediate move.
+                    if dragging_split {
+                        app.persist_split();
+                    }
                     dragging_split = false;
                 }
                 MouseEventKind::ScrollDown => {

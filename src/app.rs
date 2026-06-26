@@ -132,6 +132,12 @@ impl<R: CommandRunner> App<R> {
         let tree = Tree::new(root.clone());
         let config = Config::new(root.clone());
         let git = GitStatuses::load(&root);
+        // Restore the saved tree-pane width, clamped into the legal range in
+        // case the file was hand-edited; fall back to the default otherwise.
+        let split_pct = config
+            .load_split()
+            .map(|p| p.clamp(MIN_SPLIT, MAX_SPLIT))
+            .unwrap_or(DEFAULT_SPLIT);
         let mut app = Self {
             tree,
             store: SessionStore::new(),
@@ -149,7 +155,7 @@ impl<R: CommandRunner> App<R> {
             popup: Popup::None,
             chooser_resumes: Vec::new(),
             status: String::new(),
-            split_pct: DEFAULT_SPLIT,
+            split_pct,
             tree_offset: 0,
             pending_respawn: None,
             current_session: None,
@@ -292,6 +298,20 @@ impl<R: CommandRunner> App<R> {
         self.chooser_apply_focus(rows[new_focus]);
     }
 
+    /// Move focus by `delta`, wrapping past the ends (Tab / Shift-Tab). Unlike
+    /// `chooser_move` (arrows / `j`/`k`, which clamp), tabbing past the last row
+    /// returns to the first so the whole form is reachable with one key.
+    pub fn chooser_cycle(&mut self, delta: i32) {
+        let rows = self.chooser_rows();
+        let Popup::Chooser { focus, .. } = &mut self.popup else {
+            return;
+        };
+        let len = rows.len() as i32;
+        let new_focus = (((*focus as i32 + delta) % len) + len) % len;
+        *focus = new_focus as usize;
+        self.chooser_apply_focus(rows[new_focus as usize]);
+    }
+
     /// Clicking (or focusing) a row selects radios; clicking a button acts.
     pub fn chooser_click(&mut self, row: ChooserRow) -> io::Result<()> {
         if let Some(idx) = self.chooser_rows().iter().position(|r| *r == row) {
@@ -329,26 +349,48 @@ impl<R: CommandRunner> App<R> {
         }
     }
 
+    /// Act on the focused row (Space / click): the `Cancel`/`Create` buttons fire;
+    /// radio rows are no-ops here because moving onto them already applied the
+    /// selection. For "Enter anywhere creates", see `chooser_commit`.
     pub fn chooser_activate(&mut self) -> io::Result<()> {
-        let Popup::Chooser { dir, kind, perm, resume, focus } = self.popup.clone() else {
+        let Popup::Chooser { focus, .. } = self.popup else {
             return Ok(());
         };
-        let rows = self.chooser_rows();
-        match rows.get(focus) {
-            Some(ChooserRow::Cancel) => {
-                self.popup = Popup::None;
-            }
-            Some(ChooserRow::Create) => {
-                let resume_id = resume
-                    .and_then(|i| self.chooser_resumes.get(i))
-                    .map(|s| s.id.as_str());
-                let cmd = Self::chooser_command(kind, perm, resume_id);
-                self.popup = Popup::None;
-                self.create_session(&dir, kind, cmd.as_deref())?;
-            }
+        match self.chooser_rows().get(focus) {
+            Some(ChooserRow::Cancel) => self.popup = Popup::None,
+            Some(ChooserRow::Create) => self.create_from_form()?,
             _ => {}
         }
         Ok(())
+    }
+
+    /// Commit the form (Enter): create the session with the current selections no
+    /// matter which row has focus, so the user need not travel to `[ Create ]`.
+    /// Enter while parked on `Cancel` still cancels — least surprise.
+    pub fn chooser_commit(&mut self) -> io::Result<()> {
+        let Popup::Chooser { focus, .. } = self.popup else {
+            return Ok(());
+        };
+        if matches!(self.chooser_rows().get(focus), Some(ChooserRow::Cancel)) {
+            self.popup = Popup::None;
+            return Ok(());
+        }
+        self.create_from_form()
+    }
+
+    /// Build the launch command from the open chooser's selections, close the
+    /// popup, and start the session. Shared by `chooser_activate` (Create button)
+    /// and `chooser_commit` (Enter).
+    fn create_from_form(&mut self) -> io::Result<()> {
+        let Popup::Chooser { dir, kind, perm, resume, .. } = self.popup.clone() else {
+            return Ok(());
+        };
+        let resume_id = resume
+            .and_then(|i| self.chooser_resumes.get(i))
+            .map(|s| s.id.as_str());
+        let cmd = Self::chooser_command(kind, perm, resume_id);
+        self.popup = Popup::None;
+        self.create_session(&dir, kind, cmd.as_deref())
     }
 
     pub fn chooser_cancel(&mut self) {
@@ -565,10 +607,18 @@ impl<R: CommandRunner> App<R> {
 
     pub fn widen_split(&mut self) {
         self.split_pct = (self.split_pct + SPLIT_STEP).min(MAX_SPLIT);
+        self.persist_split();
     }
 
     pub fn narrow_split(&mut self) {
         self.split_pct = self.split_pct.saturating_sub(SPLIT_STEP).max(MIN_SPLIT);
+        self.persist_split();
+    }
+
+    /// Persist the current tree-pane width to the config dir. Best-effort: a
+    /// write failure leaves the layout usable, just not saved.
+    pub fn persist_split(&self) {
+        let _ = self.config.save_split(self.split_pct);
     }
 
     pub fn host_client_ready(&mut self) -> bool {
@@ -714,6 +764,66 @@ mod tests {
     }
 
     #[test]
+    fn chooser_commit_creates_without_focusing_create() {
+        // NEC-29: Enter creates from any row — here focus stays on the first
+        // radio (shell), no travelling down to [ Create ].
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        assert!(matches!(app.popup, Popup::Chooser { focus: 0, .. }));
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_commit().unwrap();
+        assert!(matches!(app.popup, Popup::None));
+        assert_eq!(app.tmux.runner.nth_call(0)[2], "new-session");
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. }) && r.label == "shell"));
+    }
+
+    #[test]
+    fn chooser_commit_on_cancel_row_cancels() {
+        // Enter while parked on Cancel must cancel, not create.
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        let cancel_idx = app
+            .chooser_rows()
+            .iter()
+            .position(|r| *r == ChooserRow::Cancel)
+            .unwrap();
+        if let Popup::Chooser { focus, .. } = &mut app.popup {
+            *focus = cancel_idx;
+        }
+        app.chooser_commit().unwrap();
+        assert!(matches!(app.popup, Popup::None));
+        assert_eq!(app.tmux.runner.call_count(), 0); // no session created
+    }
+
+    #[test]
+    fn chooser_cycle_wraps_around_ends() {
+        let (_d, mut app) = app_over_tempdir();
+        let src_idx = app.rows.iter().position(|r| r.label == "src").unwrap();
+        app.selected = src_idx;
+        app.open_chooser();
+        let last = app.chooser_rows().len() - 1;
+        // Shift-Tab from the first row wraps to the last (Create).
+        app.chooser_cycle(-1);
+        assert!(matches!(app.popup, Popup::Chooser { focus, .. } if focus == last));
+        // Tab from the last row wraps back to the first (shell radio).
+        app.chooser_cycle(1);
+        assert!(matches!(
+            app.popup,
+            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
+        ));
+    }
+
+    #[test]
     fn activate_file_opens_viewer_no_tmux() {
         let (_d, mut app) = app_over_tempdir();
         // expand src so a.rs is visible
@@ -742,6 +852,29 @@ mod tests {
             app.narrow_split();
         }
         assert_eq!(app.split_pct, 15); // clamped low
+    }
+
+    #[test]
+    fn split_width_persists_across_app_instances() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // First instance: a width change is saved to <root>/.pjma/split.
+        {
+            let mut app = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+            app.widen_split(); // 35 -> 40
+            assert_eq!(app.split_pct, 40);
+        }
+
+        // A fresh instance over the same root restores the saved width.
+        let app2 = App::new(root.clone(), Tmux::new("runner", MockRunner::new()));
+        assert_eq!(app2.split_pct, 40);
+    }
+
+    #[test]
+    fn split_width_falls_back_to_default_when_unsaved() {
+        let (_d, app) = app_over_tempdir();
+        assert_eq!(app.split_pct, 35);
     }
 
     #[test]

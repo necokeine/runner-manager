@@ -65,9 +65,12 @@ runner-manager
 | scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
 | drag border    | resize the tree/terminal split                      |
 
-In the new-session form: `↑`/`↓`/`j`/`k` move between rows (selecting `claude`
-reveals a permission choice: `normal` or `skip` = `--dangerously-skip-permissions`),
-`Enter`/`Space` activates the focused `Cancel`/`Create` button, `Esc` cancels.
+In the new-session form: `↑`/`↓`/`j`/`k` move between rows and `Tab`/`Shift-Tab`
+cycle through them (selecting `claude` reveals a permission choice: `normal` or
+`skip` = `--dangerously-skip-permissions`). Selections follow focus, so once the
+right radios are lit, `Enter` creates the session from **any** row — no need to
+move down to `Create` (pressing `Enter` while on `Cancel` cancels instead).
+`Space` activates the focused `Cancel`/`Create` button, and `Esc` cancels.
 When `claude` is selected and that directory already has past Claude sessions, a
 **Resume** list appears: pick `new session` to start fresh, or an existing
 session (shown with the last prompt it was working on) to launch

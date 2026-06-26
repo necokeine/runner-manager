@@ -534,6 +534,12 @@ pub fn render_chooser(
     lines.push(Line::from(format!("{}[ Create ]", arrow(ChooserRow::Create))));
     row_ys.push((y, ChooserRow::Create));
 
+    lines.push(Line::from(String::new()));
+    lines.push(Line::from(Span::styled(
+        "↑/↓/Tab move · Enter create · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
     row_ys
