@@ -1,6 +1,19 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// How deep to walk under a non-repo `root` looking for nested `.git`
+/// directories before giving up. A repo more than this many levels below the
+/// tree root is unusual.
+const MAX_REPO_SCAN_DEPTH: usize = 12;
+
+/// Hard cap on the number of directories the nested-repo scan will enter in one
+/// pass. The scan prunes at every repo boundary, so a normal parent-of-repos is
+/// covered long before this — the budget only bites on a huge *non*-repo tree
+/// (e.g. rooting at `/`), keeping a single scan cheap and bounded instead of
+/// crawling the whole filesystem.
+const MAX_REPO_SCAN_DIRS: usize = 4096;
 
 /// The git working-tree state of a single path, reduced to what the tree pane
 /// needs to colour it. Mirrors `git status`'s own colour policy: staged changes
@@ -52,17 +65,39 @@ impl GitStatuses {
         Self { map: entries.into_iter().collect() }
     }
 
-    /// Run `git status` for the repository containing `root` and build a
-    /// snapshot. Best-effort: any failure (not a repo, no `git`, bad output)
-    /// yields an empty snapshot rather than an error, so the tree just renders
-    /// without colour. Only paths under `root` are recorded — changes elsewhere
-    /// in the repo never appear in the tree, so they are skipped.
+    /// Build a `git status` snapshot for the tree `root`. Two cases:
+    ///
+    /// * `root` is itself inside a git work tree — colour its whole visible
+    ///   subtree from that one repository.
+    /// * `root` is not in a repo — walk downward and treat every directory that
+    ///   holds its own `.git` as an independent repository, colouring each
+    ///   repo's subtree from its own status. This covers a parent folder that
+    ///   holds several unrelated checkouts.
+    ///
+    /// Best-effort throughout: a missing `git`, a non-repo, or unreadable output
+    /// just contributes nothing, so the tree renders without colour rather than
+    /// failing. Only paths under `root` are ever recorded.
     pub fn load(root: &Path) -> Self {
-        let Some(toplevel) = repo_toplevel(root) else {
-            return Self::empty();
-        };
+        let mut statuses = Self::empty();
+        match repo_toplevel(root) {
+            // `root` is in a repo (at or above it): one status covers everything.
+            Some(toplevel) => statuses.merge_containing_repo(root, &toplevel),
+            // `root` is not in a repo: each nested `.git` is its own repo.
+            None => {
+                for repo in find_nested_repos(root) {
+                    statuses.merge_nested_repo(root, &repo);
+                }
+            }
+        }
+        statuses
+    }
+
+    /// Merge the status of the repository whose work tree contains `root`. Its
+    /// `toplevel` may sit at or above `root`, so paths are re-anchored onto the
+    /// original `root` and any change outside it is dropped.
+    fn merge_containing_repo(&mut self, root: &Path, toplevel: &Path) {
         let Some(output) = porcelain(root) else {
-            return Self::empty();
+            return;
         };
         // Porcelain paths are relative to the repo toplevel, which git reports
         // in canonical (symlink-resolved) form — `root` may be given in another
@@ -70,21 +105,32 @@ impl GitStatuses {
         // also use the un-resolved form). Compute the toplevel→root prefix in
         // canonical space, then re-anchor each path onto the original `root` so
         // the map's keys line up with the tree's `row.path` values.
-        let canon_top = std::fs::canonicalize(&toplevel).unwrap_or(toplevel);
-        let prefix = std::fs::canonicalize(root)
+        let canon_top = fs::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
+        let prefix = fs::canonicalize(root)
             .ok()
             .and_then(|cr| cr.strip_prefix(&canon_top).ok().map(Path::to_path_buf))
             .unwrap_or_default();
-        let mut statuses = Self::empty();
         for (rel, status) in parse_porcelain(&output) {
             // Keep only paths inside `root`; drop the prefix and re-anchor.
             let Ok(under_root) = rel.strip_prefix(&prefix) else {
                 continue;
             };
-            let abs = root.join(under_root);
-            statuses.insert_path(&abs, status, root);
+            self.insert_path(&root.join(under_root), status, root);
         }
-        statuses
+    }
+
+    /// Merge the status of a repository nested under `root`. `repo` is the
+    /// directory that holds the `.git`, already in `root`-anchored form (built
+    /// by the scan from `root`), so it is also the repo's work-tree top: its
+    /// porcelain paths are relative to it, and `repo.join(rel)` is exactly the
+    /// path the tree uses for that file — no canonicalisation needed.
+    fn merge_nested_repo(&mut self, root: &Path, repo: &Path) {
+        let Some(output) = porcelain(repo) else {
+            return;
+        };
+        for (rel, status) in parse_porcelain(&output) {
+            self.insert_path(&repo.join(rel), status, root);
+        }
     }
 
     /// Record `status` for `abs` and roll it up into every ancestor directory
@@ -134,6 +180,51 @@ fn repo_toplevel(dir: &Path) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(path))
+    }
+}
+
+/// Directories under `root` that are their own git repository (they hold a
+/// `.git`). The scan descends only through non-repo directories: once a repo is
+/// found it is recorded and **not** entered, so a repo's internals (and its
+/// `node_modules`/`target`/etc.) are never walked. Paths are returned in
+/// `root`-anchored form, matching the tree's row paths. Called only when `root`
+/// itself is not in a repo.
+fn find_nested_repos(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut budget = MAX_REPO_SCAN_DIRS;
+    collect_repos(root, 0, &mut budget, &mut out);
+    out
+}
+
+fn collect_repos(dir: &Path, depth: usize, budget: &mut usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_REPO_SCAN_DEPTH || *budget == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        // `file_type()` does not follow symlinks, so symlinked directories are
+        // skipped — that avoids both cycles and wandering outside the tree.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() || entry.file_name() == ".git" {
+            continue;
+        }
+        *budget -= 1;
+        let path = entry.path();
+        // `.git` is a directory for a normal clone and a file for a submodule or
+        // linked work tree; either marks `path` as a repository root. Prune
+        // there — a repo's own subtree is covered by its status, never re-scanned.
+        if path.join(".git").exists() {
+            out.push(path);
+        } else {
+            collect_repos(&path, depth + 1, budget, out);
+        }
     }
 }
 
@@ -304,11 +395,72 @@ mod tests {
     }
 
     #[test]
-    fn load_outside_a_repo_is_empty() {
+    fn load_outside_a_repo_with_no_nested_repos_is_empty() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x").unwrap();
-        // No `git init`: not a repo -> empty snapshot, no panic.
+        // Not a repo and nothing nested -> empty snapshot, no panic.
         let st = GitStatuses::load(dir.path());
         assert_eq!(st.get(&dir.path().join("a.txt")), None);
+    }
+
+    #[test]
+    fn load_colours_nested_repos_under_a_non_repo_root() {
+        // The tree root is NOT a git repo, but two sub-directories are their own
+        // repositories (one of them a level deep). Each repo's status colours
+        // its own subtree; the non-repo root and its plain files stay uncoloured.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        assert!(repo_toplevel(root).is_none(), "root must not be a repo for this test");
+
+        // repo A: <root>/alpha with an untracked file.
+        let alpha = root.join("alpha");
+        fs::create_dir(&alpha).unwrap();
+        init_repo(&alpha);
+        fs::write(alpha.join("loose.txt"), "u").unwrap();
+
+        // repo B: <root>/nested/beta (a level below root) with a staged file.
+        fs::create_dir(root.join("nested")).unwrap();
+        let beta = root.join("nested").join("beta");
+        fs::create_dir(&beta).unwrap();
+        init_repo(&beta);
+        fs::write(beta.join("new.rs"), "n").unwrap();
+        git(&beta, &["add", "new.rs"]);
+
+        // A plain file directly under the non-repo root: never coloured.
+        fs::write(root.join("plain.txt"), "p").unwrap();
+
+        let st = GitStatuses::load(root);
+
+        // alpha's untracked file is red; alpha/ rolls up red.
+        assert_eq!(st.get(&alpha.join("loose.txt")), Some(GitStatus::Untracked));
+        assert_eq!(st.get(&alpha), Some(GitStatus::Untracked));
+
+        // beta's staged file is green; beta/ and the intermediate nested/ roll up.
+        assert_eq!(st.get(&beta.join("new.rs")), Some(GitStatus::Staged));
+        assert_eq!(st.get(&beta), Some(GitStatus::Staged));
+        assert_eq!(st.get(&root.join("nested")), Some(GitStatus::Staged));
+
+        // The non-repo root and its plain file are untouched.
+        assert_eq!(st.get(root), None);
+        assert_eq!(st.get(&root.join("plain.txt")), None);
+    }
+
+    #[test]
+    fn nested_scan_does_not_descend_into_a_found_repo() {
+        // A repo nested under a non-repo root holds an inner directory that
+        // itself looks like a candidate. Because the scan prunes at the repo
+        // boundary, the inner path is coloured by the OUTER repo's status (it is
+        // tracked there), not treated as a separate repository.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let repo = root.join("proj");
+        fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        fs::create_dir(repo.join("inner")).unwrap();
+        fs::write(repo.join("inner").join("f.rs"), "x").unwrap(); // untracked in proj
+
+        let st = GitStatuses::load(root);
+        assert_eq!(st.get(&repo.join("inner").join("f.rs")), Some(GitStatus::Untracked));
+        assert_eq!(st.get(&repo.join("inner")), Some(GitStatus::Untracked));
     }
 }
