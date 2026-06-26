@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::claude::{self, ResumeSession};
 use crate::config::Config;
+use crate::git::GitStatuses;
 use crate::rows::{build_project_rows, build_rows, Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
@@ -100,6 +101,10 @@ pub struct App<R: CommandRunner> {
     /// One-word brief per session slug (the active pane's foreground command),
     /// refreshed each `sync` and shown in the project view.
     pub briefs: HashMap<String, String>,
+    /// `git status` snapshot for the tree root, refreshed each `sync`. Drives
+    /// the per-row colour in the directory view; empty when the root is not in
+    /// a git repo.
+    pub git: GitStatuses,
     pub host_tty: Option<String>,
     pub viewer: Option<FileView>,
     pub focus: Focus,
@@ -126,6 +131,7 @@ impl<R: CommandRunner> App<R> {
     pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
         let config = Config::new(root.clone());
+        let git = GitStatuses::load(&root);
         let mut app = Self {
             tree,
             store: SessionStore::new(),
@@ -136,6 +142,7 @@ impl<R: CommandRunner> App<R> {
             rows: Vec::new(),
             tab: TreeTab::Directory,
             briefs: HashMap::new(),
+            git,
             host_tty: None,
             viewer: None,
             focus: Focus::Tree,
@@ -509,6 +516,10 @@ impl<R: CommandRunner> App<R> {
         if let Some(slug) = self.tmux.client_session()? {
             self.current_session = Some(slug);
         }
+        // Refresh git colouring: sessions edit files in the tree, so the status
+        // can change between frames. Cheap on a clean tree; bounded by the repo
+        // size on a dirty one.
+        self.git = GitStatuses::load(&self.root);
         self.rebuild_rows();
         Ok(())
     }

@@ -11,6 +11,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, ChooserRow, Focus, TreeTab};
 use crate::claude::ResumeSession;
+use crate::git::{GitStatus, GitStatuses};
 use crate::rows::{Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
@@ -145,6 +146,21 @@ fn session_left(row: &Row) -> String {
         _ => "",
     };
     format!("{indent}{mark}{}", row.label)
+}
+
+/// The git-status colour for a row, or `None` when it should render plain.
+/// Sessions are never coloured (they aren't tracked paths); directories and
+/// files take the colour of their `git status` entry, following git's own
+/// policy — staged ("Changes to be committed") green, dirty/untracked red.
+fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
+    if matches!(row.kind, RowKind::Session { .. }) {
+        return None;
+    }
+    let color = match git.get(&row.path)? {
+        GitStatus::Staged => Color::Green,
+        GitStatus::Modified | GitStatus::Untracked => Color::Red,
+    };
+    Some(Style::default().fg(color))
 }
 
 fn row_line(row: &Row) -> String {
@@ -291,7 +307,14 @@ pub fn render<R: CommandRunner>(
 
     let view_h = inner.height as usize;
     let total = app.rows.len();
-    let items: Vec<ListItem> = app.rows.iter().map(|r| ListItem::new(row_line(r))).collect();
+    let items: Vec<ListItem> = app
+        .rows
+        .iter()
+        .map(|r| match row_style(r, &app.git) {
+            Some(style) => ListItem::new(Line::styled(row_line(r), style)),
+            None => ListItem::new(row_line(r)),
+        })
+        .collect();
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     if total > 0 {
@@ -579,6 +602,35 @@ mod tests {
     }
     fn file_row(label: &str) -> Row {
         Row { path: std::path::PathBuf::from("/"), label: label.to_string(), depth: 0, kind: RowKind::File }
+    }
+
+    #[test]
+    fn row_style_colours_files_and_dirs_by_git_status() {
+        use crate::git::{GitStatus, GitStatuses};
+        use std::path::PathBuf;
+
+        let staged = PathBuf::from("/repo/staged.rs");
+        let dirty = PathBuf::from("/repo/dirty");
+        let git = GitStatuses::from_entries([
+            (staged.clone(), GitStatus::Staged),
+            (dirty.clone(), GitStatus::Untracked),
+        ]);
+
+        let path_row = |path: PathBuf, kind: RowKind| Row { path, label: "x".into(), depth: 0, kind };
+
+        // Staged path renders green; untracked (dirty) renders red.
+        let r = path_row(staged.clone(), RowKind::File);
+        assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::Green)));
+        let r = path_row(dirty.clone(), RowKind::Dir { expanded: false });
+        assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::Red)));
+
+        // A path git didn't report stays uncoloured.
+        let r = path_row(PathBuf::from("/repo/clean.rs"), RowKind::File);
+        assert_eq!(row_style(&r, &git), None);
+
+        // Sessions are never coloured, even when their path has a status.
+        let r = path_row(staged, RowKind::Session { slug: "s".into(), kind: SessionKind::Shell });
+        assert_eq!(row_style(&r, &git), None);
     }
 
     #[test]
