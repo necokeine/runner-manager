@@ -63,6 +63,7 @@ runner-manager
 | `Ctrl-q`       | toggle focus between tree and the right pane        |
 | left-click     | focus a pane; in the tree, act on the clicked row   |
 | scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
+| drag in terminal | select text; releasing copies it to the system clipboard |
 | drag border    | resize the tree/terminal split                      |
 
 In the new-session form: `↑`/`↓`/`j`/`k` move between rows and `Tab`/`Shift-Tab`

@@ -6,6 +6,7 @@ use crate::claude::{self, ResumeSession};
 use crate::config::Config;
 use crate::git::GitStatuses;
 use crate::rows::{build_project_rows, build_rows, Row, RowKind};
+use crate::select::Selection;
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::Tree;
@@ -126,6 +127,10 @@ pub struct App<R: CommandRunner> {
     /// Set when switching/recovering and reconciled against tmux in `sync`;
     /// used to label the terminal pane with that session's directory.
     pub current_session: Option<String>,
+    /// Active mouse text selection over the terminal pane, in pane-relative
+    /// cells. `None` when nothing is selected. Driven by the run loop's
+    /// left-button drag and painted reversed by `ui::render`.
+    pub selection: Option<Selection>,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -160,6 +165,7 @@ impl<R: CommandRunner> App<R> {
             tree_offset: 0,
             pending_respawn: None,
             current_session: None,
+            selection: None,
         };
         app.rebuild_rows();
         app
@@ -588,10 +594,33 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn toggle_focus(&mut self) {
+        // Leaving (or re-entering) the terminal pane invalidates any selection
+        // painted over it.
+        self.clear_selection();
         self.focus = match self.focus {
             Focus::Tree => Focus::Right,
             Focus::Right => Focus::Tree,
         };
+    }
+
+    /// Begin a terminal-pane selection anchored at pane cell `(col, row)`. A
+    /// bare click that never drags stays empty and copies nothing.
+    pub fn begin_selection(&mut self, col: u16, row: u16) {
+        self.selection = Some(Selection::new(col, row));
+    }
+
+    /// Extend the active selection's cursor to pane cell `(col, row)`. No-op
+    /// when no selection is in progress.
+    pub fn update_selection(&mut self, col: u16, row: u16) {
+        if let Some(sel) = &mut self.selection {
+            sel.cursor = (col, row);
+        }
+    }
+
+    /// Drop any selection (and its highlight). Called when the terminal content
+    /// is about to change underneath it — a keystroke, a scroll, a focus flip.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     /// Scroll the tree by `delta` rows within `view_h` visible rows. Keeps the

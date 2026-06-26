@@ -13,6 +13,7 @@ use crate::app::{App, ChooserRow, Focus, TreeTab};
 use crate::claude::ResumeSession;
 use crate::git::{GitStatus, GitStatuses};
 use crate::rows::{Row, RowKind};
+use crate::select::Selection;
 use crate::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
 
@@ -391,8 +392,14 @@ pub fn render<R: CommandRunner>(
             .border_style(border_style(right_focused));
         f.render_widget(block, right_area);
         match screen {
-            // The embedded client is live: render its vt100 screen.
-            Some(screen) => f.render_widget(PseudoTerminal::new(screen), right_inner),
+            // The embedded client is live: render its vt100 screen, then paint
+            // any in-progress mouse selection over it.
+            Some(screen) => {
+                f.render_widget(PseudoTerminal::new(screen), right_inner);
+                if let Some(sel) = app.selection {
+                    paint_selection(f, right_inner, sel);
+                }
+            }
             // No embedded session yet (fresh start, nothing to recover). Show a
             // hint instead of a live terminal until the user starts one.
             None => {
@@ -409,6 +416,31 @@ pub fn render<R: CommandRunner>(
         split_col: right_area.x,
         term_area: right_inner,
         tabs,
+    }
+}
+
+/// Paint a selection over the already-rendered terminal pane by flipping the
+/// `REVERSED` modifier on each covered cell. `Style::default()` leaves the
+/// cell's own colours alone and only toggles the reverse attribute, so the
+/// highlight reads as inverted text whatever the underlying styling is. `term`
+/// is the terminal pane rect; the selection is in pane-relative cells.
+fn paint_selection(f: &mut Frame, term: Rect, sel: Selection) {
+    if sel.is_empty() {
+        return;
+    }
+    let buf = f.buffer_mut();
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
+    for r in 0..term.height {
+        for c in 0..term.width {
+            if !sel.contains(c, r) {
+                continue;
+            }
+            let x = term.x + c;
+            let y = term.y + r;
+            if x < buf.area.right() && y < buf.area.bottom() {
+                buf[(x, y)].set_style(highlight);
+            }
+        }
     }
 }
 
@@ -448,6 +480,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "right pane focused: type into the shell, or",
         "j/k/PgUp/PgDn to scroll a file view",
         "wheel over the terminal scrolls its history (old logs)",
+        "drag in the terminal to select text → copies to clipboard",
         "",
         "— press any key to close —",
     ];
@@ -976,6 +1009,45 @@ mod tests {
         assert_eq!(resolve_tab_click(proj_hit.0, bar.y, &bar), Some(TreeTab::Project));
         // A click on a different row never hits a tab.
         assert_eq!(resolve_tab_click(dir_hit.0, bar.y + 1, &bar), None);
+    }
+
+    #[test]
+    fn render_paints_terminal_selection_reversed() {
+        use crate::app::{App, Focus};
+        use crate::select::Selection;
+        use crate::tmux::{MockRunner, Tmux};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::sync::RwLock;
+        use tui_term::vt100::Parser;
+
+        // A live screen with some text in the top-left of the terminal pane.
+        let parser = RwLock::new(Parser::new(24, 80, 0));
+        parser.write().unwrap().process(b"hello world");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+        app.focus = Focus::Right;
+        // Select the first five cells of the first terminal row ("hello").
+        app.selection = Some(Selection { anchor: (0, 0), cursor: (4, 0) });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut term_area = None;
+        terminal
+            .draw(|f| {
+                let p = parser.read().unwrap();
+                let layout = render(f, f.area(), &mut app, Some(p.screen()));
+                term_area = Some(layout.term_area);
+            })
+            .unwrap();
+
+        let term = term_area.unwrap();
+        let buf = terminal.backend().buffer();
+        // The first selected cell is reversed; a cell past the selection is not.
+        let selected = &buf[(term.x, term.y)];
+        assert!(selected.modifier.contains(Modifier::REVERSED));
+        let unselected = &buf[(term.x + 6, term.y)];
+        assert!(!unselected.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
