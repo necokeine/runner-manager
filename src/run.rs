@@ -1,5 +1,7 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -14,10 +16,26 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{App, Focus, Popup};
+use crate::git::GitStatuses;
 use crate::keys::{encode_key, encode_wheel};
 use crate::pty::{ParserHandle, Pty};
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui::{self, Hit, PaneHit};
+
+/// Minimum idle gap between git-status scans, measured from when the previous
+/// scan *finished*. The scan runs on a background thread, so this only bounds
+/// how eagerly we re-scan — it never blocks input.
+const GIT_RESCAN_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Compute the git-status snapshot for `root` on a background thread and send
+/// it back over `tx`. Kept off the UI thread because a full `git status` of a
+/// large tree (a parent of many repos) can take seconds; running it inline —
+/// as startup and the per-second sync once did — froze the UI.
+fn spawn_git_scan(root: PathBuf, tx: Sender<GitStatuses>) {
+    thread::spawn(move || {
+        let _ = tx.send(GitStatuses::load(&root));
+    });
+}
 
 pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     enable_raw_mode()?;
@@ -86,6 +104,15 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // Re-expand the directories the user had open last session.
     app.restore_expanded();
 
+    // Git colouring is computed off the UI thread: kick off the first scan now
+    // and apply each result as it arrives (see the loop top). A single
+    // in-flight scan at a time (`git_inflight`) prevents a slow scan from
+    // piling up behind itself.
+    let (git_tx, git_rx) = mpsc::channel::<GitStatuses>();
+    spawn_git_scan(app.root.clone(), git_tx.clone());
+    let mut git_inflight = true;
+    let mut last_git = Instant::now();
+
     let mut last_term_size: (u16, u16) = (0, 0);
     let mut last_sync = Instant::now();
     let mut area_width: u16 = 0;
@@ -94,6 +121,24 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
 
     let result = loop {
+        // Apply a finished background git scan, if one landed since last frame.
+        // `try_recv` never blocks, so a still-running scan just leaves the
+        // current colours in place.
+        match git_rx.try_recv() {
+            Ok(git) => {
+                app.apply_git(git);
+                git_inflight = false;
+                last_git = Instant::now();
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
+        }
+        // Re-scan once the idle gap has elapsed since the last scan finished,
+        // but only when none is in flight — a slow scan must not stack up.
+        if !git_inflight && last_git.elapsed() >= GIT_RESCAN_INTERVAL {
+            spawn_git_scan(app.root.clone(), git_tx.clone());
+            git_inflight = true;
+        }
+
         let mut captured: Option<ui::Layout> = None;
         let draw_res = terminal.draw(|f| {
             area_width = f.area().width;
