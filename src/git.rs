@@ -85,40 +85,50 @@ impl GitStatuses {
     }
 
     /// Build a `git status` snapshot for the tree `root`, combining two sources
-    /// so colouring works no matter how the tree is rooted:
+    /// so every path is coloured by its *nearest* repository, no matter how the
+    /// tree is rooted:
     ///
     /// * If `root` is inside a git work tree (its `.git` is at or above it), that
-    ///   repository's status colours its visible subtree.
-    /// * Unless `root` is *itself* a repository top, the tree is also scanned
-    ///   downward and every directory holding its own `.git` is coloured from its
-    ///   own status. This is the common case the tree pane is rooted at a parent
-    ///   folder (e.g. `~/Projects`) holding many independent checkouts — and it
-    ///   still works when that parent happens to live inside an unrelated repo.
+    ///   repository's status colours every visible path that does not belong to
+    ///   a nearer (nested) repo.
+    /// * The tree is *always* scanned downward and every directory holding its
+    ///   own `.git` is coloured from its own status — even when `root` is itself
+    ///   a repository top. A nested checkout or submodule therefore shows its own
+    ///   per-file status instead of the single collapsed entry the outer repo
+    ///   reports for it. This covers both the parent-of-checkouts case (the tree
+    ///   rooted at e.g. `~/Projects`) and a repo that embeds other repos.
+    ///
+    /// Nearest-repo precedence: a path inside a nested repo is owned by that
+    /// nested repo, so the containing repo cedes it (see [`merge_containing_repo`]).
     ///
     /// Best-effort throughout: a missing `git`, a non-repo, or unreadable output
     /// just contributes nothing, so the tree renders without colour rather than
     /// failing. Only paths under `root` are ever recorded.
+    ///
+    /// [`merge_containing_repo`]: GitStatuses::merge_containing_repo
     pub fn load(root: &Path) -> Self {
         let mut statuses = Self::empty();
+        // Repositories nested under `root`, found first so the containing repo
+        // can cede ownership of their subtrees (nearest repo wins). The scan
+        // prunes at each repo boundary, so this finds every *first-level* repo
+        // under `root` — independent checkouts and submodules alike.
+        let nested = find_nested_repos(root);
         // The repository containing `root` (could be `root` itself or an ancestor).
         if let Some(toplevel) = repo_toplevel(root) {
-            statuses.merge_containing_repo(root, &toplevel);
+            statuses.merge_containing_repo(root, &toplevel, &nested);
         }
-        // Repositories nested under `root`. Skip this when `root` is itself a
-        // repo top: its whole subtree is one repo (already handled above), so
-        // there is no point walking it hunting for submodules.
-        if !root.join(".git").exists() {
-            for repo in find_nested_repos(root) {
-                statuses.merge_nested_repo(root, &repo);
-            }
+        for repo in &nested {
+            statuses.merge_nested_repo(root, repo);
         }
         statuses
     }
 
     /// Merge the status of the repository whose work tree contains `root`. Its
     /// `toplevel` may sit at or above `root`, so paths are re-anchored onto the
-    /// original `root` and any change outside it is dropped.
-    fn merge_containing_repo(&mut self, root: &Path, toplevel: &Path) {
+    /// original `root` and any change outside it is dropped. Paths that fall
+    /// inside one of the `nested` repos are skipped: a nearer repo owns them and
+    /// will colour them from its own status.
+    fn merge_containing_repo(&mut self, root: &Path, toplevel: &Path, nested: &[PathBuf]) {
         let Some(output) = porcelain(root) else {
             return;
         };
@@ -138,7 +148,15 @@ impl GitStatuses {
             let Ok(under_root) = rel.strip_prefix(&prefix) else {
                 continue;
             };
-            self.record(root.join(under_root), status, root);
+            let abs = root.join(under_root);
+            // Cede any path inside a nested repo to that nearer repo. The outer
+            // repo only ever reports such a path as one collapsed entry (an
+            // untracked/modified directory) anyway; the nested repo will colour
+            // it — and its contents — from its own status.
+            if nested.iter().any(|repo| abs.starts_with(repo)) {
+                continue;
+            }
+            self.record(abs, status, root);
         }
     }
 
@@ -525,6 +543,41 @@ mod tests {
         // The non-repo root and its plain file are untouched.
         assert_eq!(st.get(root), None);
         assert_eq!(st.get(&root.join("plain.txt")), None);
+    }
+
+    #[test]
+    fn load_colours_a_nested_repo_inside_a_repo_root() {
+        // The tree root is ITSELF a git repo, and a sub-directory is its own
+        // independent checkout. The root repo sees that sub-directory only as a
+        // single untracked entry, but the nested repo must still colour its own
+        // files — and the sub-directory itself — from its own status (the nearest
+        // repo wins), not from the root repo's collapsed "untracked" view.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+
+        // The root repo's own untracked file: coloured by the root repo.
+        fs::write(root.join("loose.txt"), "u").unwrap();
+
+        // A nested independent repo with a STAGED (green) file. The root repo
+        // would report `sub/` as untracked (red); the nested repo reports it as
+        // staged (green). Nearest-repo precedence must surface green.
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        init_repo(&sub);
+        fs::write(sub.join("new.rs"), "n").unwrap();
+        git(&sub, &["add", "new.rs"]);
+
+        let st = GitStatuses::load(root);
+
+        // Root repo still colours its own paths.
+        assert_eq!(st.get(&root.join("loose.txt")), Some(GitStatus::Untracked));
+
+        // The nested repo colours its file and rolls up to its own directory.
+        assert_eq!(st.get(&sub.join("new.rs")), Some(GitStatus::Staged));
+        // `sub` is GREEN (the nested repo's status), not RED — the root repo's
+        // "untracked directory" classification was ceded to the nearer repo.
+        assert_eq!(st.get(&sub), Some(GitStatus::Staged));
     }
 
     #[test]
