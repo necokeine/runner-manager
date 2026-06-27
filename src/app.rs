@@ -132,7 +132,11 @@ impl<R: CommandRunner> App<R> {
     pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
         let config = Config::new(root.clone());
-        let git = GitStatuses::load(&root);
+        // Git colouring starts empty and is filled in by the first background
+        // scan the run loop kicks off (see `apply_git`). Loading it here would
+        // block startup behind a full `git status` of the whole tree — seconds
+        // on a parent-of-many-repos root — before the first frame can paint.
+        let git = GitStatuses::empty();
         // Restore the saved tree-pane width, clamped into the legal range in
         // case the file was hand-edited; fall back to the default otherwise.
         let split_pct = config
@@ -562,12 +566,21 @@ impl<R: CommandRunner> App<R> {
         if let Some(slug) = self.tmux.client_session()? {
             self.current_session = Some(slug);
         }
-        // Refresh git colouring: sessions edit files in the tree, so the status
-        // can change between frames. Cheap on a clean tree; bounded by the repo
-        // size on a dirty one.
-        self.git = GitStatuses::load(&self.root);
+        // Git colouring is refreshed separately, off the UI thread (see
+        // `apply_git`): a full `git status` scan can take seconds on a large
+        // tree, so doing it here would stall the per-second sync and freeze
+        // input. `sync` only reconciles sessions.
         self.rebuild_rows();
         Ok(())
+    }
+
+    /// Install a git-status snapshot computed off the UI thread and rebuild the
+    /// derived rows so the new colours show. The run loop calls this when a
+    /// background `GitStatuses::load` finishes; the scan never runs inline
+    /// because it can take seconds on a parent-of-many-repos tree.
+    pub fn apply_git(&mut self, git: GitStatuses) {
+        self.git = git;
+        self.rebuild_rows();
     }
 
     /// Title for the terminal pane: the literal "terminal" plus the directory
@@ -649,6 +662,35 @@ mod tests {
         let tmux = Tmux::new("runner", MockRunner::new());
         let app = App::new(dir.path().to_path_buf(), tmux);
         (dir, app)
+    }
+
+    #[test]
+    fn startup_does_not_scan_git_and_apply_git_colours_rows() {
+        use crate::git::GitStatus;
+        use std::process::Command;
+        // A real repo with an untracked file: a `git status` scan WOULD colour
+        // it. We assert `App::new` does NOT — the scan is deferred to a
+        // background thread (run loop) so startup never blocks on `git status`.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let git_cmd = |args: &[&str]| {
+            Command::new("git").arg("-C").arg(root).args(args).output().map(|o| o.status.success())
+        };
+        if !matches!(git_cmd(&["init", "-q"]), Ok(true)) {
+            return; // git unavailable in this environment — nothing to assert.
+        }
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src").join("loose.rs"), "x").unwrap();
+
+        let mut app = App::new(root.to_path_buf(), Tmux::new("runner", MockRunner::new()));
+        // Startup left git colouring empty even though the worktree is dirty.
+        assert_eq!(app.git.get(&root.join("src")), None);
+
+        // A background scan's result is installed via `apply_git`, which colours
+        // the matching rows.
+        let src = root.join("src");
+        app.apply_git(GitStatuses::from_entries([(src.clone(), GitStatus::Untracked)]));
+        assert_eq!(app.git.get(&src), Some(GitStatus::Untracked));
     }
 
     #[test]
