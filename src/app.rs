@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::claude::{self, ResumeSession};
+use crate::claude;
+use crate::codex;
 use crate::config::Config;
 use crate::git::GitStatuses;
+use crate::resume::ResumeSession;
 use crate::rows::{build_project_rows, build_rows, Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
@@ -58,9 +60,9 @@ pub enum ChooserRow {
     KindCodex,
     PermNormal,
     PermSkip,
-    /// Start a fresh claude session (the default when resumes are offered).
+    /// Start a fresh agent session (the default when resumes are offered).
     ResumeNew,
-    /// Resume the i-th discovered session in `App::chooser_resumes`.
+    /// Resume the i-th discovered session for the selected agent.
     Resume(usize),
     Cancel,
     Create,
@@ -74,8 +76,8 @@ pub enum Popup {
         dir: PathBuf,
         kind: SessionKind,
         perm: ClaudePerm,
-        /// Which existing Claude session to resume: `None` = start fresh,
-        /// `Some(i)` = resume `App::chooser_resumes[i]`.
+        /// Which existing agent session to resume: `None` = start fresh,
+        /// `Some(i)` = resume the selected agent's i-th discovered session.
         resume: Option<usize>,
         focus: usize,
     },
@@ -113,6 +115,10 @@ pub struct App<R: CommandRunner> {
     /// Resumable Claude sessions for the directory the chooser is open on,
     /// discovered when the chooser opens. Indexed by `ChooserRow::Resume`.
     pub chooser_resumes: Vec<ResumeSession>,
+    /// Resumable Codex sessions for the directory the chooser is open on.
+    pub chooser_codex_resumes: Vec<ResumeSession>,
+    /// Resumable Codex sessions under the project root, shown in project view.
+    pub codex_project_resumes: Vec<codex::ProjectSession>,
     pub status: String,
     pub split_pct: u16,
     /// Index of the first tree row shown (scroll position). Reconciled against
@@ -159,6 +165,8 @@ impl<R: CommandRunner> App<R> {
             focus: Focus::Tree,
             popup: Popup::None,
             chooser_resumes: Vec::new(),
+            chooser_codex_resumes: Vec::new(),
+            codex_project_resumes: Vec::new(),
             status: String::new(),
             split_pct,
             tree_offset: 0,
@@ -186,11 +194,22 @@ impl<R: CommandRunner> App<R> {
     pub fn rebuild_rows(&mut self) {
         self.rows = match self.tab {
             TreeTab::Directory => build_rows(&self.tree.root, &self.store.by_dir()),
-            TreeTab::Project => build_project_rows(&self.store.by_dir(), &self.root, &self.briefs),
+            TreeTab::Project => build_project_rows(
+                &self.store.by_dir(),
+                &self.root,
+                &self.briefs,
+                &self.codex_project_resumes,
+            ),
         };
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
         }
+    }
+
+    fn refresh_project_codex_resumes(&mut self) {
+        self.codex_project_resumes = codex::sessions_base()
+            .map(|base| codex::list_sessions_under(&base, &self.root))
+            .unwrap_or_default();
     }
 
     /// Switch the left pane to `tab`, resetting the selection and scroll since
@@ -198,6 +217,9 @@ impl<R: CommandRunner> App<R> {
     pub fn set_tab(&mut self, tab: TreeTab) {
         if self.tab != tab {
             self.tab = tab;
+            if self.tab == TreeTab::Project {
+                self.refresh_project_codex_resumes();
+            }
             self.selected = 0;
             self.tree_offset = 0;
             self.rebuild_rows();
@@ -245,6 +267,10 @@ impl<R: CommandRunner> App<R> {
             RowKind::Session { slug, .. } => {
                 self.switch_to(&slug)?;
             }
+            RowKind::CodexResume { id } => {
+                let cmd = Self::chooser_command(SessionKind::Codex, ClaudePerm::Normal, Some(&id));
+                self.create_session(&row.path, SessionKind::Codex, cmd.as_deref())?;
+            }
             RowKind::File => {
                 self.open_file(&row.path);
             }
@@ -252,15 +278,18 @@ impl<R: CommandRunner> App<R> {
         Ok(())
     }
 
-    /// Open the shell/claude chooser for the selected directory row.
+    /// Open the shell/claude/codex chooser for the selected directory row.
     pub fn open_chooser(&mut self) {
         if let Some(row) = self.selected_row() {
             if matches!(row.kind, RowKind::Dir { .. }) {
                 let dir = row.path.clone();
-                // Discover any resumable Claude sessions for this directory now,
-                // so the chooser can offer them once the user picks "claude".
+                // Discover resumable sessions for this directory now, so the
+                // chooser can offer them once the user picks an agent.
                 self.chooser_resumes = claude::projects_base()
                     .map(|base| claude::list_sessions(&base, &dir))
+                    .unwrap_or_default();
+                self.chooser_codex_resumes = codex::sessions_base()
+                    .map(|base| codex::list_sessions(&base, &dir))
                     .unwrap_or_default();
                 self.popup = Popup::Chooser {
                     dir,
@@ -275,14 +304,21 @@ impl<R: CommandRunner> App<R> {
 
     /// Visible focusable rows for the current chooser kind.
     pub fn chooser_rows(&self) -> Vec<ChooserRow> {
-        let mut rows = vec![ChooserRow::KindShell, ChooserRow::KindClaude, ChooserRow::KindCodex];
-        if let Popup::Chooser { kind: SessionKind::Claude, .. } = self.popup {
-            rows.push(ChooserRow::PermNormal);
-            rows.push(ChooserRow::PermSkip);
+        let mut rows = vec![
+            ChooserRow::KindShell,
+            ChooserRow::KindClaude,
+            ChooserRow::KindCodex,
+        ];
+        if let Popup::Chooser { kind, .. } = &self.popup {
+            if *kind == SessionKind::Claude {
+                rows.push(ChooserRow::PermNormal);
+                rows.push(ChooserRow::PermSkip);
+            }
+            let resumes = self.chooser_resumes_for(*kind);
             // Offer the resume picker only when there is history to resume.
-            if !self.chooser_resumes.is_empty() {
+            if !resumes.is_empty() {
                 rows.push(ChooserRow::ResumeNew);
-                for i in 0..self.chooser_resumes.len() {
+                for i in 0..resumes.len() {
                     rows.push(ChooserRow::Resume(i));
                 }
             }
@@ -334,11 +370,23 @@ impl<R: CommandRunner> App<R> {
     /// Apply the radio-follows-focus rule for the given row.
     fn chooser_apply_focus(&mut self, row: ChooserRow) {
         // Apply radio selection first (this may change `kind`, which changes the row set).
-        if let Popup::Chooser { kind, perm, resume, .. } = &mut self.popup {
+        if let Popup::Chooser {
+            kind, perm, resume, ..
+        } = &mut self.popup
+        {
             match row {
-                ChooserRow::KindShell => *kind = SessionKind::Shell,
-                ChooserRow::KindClaude => *kind = SessionKind::Claude,
-                ChooserRow::KindCodex => *kind = SessionKind::Codex,
+                ChooserRow::KindShell => {
+                    *kind = SessionKind::Shell;
+                    *resume = None;
+                }
+                ChooserRow::KindClaude => {
+                    *kind = SessionKind::Claude;
+                    *resume = None;
+                }
+                ChooserRow::KindCodex => {
+                    *kind = SessionKind::Codex;
+                    *resume = None;
+                }
                 ChooserRow::PermNormal => *perm = ClaudePerm::Normal,
                 ChooserRow::PermSkip => *perm = ClaudePerm::Skip,
                 ChooserRow::ResumeNew => *resume = None,
@@ -388,11 +436,18 @@ impl<R: CommandRunner> App<R> {
     /// popup, and start the session. Shared by `chooser_activate` (Create button)
     /// and `chooser_commit` (Enter).
     fn create_from_form(&mut self) -> io::Result<()> {
-        let Popup::Chooser { dir, kind, perm, resume, .. } = self.popup.clone() else {
+        let Popup::Chooser {
+            dir,
+            kind,
+            perm,
+            resume,
+            ..
+        } = self.popup.clone()
+        else {
             return Ok(());
         };
         let resume_id = resume
-            .and_then(|i| self.chooser_resumes.get(i))
+            .and_then(|i| self.chooser_resumes_for(kind).get(i))
             .map(|s| s.id.as_str());
         let cmd = Self::chooser_command(kind, perm, resume_id);
         self.popup = Popup::None;
@@ -406,7 +461,7 @@ impl<R: CommandRunner> App<R> {
     /// Build the launch command for a session. Shell sessions run the default
     /// shell (`None`). Claude sessions run `claude`, optionally resuming an
     /// existing session (`--resume <id>`) and/or skipping permission prompts.
-    /// Codex sessions run `codex`.
+    /// Codex sessions run `codex`, optionally resuming an existing session.
     pub fn chooser_command(
         kind: SessionKind,
         perm: ClaudePerm,
@@ -414,7 +469,10 @@ impl<R: CommandRunner> App<R> {
     ) -> Option<String> {
         match kind {
             SessionKind::Shell => None,
-            SessionKind::Codex => Some(String::from("codex")),
+            SessionKind::Codex => match resume_id {
+                Some(id) => Some(format!("codex resume {id}")),
+                None => Some(String::from("codex")),
+            },
             SessionKind::Claude => {
                 let mut cmd = String::from("claude");
                 if let Some(id) = resume_id {
@@ -429,7 +487,20 @@ impl<R: CommandRunner> App<R> {
         }
     }
 
-    fn create_session(&mut self, dir: &Path, kind: SessionKind, command: Option<&str>) -> io::Result<()> {
+    pub fn chooser_resumes_for(&self, kind: SessionKind) -> &[ResumeSession] {
+        match kind {
+            SessionKind::Claude => &self.chooser_resumes,
+            SessionKind::Codex => &self.chooser_codex_resumes,
+            SessionKind::Shell => &[],
+        }
+    }
+
+    fn create_session(
+        &mut self,
+        dir: &Path,
+        kind: SessionKind,
+        command: Option<&str>,
+    ) -> io::Result<()> {
         let slug = self.store.create(dir, &self.root, kind);
         self.tmux.new_session(&slug, dir, command)?;
         // Tag the session so a later run can re-adopt it into the tree.
@@ -546,7 +617,13 @@ impl<R: CommandRunner> App<R> {
         let adoptable: Vec<(String, PathBuf, SessionKind)> = infos
             .iter()
             .filter(|i| !i.dir.is_empty())
-            .map(|i| (i.name.clone(), PathBuf::from(&i.dir), SessionKind::from_tag(&i.kind)))
+            .map(|i| {
+                (
+                    i.name.clone(),
+                    PathBuf::from(&i.dir),
+                    SessionKind::from_tag(&i.kind),
+                )
+            })
             .collect();
         self.store.adopt(&adoptable);
         // Refresh the per-session briefs shown in the project view from the
@@ -593,7 +670,12 @@ impl<R: CommandRunner> App<R> {
             .current_session
             .as_deref()
             .and_then(|slug| self.store.dir_of(slug))
-            .map(|dir| dir.strip_prefix(&self.root).unwrap_or(dir).to_string_lossy().into_owned());
+            .map(|dir| {
+                dir.strip_prefix(&self.root)
+                    .unwrap_or(dir)
+                    .to_string_lossy()
+                    .into_owned()
+            });
         match rel {
             Some(rel) if !rel.is_empty() && rel != "." => format!("terminal — {rel}"),
             _ => "terminal".to_string(),
@@ -653,6 +735,7 @@ mod tests {
     use super::*;
     use crate::tmux::{MockRunner, Tmux};
     use std::fs;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     fn app_over_tempdir() -> (tempfile::TempDir, App<MockRunner>) {
@@ -674,7 +757,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let git_cmd = |args: &[&str]| {
-            Command::new("git").arg("-C").arg(root).args(args).output().map(|o| o.status.success())
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
         };
         if !matches!(git_cmd(&["init", "-q"]), Ok(true)) {
             return; // git unavailable in this environment — nothing to assert.
@@ -689,7 +777,10 @@ mod tests {
         // A background scan's result is installed via `apply_git`, which colours
         // the matching rows.
         let src = root.join("src");
-        app.apply_git(GitStatuses::from_entries([(src.clone(), GitStatus::Untracked)]));
+        app.apply_git(GitStatuses::from_entries([(
+            src.clone(),
+            GitStatus::Untracked,
+        )]));
         assert_eq!(app.git.get(&src), Some(GitStatus::Untracked));
     }
 
@@ -748,14 +839,18 @@ mod tests {
         app.open_chooser();
         assert!(matches!(
             app.popup,
-            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
+            Popup::Chooser {
+                focus: 0,
+                kind: SessionKind::Shell,
+                ..
+            }
         ));
         // shell: new-session, tag (set-option), list-clients, switch-client
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
-        // focus starts on the tree before the session is created
+                                        // focus starts on the tree before the session is created
         assert_eq!(app.focus, Focus::Tree);
         focus_create(&mut app);
         app.chooser_activate().unwrap();
@@ -865,7 +960,11 @@ mod tests {
         app.chooser_cycle(1);
         assert!(matches!(
             app.popup,
-            Popup::Chooser { focus: 0, kind: SessionKind::Shell, .. }
+            Popup::Chooser {
+                focus: 0,
+                kind: SessionKind::Shell,
+                ..
+            }
         ));
     }
 
@@ -979,11 +1078,17 @@ mod tests {
         app.tmux.runner.push(true, ""); // switch-client
         focus_create(&mut app);
         app.chooser_activate().unwrap();
-        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
         // sync with an empty live set -> the session is gone
         app.tmux.runner.push(true, ""); // list-sessions returns nothing
         app.sync().unwrap();
-        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(!app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
     }
 
     #[test]
@@ -993,8 +1098,13 @@ mod tests {
         // an untagged hand-made session must stay out of the tree.
         let (_d, mut app) = app_over_tempdir();
         let root = app.root.to_str().unwrap().to_string();
-        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
-        app.tmux.runner.push(true, &format!("root-shell\tshell {root}\nscratch\t\n"));
+        assert!(!app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
+        app.tmux
+            .runner
+            .push(true, &format!("root-shell\tshell {root}\nscratch\t\n"));
         app.sync().unwrap();
         let sessions: Vec<&Row> = app
             .rows
@@ -1002,7 +1112,13 @@ mod tests {
             .filter(|r| matches!(r.kind, RowKind::Session { .. }))
             .collect();
         assert_eq!(sessions.len(), 1);
-        assert!(matches!(sessions[0].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
+        assert!(matches!(
+            sessions[0].kind,
+            RowKind::Session {
+                kind: SessionKind::Shell,
+                ..
+            }
+        ));
         assert!(!app.rows.iter().any(|r| r.label == "scratch"));
     }
 
@@ -1090,7 +1206,10 @@ mod tests {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
         // Inject discovered sessions (open_chooser found none for the tempdir).
-        app.chooser_resumes = vec![fake_resume("aaa", "do a thing"), fake_resume("bbb", "do another")];
+        app.chooser_resumes = vec![
+            fake_resume("aaa", "do a thing"),
+            fake_resume("bbb", "do another"),
+        ];
         app.chooser_move(1); // focus -> claude
         assert_eq!(
             app.chooser_rows(),
@@ -1147,28 +1266,48 @@ mod tests {
 
     #[test]
     fn chooser_command_maps_kind_and_perm() {
-        assert_eq!(App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal, None), None);
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, None).as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal, None),
+            None
+        );
+        assert_eq!(
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, None)
+                .as_deref(),
             Some("claude")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, None).as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, None)
+                .as_deref(),
             Some("claude --dangerously-skip-permissions")
         );
         // Resuming an existing session injects --resume <id>, before the perm flag.
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, Some("abc-123")).as_deref(),
+            App::<MockRunner>::chooser_command(
+                SessionKind::Claude,
+                ClaudePerm::Normal,
+                Some("abc-123")
+            )
+            .as_deref(),
             Some("claude --resume abc-123")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, Some("abc-123")).as_deref(),
+            App::<MockRunner>::chooser_command(
+                SessionKind::Claude,
+                ClaudePerm::Skip,
+                Some("abc-123")
+            )
+            .as_deref(),
             Some("claude --resume abc-123 --dangerously-skip-permissions")
         );
-        // Codex ignores the claude-only perm/resume inputs and just runs `codex`.
+        // Codex ignores the claude-only perm flag but resumes with `codex resume`.
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Codex, ClaudePerm::Skip, Some("abc-123")).as_deref(),
-            Some("codex")
+            App::<MockRunner>::chooser_command(
+                SessionKind::Codex,
+                ClaudePerm::Skip,
+                Some("abc-123")
+            )
+            .as_deref(),
+            Some("codex resume abc-123")
         );
     }
 
@@ -1182,7 +1321,7 @@ mod tests {
         } else {
             panic!("expected chooser");
         }
-        // Codex offers no permission/resume rows (those are claude-only).
+        // Codex offers no permission rows, and no resume rows if no history exists.
         assert_eq!(
             app.chooser_rows(),
             vec![
@@ -1191,6 +1330,26 @@ mod tests {
                 ChooserRow::KindCodex,
                 ChooserRow::Cancel,
                 ChooserRow::Create
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_chooser_lists_resume_rows_when_history_exists() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_codex_resumes = vec![fake_resume("codex-aaa", "resume codex work")];
+        app.chooser_move(2); // focus -> codex
+        assert_eq!(
+            app.chooser_rows(),
+            vec![
+                ChooserRow::KindShell,
+                ChooserRow::KindClaude,
+                ChooserRow::KindCodex,
+                ChooserRow::ResumeNew,
+                ChooserRow::Resume(0),
+                ChooserRow::Cancel,
+                ChooserRow::Create,
             ]
         );
     }
@@ -1216,13 +1375,36 @@ mod tests {
     }
 
     #[test]
+    fn chooser_create_codex_resume_uses_resume_command() {
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        app.chooser_codex_resumes = vec![fake_resume("codex-xyz", "resume codex")];
+        app.chooser_click(ChooserRow::KindCodex).unwrap();
+        app.chooser_click(ChooserRow::Resume(0)).unwrap();
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_click(ChooserRow::Create).unwrap();
+        assert!(app
+            .tmux
+            .runner
+            .nth_call(0)
+            .contains(&"codex resume codex-xyz".to_string()));
+    }
+
+    #[test]
     fn chooser_activate_create_starts_claude_skip() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
         app.chooser_move(1); // claude
         app.chooser_move(3); // skip (past codex + normal)
-        // move focus to Create
-        let create_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Create).unwrap();
+                             // move focus to Create
+        let create_idx = app
+            .chooser_rows()
+            .iter()
+            .position(|r| *r == ChooserRow::Create)
+            .unwrap();
         if let Popup::Chooser { focus, .. } = &mut app.popup {
             *focus = create_idx;
         }
@@ -1331,7 +1513,10 @@ mod tests {
         assert_eq!(kill[2], "kill-session");
         assert_eq!(kill[4], "src-shell");
         // and the session row is gone immediately
-        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(!app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
     }
 
     #[test]
@@ -1355,7 +1540,10 @@ mod tests {
         app.request_close(sess_idx);
         assert!(matches!(app.popup, Popup::ConfirmClose { ref slug } if slug == "src-shell"));
         assert_eq!(app.tmux.runner.call_count(), calls_before);
-        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
 
         // Confirming dismisses the popup and kills the session.
         app.tmux.runner.push(true, ""); // kill-session
@@ -1364,7 +1552,10 @@ mod tests {
         assert_eq!(kill[2], "kill-session");
         assert_eq!(kill[4], "src-shell");
         assert!(matches!(app.popup, Popup::None));
-        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(!app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
     }
 
     #[test]
@@ -1389,7 +1580,10 @@ mod tests {
         // Popup gone, session untouched, no tmux call issued.
         assert!(matches!(app.popup, Popup::None));
         assert_eq!(app.tmux.runner.call_count(), calls_before);
-        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
     }
 
     #[test]
@@ -1453,7 +1647,9 @@ mod tests {
         let root = app.root.to_str().unwrap().to_string();
         // list-sessions-full adopts a session under src/, then client_session
         // reports the client is attached to it.
-        app.tmux.runner.push(true, &format!("src-shell\tshell {root}/src\n"));
+        app.tmux
+            .runner
+            .push(true, &format!("src-shell\tshell {root}/src\n"));
         app.tmux.runner.push(true, "src-shell\n"); // list-clients (client_session)
         app.sync().unwrap();
         assert_eq!(app.current_session.as_deref(), Some("src-shell"));
@@ -1479,16 +1675,26 @@ mod tests {
         assert_eq!(app.tab, TreeTab::Directory);
         app.toggle_tab();
         assert_eq!(app.tab, TreeTab::Project);
-        // The project view is a flat list of sessions, no directory rows.
-        assert!(app.rows.iter().all(|r| matches!(r.kind, RowKind::Session { .. })));
-        let row = app.rows.iter().find(|r| matches!(&r.kind, RowKind::Session { slug, .. } if slug == "src-shell")).unwrap();
+        // The project view is a flat list of sessions/history, no directory rows.
+        assert!(app
+            .rows
+            .iter()
+            .all(|r| !matches!(r.kind, RowKind::Dir { .. })));
+        let row = app
+            .rows
+            .iter()
+            .find(|r| matches!(&r.kind, RowKind::Session { slug, .. } if slug == "src-shell"))
+            .unwrap();
         assert_eq!(row.label, "shell  src  — zsh");
         // Selection resets to the top when switching tabs.
         assert_eq!(app.selected, 0);
         // Switching back restores the directory tree (root dir row present).
         app.toggle_tab();
         assert_eq!(app.tab, TreeTab::Directory);
-        assert!(app.rows.iter().any(|r| matches!(r.kind, RowKind::Dir { .. })));
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Dir { .. })));
     }
 
     #[test]
@@ -1511,7 +1717,47 @@ mod tests {
             .unwrap();
         app.tmux.runner.push(true, ""); // kill-session
         app.close_session(sess_idx).unwrap();
-        assert!(!app.rows.iter().any(|r| matches!(r.kind, RowKind::Session { .. })));
+        assert!(!app
+            .rows
+            .iter()
+            .any(|r| matches!(r.kind, RowKind::Session { .. })));
+    }
+
+    #[test]
+    fn project_view_codex_resume_row_starts_resume_session() {
+        let (_d, mut app) = app_over_tempdir();
+        let src = app.root.join("src");
+        app.tab = TreeTab::Project;
+        app.codex_project_resumes = vec![codex::ProjectSession {
+            dir: src,
+            session: ResumeSession {
+                id: "codex-xyz".into(),
+                last_command: "resume codex".into(),
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        }];
+        app.rebuild_rows();
+        let idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::CodexResume { .. }))
+            .unwrap();
+        app.selected = idx;
+
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.activate().unwrap();
+
+        assert!(app
+            .tmux
+            .runner
+            .nth_call(0)
+            .contains(&"codex resume codex-xyz".to_string()));
+        let tag = app.tmux.runner.nth_call(1);
+        assert!(tag.iter().any(|a| a.starts_with("codex ")));
+        assert_eq!(app.focus, Focus::Right);
     }
 
     #[test]
@@ -1519,7 +1765,9 @@ mod tests {
         let (_d, mut app) = app_over_tempdir();
         let root = app.root.to_str().unwrap().to_string();
         // list-sessions-full: a tagged session whose active pane runs `vim`.
-        app.tmux.runner.push(true, &format!("src-shell\tshell {root}/src\tvim\n"));
+        app.tmux
+            .runner
+            .push(true, &format!("src-shell\tshell {root}/src\tvim\n"));
         app.tmux.runner.push(true, "src-shell\n"); // client_session
         app.sync().unwrap();
         assert_eq!(app.briefs.get("src-shell").map(String::as_str), Some("vim"));
@@ -1529,7 +1777,11 @@ mod tests {
     fn chooser_activate_cancel_closes_without_tmux() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        let cancel_idx = app.chooser_rows().iter().position(|r| *r == ChooserRow::Cancel).unwrap();
+        let cancel_idx = app
+            .chooser_rows()
+            .iter()
+            .position(|r| *r == ChooserRow::Cancel)
+            .unwrap();
         if let Popup::Chooser { focus, .. } = &mut app.popup {
             *focus = cancel_idx;
         }

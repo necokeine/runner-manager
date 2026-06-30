@@ -12,18 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// One resumable Claude session discovered on disk for a directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumeSession {
-    /// Session id — the JSONL filename without its extension. This is the value
-    /// passed to `claude --resume <id>`.
-    pub id: String,
-    /// The last human prompt in the transcript, collapsed to a single line.
-    /// Empty when the transcript has no plain user message yet.
-    pub last_command: String,
-    /// Transcript file mtime; sessions are listed most-recently-modified first.
-    pub modified: SystemTime,
-}
+use crate::resume::ResumeSession;
 
 /// Longest `last_command` we retain; the UI truncates further to fit the popup.
 const MAX_COMMAND_LEN: usize = 200;

@@ -10,8 +10,8 @@ use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, ChooserRow, Focus, TreeTab};
-use crate::claude::ResumeSession;
 use crate::git::{GitStatus, GitStatuses};
+use crate::resume::ResumeSession;
 use crate::rows::{Row, RowKind};
 use crate::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
@@ -99,13 +99,19 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> O
                     return Some(Hit::Close(idx));
                 }
             }
-            RowKind::File => {}
+            RowKind::CodexResume { .. } | RowKind::File => {}
         }
     }
     Some(Hit::Row(idx))
 }
 
-pub fn resolve_pane_click(col: u16, row: u16, split_col: u16, tree_layout: &ListLayout, rows: &[Row]) -> PaneHit {
+pub fn resolve_pane_click(
+    col: u16,
+    row: u16,
+    split_col: u16,
+    tree_layout: &ListLayout,
+    rows: &[Row],
+) -> PaneHit {
     if col >= split_col {
         PaneHit::Right
     } else {
@@ -115,7 +121,9 @@ pub fn resolve_pane_click(col: u16, row: u16, split_col: u16, tree_layout: &List
 
 fn border_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     }
@@ -141,12 +149,26 @@ fn dir_left(row: &Row) -> String {
 fn session_left(row: &Row) -> String {
     let indent = "  ".repeat(row.depth);
     let mark = match &row.kind {
-        RowKind::Session { kind: SessionKind::Shell, .. } => "$ ",
-        RowKind::Session { kind: SessionKind::Claude, .. } => "✦ ",
-        RowKind::Session { kind: SessionKind::Codex, .. } => "⌬ ",
+        RowKind::Session {
+            kind: SessionKind::Shell,
+            ..
+        } => "$ ",
+        RowKind::Session {
+            kind: SessionKind::Claude,
+            ..
+        } => "✦ ",
+        RowKind::Session {
+            kind: SessionKind::Codex,
+            ..
+        } => "⌬ ",
         _ => "",
     };
     format!("{indent}{mark}{}", row.label)
+}
+
+fn codex_resume_left(row: &Row) -> String {
+    let indent = "  ".repeat(row.depth);
+    format!("{indent}⌬ {}", row.label)
 }
 
 /// The git-status colour for a row, or `None` when it should render plain.
@@ -155,7 +177,10 @@ fn session_left(row: &Row) -> String {
 /// policy — staged ("Changes to be committed") green, dirty/untracked red,
 /// ignored grey.
 fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
-    if matches!(row.kind, RowKind::Session { .. }) {
+    if matches!(
+        row.kind,
+        RowKind::Session { .. } | RowKind::CodexResume { .. }
+    ) {
         return None;
     }
     let color = match git.get(&row.path)? {
@@ -173,6 +198,7 @@ fn row_line(row: &Row) -> String {
         RowKind::Dir { .. } => format!("{} [+]", dir_left(row)),
         // A close button sits right after the session name, mirroring `[+]`.
         RowKind::Session { .. } => format!("{} [×]", session_left(row)),
+        RowKind::CodexResume { .. } => codex_resume_left(row),
         RowKind::File => format!("{indent}  {}", row.label),
     }
 }
@@ -224,7 +250,9 @@ fn render_banner(f: &mut Frame, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let name_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let name_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let hint_style = Style::default().fg(Color::DarkGray);
 
     let big = big_name(APP_NAME);
@@ -249,7 +277,10 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
     let mut spans: Vec<Span> = Vec::new();
     let mut hits: Vec<(u16, u16, TreeTab)> = Vec::new();
     let mut x = area.x;
-    for (i, tab) in [TreeTab::Directory, TreeTab::Project].into_iter().enumerate() {
+    for (i, tab) in [TreeTab::Directory, TreeTab::Project]
+        .into_iter()
+        .enumerate()
+    {
         if i > 0 {
             spans.push(Span::raw(" "));
             x += 1;
@@ -257,7 +288,9 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
         let text = format!(" {} ", tab.label());
         let w = text.chars().count() as u16;
         let style = if tab == active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -332,7 +365,7 @@ pub fn render<R: CommandRunner>(
 
     // Project view with nothing open: a hint reads better than a blank pane.
     if app.tab == TreeTab::Project && total == 0 {
-        let hint = Paragraph::new("no open sessions")
+        let hint = Paragraph::new("no open sessions or codex history")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(hint, inner);
@@ -353,7 +386,10 @@ pub fn render<R: CommandRunner>(
             .end_symbol(None);
         f.render_stateful_widget(
             scrollbar,
-            tree_area.inner(Margin { vertical: 1, horizontal: 0 }),
+            tree_area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
             &mut sb_state,
         );
     }
@@ -382,7 +418,9 @@ pub fn render<R: CommandRunner>(
             .borders(Borders::ALL)
             .border_style(border_style(right_focused));
         let body = view.lines.join("\n");
-        let para = Paragraph::new(body).block(block).scroll((view.scroll as u16, 0));
+        let para = Paragraph::new(body)
+            .block(block)
+            .scroll((view.scroll as u16, 0));
         f.render_widget(para, right_area);
     } else {
         let block = Block::default()
@@ -396,9 +434,11 @@ pub fn render<R: CommandRunner>(
             // No embedded session yet (fresh start, nothing to recover). Show a
             // hint instead of a live terminal until the user starts one.
             None => {
-                let hint = Paragraph::new("no active session\n\nselect a directory and press 'a' to start one")
-                    .alignment(Alignment::Center)
-                    .style(Style::default().fg(Color::DarkGray));
+                let hint = Paragraph::new(
+                    "no active session\n\nselect a directory and press 'a' to start one",
+                )
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray));
                 f.render_widget(hint, right_inner);
             }
         }
@@ -438,7 +478,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "k / ↑      move up",
         "Tab        switch directory / project view",
         "Enter      expand dir / switch session / view file",
-        "a / [+]    new session (shell or claude) on a dir",
+        "a / [+]    new session (shell/claude/codex) on a dir",
         "x / [×]    close the selected session (asks to confirm)",
         "wheel      scroll the tree (scrollbar shows when needed)",
         "h / ?      this help",
@@ -483,59 +523,85 @@ pub fn render_chooser(
     // Kind:
     lines.push(Line::from("Kind:".to_string()));
     y += 1;
-    lines.push(Line::from(format!("{}{} shell", arrow(ChooserRow::KindShell), radio(kind == SessionKind::Shell))));
+    lines.push(Line::from(format!(
+        "{}{} shell",
+        arrow(ChooserRow::KindShell),
+        radio(kind == SessionKind::Shell)
+    )));
     row_ys.push((y, ChooserRow::KindShell));
     y += 1;
-    lines.push(Line::from(format!("{}{} claude", arrow(ChooserRow::KindClaude), radio(kind == SessionKind::Claude))));
+    lines.push(Line::from(format!(
+        "{}{} claude",
+        arrow(ChooserRow::KindClaude),
+        radio(kind == SessionKind::Claude)
+    )));
     row_ys.push((y, ChooserRow::KindClaude));
     y += 1;
-    lines.push(Line::from(format!("{}{} codex", arrow(ChooserRow::KindCodex), radio(kind == SessionKind::Codex))));
+    lines.push(Line::from(format!(
+        "{}{} codex",
+        arrow(ChooserRow::KindCodex),
+        radio(kind == SessionKind::Codex)
+    )));
     row_ys.push((y, ChooserRow::KindCodex));
     y += 1;
 
     if kind == SessionKind::Claude {
         lines.push(Line::from("Permission:".to_string()));
         y += 1;
-        lines.push(Line::from(format!("{}{} normal", arrow(ChooserRow::PermNormal), radio(perm == ClaudePerm::Normal))));
+        lines.push(Line::from(format!(
+            "{}{} normal",
+            arrow(ChooserRow::PermNormal),
+            radio(perm == ClaudePerm::Normal)
+        )));
         row_ys.push((y, ChooserRow::PermNormal));
         y += 1;
-        lines.push(Line::from(format!("{}{} skip (--dangerously-skip-permissions)", arrow(ChooserRow::PermSkip), radio(perm == ClaudePerm::Skip))));
+        lines.push(Line::from(format!(
+            "{}{} skip (--dangerously-skip-permissions)",
+            arrow(ChooserRow::PermSkip),
+            radio(perm == ClaudePerm::Skip)
+        )));
         row_ys.push((y, ChooserRow::PermSkip));
         y += 1;
+    }
 
-        // Resume picker: only shown when this directory has Claude history.
-        if !resumes.is_empty() {
-            lines.push(Line::from("Resume:".to_string()));
-            y += 1;
+    // Resume picker: only shown when the selected agent has local history.
+    if kind != SessionKind::Shell && !resumes.is_empty() {
+        lines.push(Line::from("Resume:".to_string()));
+        y += 1;
+        lines.push(Line::from(format!(
+            "{}{} new session",
+            arrow(ChooserRow::ResumeNew),
+            radio(resume_sel.is_none())
+        )));
+        row_ys.push((y, ChooserRow::ResumeNew));
+        y += 1;
+        // Keep the label inside the popup; reserve room for the "> (•) " prefix.
+        let label_width = (inner.width as usize).saturating_sub(7);
+        for (i, s) in resumes.iter().enumerate() {
+            let row = ChooserRow::Resume(i);
             lines.push(Line::from(format!(
-                "{}{} new session",
-                arrow(ChooserRow::ResumeNew),
-                radio(resume_sel.is_none())
+                "{}{} {}",
+                arrow(row),
+                radio(resume_sel == Some(i)),
+                resume_label(s, label_width)
             )));
-            row_ys.push((y, ChooserRow::ResumeNew));
+            row_ys.push((y, row));
             y += 1;
-            // Keep the label inside the popup; reserve room for the "> (•) " prefix.
-            let label_width = (inner.width as usize).saturating_sub(7);
-            for (i, s) in resumes.iter().enumerate() {
-                let row = ChooserRow::Resume(i);
-                lines.push(Line::from(format!(
-                    "{}{} {}",
-                    arrow(row),
-                    radio(resume_sel == Some(i)),
-                    resume_label(s, label_width)
-                )));
-                row_ys.push((y, row));
-                y += 1;
-            }
         }
     }
 
     lines.push(Line::from(String::new()));
     y += 1;
-    lines.push(Line::from(format!("{}[ Cancel ]", arrow(ChooserRow::Cancel))));
+    lines.push(Line::from(format!(
+        "{}[ Cancel ]",
+        arrow(ChooserRow::Cancel)
+    )));
     row_ys.push((y, ChooserRow::Cancel));
     y += 1;
-    lines.push(Line::from(format!("{}[ Create ]", arrow(ChooserRow::Create))));
+    lines.push(Line::from(format!(
+        "{}[ Create ]",
+        arrow(ChooserRow::Create)
+    )));
     row_ys.push((y, ChooserRow::Create));
 
     lines.push(Line::from(String::new()));
@@ -555,7 +621,9 @@ pub fn render_chooser(
 pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, bool)> {
     let popup = centered_rect(50, 30, area);
     f.render_widget(Clear, popup);
-    let block = Block::default().title("Close session").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Close session")
+        .borders(Borders::ALL);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -610,10 +678,20 @@ mod tests {
     use super::*;
 
     fn dir_row(label: &str, depth: usize) -> Row {
-        Row { path: std::path::PathBuf::from("/"), label: label.to_string(), depth, kind: RowKind::Dir { expanded: true } }
+        Row {
+            path: std::path::PathBuf::from("/"),
+            label: label.to_string(),
+            depth,
+            kind: RowKind::Dir { expanded: true },
+        }
     }
     fn file_row(label: &str) -> Row {
-        Row { path: std::path::PathBuf::from("/"), label: label.to_string(), depth: 0, kind: RowKind::File }
+        Row {
+            path: std::path::PathBuf::from("/"),
+            label: label.to_string(),
+            depth: 0,
+            kind: RowKind::File,
+        }
     }
 
     #[test]
@@ -630,7 +708,12 @@ mod tests {
             (ignored.clone(), GitStatus::Ignored),
         ]);
 
-        let path_row = |path: PathBuf, kind: RowKind| Row { path, label: "x".into(), depth: 0, kind };
+        let path_row = |path: PathBuf, kind: RowKind| Row {
+            path,
+            label: "x".into(),
+            depth: 0,
+            kind,
+        };
 
         // Staged path renders green; untracked (dirty) renders red; ignored grey.
         let r = path_row(staged.clone(), RowKind::File);
@@ -638,14 +721,28 @@ mod tests {
         let r = path_row(dirty.clone(), RowKind::Dir { expanded: false });
         assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::Red)));
         let r = path_row(ignored.clone(), RowKind::File);
-        assert_eq!(row_style(&r, &git), Some(Style::default().fg(Color::DarkGray)));
+        assert_eq!(
+            row_style(&r, &git),
+            Some(Style::default().fg(Color::DarkGray))
+        );
 
         // A path git didn't report stays uncoloured.
         let r = path_row(PathBuf::from("/repo/clean.rs"), RowKind::File);
         assert_eq!(row_style(&r, &git), None);
 
         // Sessions are never coloured, even when their path has a status.
-        let r = path_row(staged, RowKind::Session { slug: "s".into(), kind: SessionKind::Shell });
+        let r = path_row(
+            staged,
+            RowKind::Session {
+                slug: "s".into(),
+                kind: SessionKind::Shell,
+            },
+        );
+        assert_eq!(row_style(&r, &git), None);
+        let r = path_row(
+            PathBuf::from("/repo/history"),
+            RowKind::CodexResume { id: "c".into() },
+        );
         assert_eq!(row_style(&r, &git), None);
     }
 
@@ -654,10 +751,33 @@ mod tests {
         let dir = dir_row("src", 0);
         assert_eq!(row_line(&dir), "▾ src [+]");
         // Sessions carry a per-kind mark and a `[×]` close button after the name.
-        let shell = Row { path: std::path::PathBuf::from("/"), label: "shell".into(), depth: 1, kind: RowKind::Session { slug: "s".into(), kind: SessionKind::Shell } };
+        let shell = Row {
+            path: std::path::PathBuf::from("/"),
+            label: "shell".into(),
+            depth: 1,
+            kind: RowKind::Session {
+                slug: "s".into(),
+                kind: SessionKind::Shell,
+            },
+        };
         assert_eq!(row_line(&shell), "  $ shell [×]");
-        let claude = Row { path: std::path::PathBuf::from("/"), label: "claude".into(), depth: 1, kind: RowKind::Session { slug: "c".into(), kind: SessionKind::Claude } };
+        let claude = Row {
+            path: std::path::PathBuf::from("/"),
+            label: "claude".into(),
+            depth: 1,
+            kind: RowKind::Session {
+                slug: "c".into(),
+                kind: SessionKind::Claude,
+            },
+        };
         assert_eq!(row_line(&claude), "  ✦ claude [×]");
+        let codex_resume = Row {
+            path: std::path::PathBuf::from("/"),
+            label: "resume  src  — keep going".into(),
+            depth: 0,
+            kind: RowKind::CodexResume { id: "c".into() },
+        };
+        assert_eq!(row_line(&codex_resume), "⌬ resume  src  — keep going");
         assert_eq!(row_line(&file_row("a.rs")), "  a.rs");
     }
 
@@ -669,10 +789,19 @@ mod tests {
             path: std::path::PathBuf::from("/"),
             label: "shell".into(),
             depth: 1,
-            kind: RowKind::Session { slug: "src-shell".into(), kind: SessionKind::Shell },
+            kind: RowKind::Session {
+                slug: "src-shell".into(),
+                kind: SessionKind::Shell,
+            },
         };
         let rows = vec![file_row("a"), sess];
-        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 2, offset: 0, view_h: 10 };
+        let layout = ListLayout {
+            origin_y: 1,
+            content_x: 0,
+            row_count: 2,
+            offset: 0,
+            view_h: 10,
+        };
         // clicking the name (not the cross) selects the row
         assert_eq!(resolve_click(3, 2, &layout, &rows), Some(Hit::Row(1)));
         // clicking the cross closes the session
@@ -686,7 +815,13 @@ mod tests {
         // content_x=0; row 1 is depth-0 dir "src": left = "▾ src" (5 chars), so
         // "[+]" occupies columns 6,7,8 (left+1 ..= left+3).
         let rows = vec![file_row("a"), dir_row("src", 0), file_row("c")];
-        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 3, offset: 0, view_h: 10 };
+        let layout = ListLayout {
+            origin_y: 1,
+            content_x: 0,
+            row_count: 3,
+            offset: 0,
+            view_h: 10,
+        };
         assert_eq!(resolve_click(2, 1, &layout, &rows), Some(Hit::Row(0)));
         assert_eq!(resolve_click(7, 2, &layout, &rows), Some(Hit::Button(1)));
         // clicking the dir name (not the button) toggles, not opens the chooser
@@ -702,7 +837,13 @@ mod tests {
         // Scrolled down by 5 rows: the top visible screen row maps to row index 5.
         let mut rows: Vec<Row> = (0..30).map(|i| file_row(&format!("f{i}"))).collect();
         rows[5] = dir_row("src", 0); // "▾ src" -> button at cols 6,7,8
-        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 30, offset: 5, view_h: 8 };
+        let layout = ListLayout {
+            origin_y: 1,
+            content_x: 0,
+            row_count: 30,
+            offset: 5,
+            view_h: 8,
+        };
         assert_eq!(resolve_click(2, 1, &layout, &rows), Some(Hit::Row(5)));
         assert_eq!(resolve_click(7, 1, &layout, &rows), Some(Hit::Button(5)));
         // a click past the visible window height is ignored
@@ -712,15 +853,40 @@ mod tests {
     #[test]
     fn resolve_pane_click_splits_on_column() {
         let rows = vec![file_row("a"), file_row("b"), file_row("c")];
-        let layout = ListLayout { origin_y: 1, content_x: 0, row_count: 3, offset: 0, view_h: 10 };
-        assert_eq!(resolve_pane_click(5, 2, 50, &layout, &rows), PaneHit::Tree(Some(Hit::Row(1))));
-        assert_eq!(resolve_pane_click(50, 2, 50, &layout, &rows), PaneHit::Right);
+        let layout = ListLayout {
+            origin_y: 1,
+            content_x: 0,
+            row_count: 3,
+            offset: 0,
+            view_h: 10,
+        };
+        assert_eq!(
+            resolve_pane_click(5, 2, 50, &layout, &rows),
+            PaneHit::Tree(Some(Hit::Row(1)))
+        );
+        assert_eq!(
+            resolve_pane_click(50, 2, 50, &layout, &rows),
+            PaneHit::Right
+        );
     }
 
     #[test]
     fn centered_rect_is_centered() {
-        let area = Rect { x: 0, y: 0, width: 100, height: 100 };
-        assert_eq!(centered_rect(50, 50, area), Rect { x: 25, y: 25, width: 50, height: 50 });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        assert_eq!(
+            centered_rect(50, 50, area),
+            Rect {
+                x: 25,
+                y: 25,
+                width: 50,
+                height: 50
+            }
+        );
     }
 
     #[test]
@@ -747,7 +913,10 @@ mod tests {
         // empty tempdir (not `/`) so App::new's git scan finds nothing instantly.
         let has_thumb = |rows: Vec<Row>| -> bool {
             let dir = tempfile::tempdir().unwrap();
-            let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+            let mut app = App::new(
+                dir.path().to_path_buf(),
+                Tmux::new("runner", MockRunner::new()),
+            );
             app.rows = rows;
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -756,7 +925,13 @@ mod tests {
                     render(f, f.area(), &mut app, None);
                 })
                 .unwrap();
-            let content: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+            let content: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
             content.contains('█')
         };
         // 40 rows in an 8-row viewport -> scrollbar thumb visible.
@@ -788,12 +963,16 @@ mod tests {
         // of the scrollbar thumb cells.
         let thumb_span = |offset: usize, selected: usize| -> (u16, u16) {
             let dir = tempfile::tempdir().unwrap();
-            let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+            let mut app = App::new(
+                dir.path().to_path_buf(),
+                Tmux::new("runner", MockRunner::new()),
+            );
             app.rows = rows.clone();
             app.viewer = Some(FileView::load(Path::new("/nonexistent")));
             app.tree_offset = offset;
             app.selected = selected;
-            let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
+            let mut terminal =
+                Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
             terminal
                 .draw(|f| {
                     render(f, f.area(), &mut app, None);
@@ -819,12 +998,18 @@ mod tests {
         let top = BANNER_HEIGHT + TAB_HEIGHT + 1;
         let bottom = BANNER_HEIGHT + TAB_HEIGHT + 8;
         let (top_min, _) = thumb_span(0, 0);
-        assert_eq!(top_min, top, "at the top the thumb should touch the first track cell");
+        assert_eq!(
+            top_min, top,
+            "at the top the thumb should touch the first track cell"
+        );
 
         // Scrolled to the bottom (max_off = 40 - 8 = 32), the thumb must reach
         // the last track cell.
         let (_, bot_max) = thumb_span(32, 39);
-        assert_eq!(bot_max, bottom, "at the bottom the thumb should touch the last track cell");
+        assert_eq!(
+            bot_max, bottom,
+            "at the bottom the thumb should touch the last track cell"
+        );
     }
 
     #[test]
@@ -843,7 +1028,10 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         let dir = tempfile::tempdir().unwrap();
-        let mut app = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+        let mut app = App::new(
+            dir.path().to_path_buf(),
+            Tmux::new("runner", MockRunner::new()),
+        );
         app.rows = (0..30)
             .map(|i| Row {
                 path: PathBuf::from("/"),
@@ -857,7 +1045,8 @@ mod tests {
         // 40 wide; height is BANNER_HEIGHT + TAB_HEIGHT taller than the tree so
         // that after the banner, tab bar, and border the tree inner height is
         // still 8 rows.
-        let mut terminal = Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
+        let mut terminal =
+            Terminal::new(TestBackend::new(40, 10 + BANNER_HEIGHT + TAB_HEIGHT)).unwrap();
         let view_h = 8usize;
         let draw = |app: &mut App<MockRunner>, t: &mut Terminal<TestBackend>| {
             t.draw(|f| {
@@ -970,10 +1159,24 @@ mod tests {
         let bar = tab_bar.unwrap();
         // Clicking inside the "directory" label resolves to that tab; clicking
         // inside "project" resolves to the other; a miss returns None.
-        let dir_hit = bar.hits.iter().find(|(_, _, t)| *t == TreeTab::Directory).unwrap();
-        assert_eq!(resolve_tab_click(dir_hit.0, bar.y, &bar), Some(TreeTab::Directory));
-        let proj_hit = bar.hits.iter().find(|(_, _, t)| *t == TreeTab::Project).unwrap();
-        assert_eq!(resolve_tab_click(proj_hit.0, bar.y, &bar), Some(TreeTab::Project));
+        let dir_hit = bar
+            .hits
+            .iter()
+            .find(|(_, _, t)| *t == TreeTab::Directory)
+            .unwrap();
+        assert_eq!(
+            resolve_tab_click(dir_hit.0, bar.y, &bar),
+            Some(TreeTab::Directory)
+        );
+        let proj_hit = bar
+            .hits
+            .iter()
+            .find(|(_, _, t)| *t == TreeTab::Project)
+            .unwrap();
+        assert_eq!(
+            resolve_tab_click(proj_hit.0, bar.y, &bar),
+            Some(TreeTab::Project)
+        );
         // A click on a different row never hits a tab.
         assert_eq!(resolve_tab_click(dir_hit.0, bar.y + 1, &bar), None);
     }
@@ -1012,7 +1215,7 @@ mod tests {
     #[test]
     fn render_chooser_shows_resume_rows() {
         use crate::app::ChooserRow;
-        use crate::claude::ResumeSession;
+        use crate::resume::ResumeSession;
         use crate::session::{ClaudePerm, SessionKind};
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;

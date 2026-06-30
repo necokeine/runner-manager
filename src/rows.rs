@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::codex::ProjectSession;
 use crate::session::{SessionKind, SessionRow};
 use crate::tree::Node;
 
@@ -8,6 +9,7 @@ use crate::tree::Node;
 pub enum RowKind {
     Dir { expanded: bool },
     Session { slug: String, kind: SessionKind },
+    CodexResume { id: String },
     File,
 }
 
@@ -35,6 +37,7 @@ pub fn build_project_rows(
     sessions: &HashMap<PathBuf, Vec<SessionRow>>,
     root: &Path,
     briefs: &HashMap<String, String>,
+    codex_resumes: &[ProjectSession],
 ) -> Vec<Row> {
     let mut dirs: Vec<&PathBuf> = sessions.keys().collect();
     dirs.sort();
@@ -60,6 +63,26 @@ pub fn build_project_rows(
                 kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
             });
         }
+    }
+    for s in codex_resumes {
+        let rel = s.dir
+            .strip_prefix(root)
+            .unwrap_or(&s.dir)
+            .to_string_lossy()
+            .into_owned();
+        let rel = if rel.is_empty() { ".".to_string() } else { rel };
+        let brief = if s.session.last_command.is_empty() {
+            let short: String = s.session.id.chars().take(8).collect();
+            format!("({short}…)")
+        } else {
+            s.session.last_command.clone()
+        };
+        out.push(Row {
+            path: s.dir.clone(),
+            label: format!("resume  {rel}  — {brief}"),
+            depth: 0,
+            kind: RowKind::CodexResume { id: s.session.id.clone() },
+        });
     }
     out
 }
@@ -102,10 +125,12 @@ fn collect(node: &Node, depth: usize, sessions: &HashMap<PathBuf, Vec<SessionRow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resume::ResumeSession;
     use crate::session::{SessionKind, SessionRow};
     use crate::tree::Tree;
     use std::collections::HashMap;
     use std::fs;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     #[test]
@@ -143,7 +168,7 @@ mod tests {
         let mut briefs: HashMap<String, String> = HashMap::new();
         briefs.insert("src-claude".into(), "node".into());
         // root-shell has no brief recorded -> its label omits the dash.
-        let rows = build_project_rows(&sessions, &root, &briefs);
+        let rows = build_project_rows(&sessions, &root, &briefs, &[]);
         // Sorted by dir: "/p" before "/p/src".
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "shell  .");
@@ -151,6 +176,29 @@ mod tests {
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[1].label, "claude  src  — node");
         assert!(matches!(rows[1].kind, RowKind::Session { kind: SessionKind::Claude, .. }));
+    }
+
+    #[test]
+    fn project_rows_append_codex_resume_history() {
+        let root = PathBuf::from("/p");
+        let sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
+        let briefs: HashMap<String, String> = HashMap::new();
+        let codex = vec![ProjectSession {
+            dir: PathBuf::from("/p/src"),
+            session: ResumeSession {
+                id: "11111111-1111-1111-1111-111111111111".into(),
+                last_command: "continue local work".into(),
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        }];
+
+        let rows = build_project_rows(&sessions, &root, &briefs, &codex);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "resume  src  — continue local work");
+        assert!(matches!(
+            &rows[0].kind,
+            RowKind::CodexResume { id } if id == "11111111-1111-1111-1111-111111111111"
+        ));
     }
 
     #[test]

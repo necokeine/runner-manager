@@ -1,8 +1,10 @@
 pub mod claude;
+pub mod codex;
 pub mod config;
 pub mod git;
 pub mod lock;
 pub mod pty;
+pub mod resume;
 pub mod tmux;
 pub mod session;
 pub mod tree;

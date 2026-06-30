@@ -67,7 +67,7 @@ runner-manager
 
 In the new-session form: `↑`/`↓`/`j`/`k` move between rows and `Tab`/`Shift-Tab`
 cycle through them (selecting `claude` reveals a permission choice: `normal` or
-`skip` = `--dangerously-skip-permissions`; `codex` just runs `codex`). Selections follow focus, so once the
+`skip` = `--dangerously-skip-permissions`). Selections follow focus, so once the
 right radios are lit, `Enter` creates the session from **any** row — no need to
 move down to `Create` (pressing `Enter` while on `Cancel` cancels instead).
 `Space` activates the focused `Cancel`/`Create` button, and `Esc` cancels.
@@ -75,5 +75,8 @@ When `claude` is selected and that directory already has past Claude sessions, a
 **Resume** list appears: pick `new session` to start fresh, or an existing
 session (shown with the last prompt it was working on) to launch
 `claude --resume <id>` and continue where it left off.
+When `codex` is selected and `~/.codex/sessions` has past sessions for that
+directory, the same **Resume** list appears and existing entries launch
+`codex resume <id>`.
 Click a row to select it, or click `Cancel`/`Create`. The split between the tree
 and the right pane is adjustable with `<`/`>` or by dragging the border.
