@@ -20,13 +20,18 @@ multiple tmux sessions (shell, claude, or codex), shown as rows under it.
   again under their directories.
 - Selecting a session row shows it in the right pane (embedded terminal).
   Selecting a file shows it in a read-only viewer in the right pane.
-- Git-changed files (and the directories containing them) are coloured
+- Git-changed files (and the directories containing them) can be coloured
   following `git status`'s own policy: staged changes ("Changes to be
   committed") in green, modified-but-unstaged and untracked paths in red, and
   git-ignored files and directories in grey. This works whether the tree root is
   itself a repository or just a parent folder holding several separate
   checkouts — each directory with its own `.git` is coloured from its own
-  status. The colouring refreshes as sessions edit files.
+  status. The colouring refreshes as sessions edit files. **This feature is off
+  by default** — a full `git status` of a large tree can be expensive — and is
+  toggled at runtime with `g` (the choice is persisted). It can also be enabled
+  up front by writing a truthy value (`on`/`1`/`true`) to `<root>/.pjma/git`, or
+  for one run via the `RM_GIT_STATUS` environment variable (which overrides the
+  file).
 - The left pane has two tabs, switched with `Tab` (or by clicking a tab):
   the **directory** view (the file tree above) and the **project** view, a flat
   list of every open session showing its type, directory, and a short brief
@@ -58,6 +63,7 @@ runner-manager
 | `a` / `[+]`    | new session form (shell/claude/codex) on a directory |
 | `x` / `[×]`    | close the selected session (tree focus)             |
 | `<` / `>`      | narrow / widen the tree pane (tree focus)           |
+| `g`            | toggle git-status colouring on/off (off by default) |
 | `h` / `?`      | help popup                                          |
 | `q`            | quit (tree focus)                                   |
 | `Ctrl-q`       | toggle focus between tree and the right pane        |

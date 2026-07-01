@@ -440,6 +440,7 @@ pub fn render_help(f: &mut Frame, area: Rect) {
         "Enter      expand dir / switch session / view file",
         "a / [+]    new session (shell or claude) on a dir",
         "x / [×]    close the selected session (asks to confirm)",
+        "g          toggle git-status colouring (off by default)",
         "wheel      scroll the tree (scrollbar shows when needed)",
         "h / ?      this help",
         "Ctrl-q     toggle focus (tree / right pane)",
