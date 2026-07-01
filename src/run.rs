@@ -107,10 +107,15 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // Git colouring is computed off the UI thread: kick off the first scan now
     // and apply each result as it arrives (see the loop top). A single
     // in-flight scan at a time (`git_inflight`) prevents a slow scan from
-    // piling up behind itself.
+    // piling up behind itself. The feature is off by default (see
+    // `Config::git_status_enabled`); when disabled we spawn no scans at all and
+    // the tree renders in its default colours until the user toggles it on (`g`).
     let (git_tx, git_rx) = mpsc::channel::<GitStatuses>();
-    spawn_git_scan(app.root.clone(), git_tx.clone());
-    let mut git_inflight = true;
+    let mut git_inflight = false;
+    if app.git_enabled {
+        spawn_git_scan(app.root.clone(), git_tx.clone());
+        git_inflight = true;
+    }
     let mut last_git = Instant::now();
 
     let mut last_term_size: (u16, u16) = (0, 0);
@@ -127,15 +132,20 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         // current colours in place.
         match git_rx.try_recv() {
             Ok(git) => {
-                app.apply_git(git);
+                // Drop a scan that finished after the user toggled the feature
+                // off; `toggle_git_status` already cleared the colours.
+                if app.git_enabled {
+                    app.apply_git(git);
+                }
                 git_inflight = false;
                 last_git = Instant::now();
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
         }
         // Re-scan once the idle gap has elapsed since the last scan finished,
-        // but only when none is in flight — a slow scan must not stack up.
-        if !git_inflight && last_git.elapsed() >= GIT_RESCAN_INTERVAL {
+        // but only when the feature is on and none is in flight — a slow scan
+        // must not stack up.
+        if app.git_enabled && !git_inflight && last_git.elapsed() >= GIT_RESCAN_INTERVAL {
             spawn_git_scan(app.root.clone(), git_tx.clone());
             git_inflight = true;
         }
@@ -252,6 +262,16 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                     }
                                     KeyCode::Char('<') => app.narrow_split(),
                                     KeyCode::Char('>') => app.widen_split(),
+                                    // Toggle git-status colouring (off by
+                                    // default). Turning it on kicks an
+                                    // immediate scan so colours appear promptly.
+                                    KeyCode::Char('g') => {
+                                        let now_on = app.toggle_git_status();
+                                        if now_on && !git_inflight {
+                                            spawn_git_scan(app.root.clone(), git_tx.clone());
+                                            git_inflight = true;
+                                        }
+                                    }
                                     _ => {}
                                 },
                                 Focus::Right => {

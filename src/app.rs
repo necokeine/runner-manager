@@ -127,6 +127,13 @@ pub struct App<R: CommandRunner> {
     /// the per-row colour in the directory view; empty when the root is not in
     /// a git repo.
     pub git: GitStatuses,
+    /// Whether git-status colouring is enabled. Off by default (see
+    /// [`Config::git_status_enabled`]); toggled at runtime with `g` and
+    /// persisted. When false the run loop runs no `git status` scans and `git`
+    /// stays empty, so the tree renders in its default colours.
+    ///
+    /// [`Config::git_status_enabled`]: crate::config::Config::git_status_enabled
+    pub git_enabled: bool,
     pub host_tty: Option<String>,
     pub viewer: Option<FileView>,
     pub focus: Focus,
@@ -158,6 +165,9 @@ impl<R: CommandRunner> App<R> {
         // block startup behind a full `git status` of the whole tree — seconds
         // on a parent-of-many-repos root — before the first frame can paint.
         let git = GitStatuses::empty();
+        // Git colouring is opt-in and off by default; read the persisted (or
+        // env-overridden) toggle so the run loop knows whether to scan.
+        let git_enabled = config.git_status_enabled();
         // Restore the saved tree-pane width, clamped into the legal range in
         // case the file was hand-edited; fall back to the default otherwise.
         let split_pct = config
@@ -175,6 +185,7 @@ impl<R: CommandRunner> App<R> {
             tab: TreeTab::Directory,
             briefs: HashMap::new(),
             git,
+            git_enabled,
             host_tty: None,
             viewer: None,
             focus: Focus::Tree,
@@ -724,6 +735,28 @@ impl<R: CommandRunner> App<R> {
         self.rebuild_rows();
     }
 
+    /// Toggle git-status colouring, persist the new state, and return whether it
+    /// is now enabled. Turning it **off** clears the current colours immediately
+    /// (so the tree redraws plain); turning it **on** leaves `git` empty until
+    /// the run loop's next background scan lands via [`apply_git`]. Persistence
+    /// is best-effort — a write failure still flips the in-memory flag.
+    ///
+    /// [`apply_git`]: App::apply_git
+    pub fn toggle_git_status(&mut self) -> bool {
+        self.git_enabled = !self.git_enabled;
+        let _ = self.config.save_git_status(self.git_enabled);
+        if !self.git_enabled {
+            self.git = GitStatuses::empty();
+            self.rebuild_rows();
+        }
+        self.status = if self.git_enabled {
+            "git status: on".into()
+        } else {
+            "git status: off".into()
+        };
+        self.git_enabled
+    }
+
     /// Title for the terminal pane: the literal "terminal" plus the directory
     /// of the session the embedded client is showing, relative to the tree root
     /// (e.g. "terminal — foo/bar" for a session opened on `<root>/foo/bar`).
@@ -832,6 +865,42 @@ mod tests {
         let src = root.join("src");
         app.apply_git(GitStatuses::from_entries([(src.clone(), GitStatus::Untracked)]));
         assert_eq!(app.git.get(&src), Some(GitStatus::Untracked));
+    }
+
+    #[test]
+    fn git_status_off_by_default_and_toggle_persists_and_clears() {
+        use crate::git::GitStatus;
+        let (dir, mut app) = app_over_tempdir();
+        // Off by default — no persisted `.pjma/git` file exists.
+        assert!(!app.git_enabled);
+
+        // Pretend a background scan had coloured a row.
+        let src = dir.path().join("src");
+        app.apply_git(GitStatuses::from_entries([(src.clone(), GitStatus::Untracked)]));
+
+        // Toggle on: the flag flips and the choice is persisted, but colours are
+        // left to the next background scan (still present from before here).
+        assert!(app.toggle_git_status());
+        assert!(app.git_enabled);
+        assert!(app.config.git_status_enabled());
+
+        // Toggle off: colours are cleared immediately and the choice persists.
+        assert!(!app.toggle_git_status());
+        assert!(!app.git_enabled);
+        assert_eq!(app.git.get(&src), None);
+        assert!(!app.config.git_status_enabled());
+
+        // A fresh App over the same root honours the persisted (off) state.
+        let app2 = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+        assert!(!app2.git_enabled);
+    }
+
+    #[test]
+    fn app_new_honours_persisted_git_status_on() {
+        let (dir, app) = app_over_tempdir();
+        app.config.save_git_status(true).unwrap();
+        let app2 = App::new(dir.path().to_path_buf(), Tmux::new("runner", MockRunner::new()));
+        assert!(app2.git_enabled);
     }
 
     #[test]
