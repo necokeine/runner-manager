@@ -65,15 +65,23 @@ runner-manager
 | scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
 | drag border    | resize the tree/terminal split                      |
 
-In the new-session form: `↑`/`↓`/`j`/`k` move between rows and `Tab`/`Shift-Tab`
-cycle through them (selecting `claude` reveals a permission choice: `normal` or
-`skip` = `--dangerously-skip-permissions`; `codex` just runs `codex`). Selections follow focus, so once the
-right radios are lit, `Enter` creates the session from **any** row — no need to
-move down to `Create` (pressing `Enter` while on `Cancel` cancels instead).
-`Space` activates the focused `Cancel`/`Create` button, and `Esc` cancels.
-When `claude` is selected and that directory already has past Claude sessions, a
-**Resume** list appears: pick `new session` to start fresh, or an existing
-session (shown with the last prompt it was working on) to launch
-`claude --resume <id>` and continue where it left off.
-Click a row to select it, or click `Cancel`/`Create`. The split between the tree
-and the right pane is adjustable with `<`/`>` or by dragging the border.
+The new-session form is laid out as labelled groups (Kind, Permission, Resume,
+and the Cancel/Create buttons) and navigated in two axes:
+
+| Key                        | Action                                              |
+|----------------------------|-----------------------------------------------------|
+| `↑`/`↓` (`j`/`k`)          | move between groups (Kind → Permission → Resume → buttons) |
+| `←`/`→` (`h`/`l`)          | change the selected option within the focused group |
+| `Tab` / `Shift-Tab`        | cycle between groups (wraps around)                 |
+| `Enter`                    | create the session from **any** group (`Cancel` cancels) |
+| `Space`                    | activate the focused `Cancel`/`Create` button       |
+| `Esc`                      | cancel                                              |
+
+The Kind group offers `shell`, `claude`, and `codex`. Selecting `claude` reveals
+the **Permission** group — `normal` or `skip` = `--dangerously-skip-permissions`
+(`shell` and `codex` have no extra options). When that directory already has past
+Claude sessions, a **Resume** group appears too: pick `new session` to start
+fresh, or an existing session (shown with the last prompt it was working on) to
+launch `claude --resume <id>` and continue where it left off. Every option is
+also clickable. The split between the tree and the right pane is adjustable with
+`<`/`>` or by dragging the border.

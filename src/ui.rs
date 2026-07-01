@@ -458,6 +458,53 @@ pub fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(para, popup);
 }
 
+/// The radio marker for a (un)selected option, including its trailing space.
+fn radio_marker(selected: bool) -> &'static str {
+    if selected {
+        "(•) "
+    } else {
+        "( ) "
+    }
+}
+
+/// Build one horizontal line of options indented under a group label. Each
+/// `cell` is the already-formatted option text (radio marker + label, or a
+/// `[ button ]`). The focused option is drawn reversed, and its column span is
+/// recorded in `hits` so a mouse click maps back to the row.
+fn options_line(
+    x0: u16,
+    y: u16,
+    cells: &[(String, ChooserRow)],
+    focus_row: ChooserRow,
+    hits: &mut Vec<(u16, u16, u16, ChooserRow)>,
+) -> Line<'static> {
+    const INDENT: u16 = 2;
+    const GAP: u16 = 3;
+    let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(INDENT as usize))];
+    let mut col = x0 + INDENT;
+    for (i, (cell, row)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(GAP as usize)));
+            col += GAP;
+        }
+        let w = cell.chars().count() as u16;
+        let style = if *row == focus_row {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(cell.clone(), style));
+        hits.push((y, col, col + w.saturating_sub(1), *row));
+        col += w;
+    }
+    Line::from(spans)
+}
+
+/// Draw the new-session form. Options are grouped (Kind / Permission / Resume /
+/// actions); the layout puts each group's label on its own line with its
+/// options laid out horizontally below it, mirroring the navigation model
+/// (Up/Down between groups, Left/Right between options). Returns the clickable
+/// column span `(y, x_start, x_end, row)` of every option for mouse hit-testing.
 pub fn render_chooser(
     f: &mut Frame,
     area: Rect,
@@ -466,87 +513,117 @@ pub fn render_chooser(
     resumes: &[ResumeSession],
     resume_sel: Option<usize>,
     focus_row: ChooserRow,
-) -> Vec<(u16, ChooserRow)> {
-    let popup = centered_rect(50, 60, area);
+) -> Vec<(u16, u16, u16, ChooserRow)> {
+    let popup = centered_rect(50, 70, area);
     f.render_widget(Clear, popup);
     let block = Block::default().title("New session").borders(Borders::ALL);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut row_ys: Vec<(u16, ChooserRow)> = Vec::new();
+    let mut hits: Vec<(u16, u16, u16, ChooserRow)> = Vec::new();
     let mut y = inner.y;
 
-    let radio = |selected: bool| if selected { "(•)" } else { "( )" };
-    let arrow = |row: ChooserRow| if row == focus_row { "> " } else { "  " };
-
-    // Kind:
+    // Kind group.
     lines.push(Line::from("Kind:".to_string()));
     y += 1;
-    lines.push(Line::from(format!("{}{} shell", arrow(ChooserRow::KindShell), radio(kind == SessionKind::Shell))));
-    row_ys.push((y, ChooserRow::KindShell));
-    y += 1;
-    lines.push(Line::from(format!("{}{} claude", arrow(ChooserRow::KindClaude), radio(kind == SessionKind::Claude))));
-    row_ys.push((y, ChooserRow::KindClaude));
-    y += 1;
-    lines.push(Line::from(format!("{}{} codex", arrow(ChooserRow::KindCodex), radio(kind == SessionKind::Codex))));
-    row_ys.push((y, ChooserRow::KindCodex));
+    let kind_cells = vec![
+        (
+            format!("{}shell", radio_marker(kind == SessionKind::Shell)),
+            ChooserRow::KindShell,
+        ),
+        (
+            format!("{}claude", radio_marker(kind == SessionKind::Claude)),
+            ChooserRow::KindClaude,
+        ),
+        (
+            format!("{}codex", radio_marker(kind == SessionKind::Codex)),
+            ChooserRow::KindCodex,
+        ),
+    ];
+    lines.push(options_line(inner.x, y, &kind_cells, focus_row, &mut hits));
     y += 1;
 
     if kind == SessionKind::Claude {
+        lines.push(Line::from(String::new()));
+        y += 1;
         lines.push(Line::from("Permission:".to_string()));
         y += 1;
-        lines.push(Line::from(format!("{}{} normal", arrow(ChooserRow::PermNormal), radio(perm == ClaudePerm::Normal))));
-        row_ys.push((y, ChooserRow::PermNormal));
-        y += 1;
-        lines.push(Line::from(format!("{}{} skip (--dangerously-skip-permissions)", arrow(ChooserRow::PermSkip), radio(perm == ClaudePerm::Skip))));
-        row_ys.push((y, ChooserRow::PermSkip));
+        let perm_cells = vec![
+            (
+                format!("{}normal", radio_marker(perm == ClaudePerm::Normal)),
+                ChooserRow::PermNormal,
+            ),
+            (
+                format!("{}skip", radio_marker(perm == ClaudePerm::Skip)),
+                ChooserRow::PermSkip,
+            ),
+        ];
+        lines.push(options_line(inner.x, y, &perm_cells, focus_row, &mut hits));
         y += 1;
 
         // Resume picker: only shown when this directory has Claude history.
+        // Entries stay vertical (full-width labels) but are still one group:
+        // Left/Right walks the entries, the line spans the inner width for clicks.
         if !resumes.is_empty() {
+            lines.push(Line::from(String::new()));
+            y += 1;
             lines.push(Line::from("Resume:".to_string()));
             y += 1;
-            lines.push(Line::from(format!(
-                "{}{} new session",
-                arrow(ChooserRow::ResumeNew),
-                radio(resume_sel.is_none())
+            let x_end = inner.x + inner.width.saturating_sub(1);
+            let new_focused = focus_row == ChooserRow::ResumeNew;
+            let new_style = if new_focused {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {}new session", radio_marker(resume_sel.is_none())),
+                new_style,
             )));
-            row_ys.push((y, ChooserRow::ResumeNew));
+            hits.push((y, inner.x, x_end, ChooserRow::ResumeNew));
             y += 1;
-            // Keep the label inside the popup; reserve room for the "> (•) " prefix.
-            let label_width = (inner.width as usize).saturating_sub(7);
+            // Keep the label inside the popup; reserve room for the "  (•) " prefix.
+            let label_width = (inner.width as usize).saturating_sub(6);
             for (i, s) in resumes.iter().enumerate() {
                 let row = ChooserRow::Resume(i);
-                lines.push(Line::from(format!(
-                    "{}{} {}",
-                    arrow(row),
-                    radio(resume_sel == Some(i)),
-                    resume_label(s, label_width)
+                let style = if focus_row == row {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}{}",
+                        radio_marker(resume_sel == Some(i)),
+                        resume_label(s, label_width)
+                    ),
+                    style,
                 )));
-                row_ys.push((y, row));
+                hits.push((y, inner.x, x_end, row));
                 y += 1;
             }
         }
     }
 
+    // Action buttons (no group label).
     lines.push(Line::from(String::new()));
     y += 1;
-    lines.push(Line::from(format!("{}[ Cancel ]", arrow(ChooserRow::Cancel))));
-    row_ys.push((y, ChooserRow::Cancel));
-    y += 1;
-    lines.push(Line::from(format!("{}[ Create ]", arrow(ChooserRow::Create))));
-    row_ys.push((y, ChooserRow::Create));
+    let action_cells = vec![
+        ("[ Cancel ]".to_string(), ChooserRow::Cancel),
+        ("[ Create ]".to_string(), ChooserRow::Create),
+    ];
+    lines.push(options_line(inner.x, y, &action_cells, focus_row, &mut hits));
 
     lines.push(Line::from(String::new()));
     lines.push(Line::from(Span::styled(
-        "↑/↓/Tab move · Enter create · Esc cancel",
+        "↑↓ group · ←→ option · ↵ start · esc",
         Style::default().fg(Color::DarkGray),
     )));
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
-    row_ys
+    hits
 }
 
 /// Draw the "really close this session?" confirmation. Returns the screen `y` of
@@ -997,7 +1074,7 @@ mod tests {
                     None,
                     ChooserRow::Create,
                 );
-                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::Create));
+                assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::Create));
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -1033,8 +1110,8 @@ mod tests {
                     Some(0),
                     ChooserRow::Resume(0),
                 );
-                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::Resume(0)));
-                assert!(rows.iter().any(|(_, r)| *r == ChooserRow::ResumeNew));
+                assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::Resume(0)));
+                assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::ResumeNew));
             })
             .unwrap();
         let content: String = terminal
@@ -1047,5 +1124,36 @@ mod tests {
         assert!(content.contains("Resume:"));
         assert!(content.contains("new session"));
         assert!(content.contains("refactor the chooser"));
+    }
+
+    #[test]
+    fn render_chooser_lays_kind_options_horizontally() {
+        use crate::app::ChooserRow;
+        use crate::session::{ClaudePerm, SessionKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                hits = render_chooser(
+                    f,
+                    f.area(),
+                    SessionKind::Shell,
+                    ClaudePerm::Normal,
+                    &[],
+                    None,
+                    ChooserRow::KindShell,
+                );
+            })
+            .unwrap();
+        let shell = hits.iter().find(|(_, _, _, r)| *r == ChooserRow::KindShell).unwrap();
+        let claude = hits.iter().find(|(_, _, _, r)| *r == ChooserRow::KindClaude).unwrap();
+        // Same row, side by side, with shell's span ending before claude's begins.
+        assert_eq!(shell.0, claude.0);
+        assert!(shell.2 < claude.1, "shell {shell:?} should sit left of claude {claude:?}");
+        // The Cancel/Create buttons sit on a later row (a different group).
+        let create = hits.iter().find(|(_, _, _, r)| *r == ChooserRow::Create).unwrap();
+        assert!(create.0 > shell.0);
     }
 }
