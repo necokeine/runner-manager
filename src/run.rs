@@ -327,6 +327,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                                             _ => {}
                                         }
                                     } else if let Some(p) = &mut pty {
+                                        // Typing changes what is on screen, so any
+                                        // selection painted over it is now stale.
+                                        app.clear_selection();
                                         let _ = p.write_input(&encode_key(key));
                                     }
                                 }
@@ -369,7 +372,19 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                             dragging_split = true;
                         } else {
                             match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree, &app.rows) {
-                                PaneHit::Right => app.focus = Focus::Right,
+                                PaneHit::Right => {
+                                    app.focus = Focus::Right;
+                                    // Start a text selection when the press lands
+                                    // inside the live terminal (not the viewer,
+                                    // not the border). A bare click stays empty
+                                    // and copies nothing.
+                                    app.clear_selection();
+                                    if app.viewer.is_none() {
+                                        if let Some((c, r)) = cell_in_pane(m.column, m.row, layout.term_area) {
+                                            app.begin_selection(c, r);
+                                        }
+                                    }
+                                }
                                 PaneHit::Tree(hit) => {
                                     app.focus = Focus::Tree;
                                     match hit {
@@ -395,6 +410,12 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if dragging_split {
                         app.split_pct = crate::app::col_to_split_pct(m.column, area_width);
+                    } else if app.selection.is_some() {
+                        // Extend the selection, clamping the pointer into the
+                        // pane so a drag past its edge selects to the boundary.
+                        if let Some((c, r)) = clamp_cell(m.column, m.row, layout.term_area) {
+                            app.update_selection(c, r);
+                        }
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
@@ -402,6 +423,22 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                     // intermediate move.
                     if dragging_split {
                         app.persist_split();
+                    } else if let Some(sel) = app.selection {
+                        if sel.is_empty() {
+                            // A bare click selected nothing; drop the empty marker.
+                            app.clear_selection();
+                        } else if let Some(p) = &parser {
+                            // Pull the covered text from the current screen and
+                            // copy it; leave the highlight up as confirmation
+                            // until the next interaction clears it.
+                            let guard = crate::pty::read_screen(p);
+                            let text = crate::select::selected_text(guard.screen(), &sel);
+                            drop(guard);
+                            if !text.is_empty() {
+                                crate::clipboard::copy(&text);
+                                app.status = format!("copied {} chars to clipboard", text.chars().count());
+                            }
+                        }
                     }
                     dragging_split = false;
                 }
@@ -412,6 +449,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         } else if let Some(v) = &mut app.viewer {
                             v.scroll_down(3);
                         } else {
+                            app.clear_selection();
                             forward_wheel(&mut pty, false, m.column, m.row, layout.term_area);
                         }
                     }
@@ -423,6 +461,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         } else if let Some(v) = &mut app.viewer {
                             v.scroll_up(3);
                         } else {
+                            app.clear_selection();
                             forward_wheel(&mut pty, true, m.column, m.row, layout.term_area);
                         }
                     }
@@ -464,6 +503,31 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let restore_raw = disable_raw_mode();
     let restore_screen = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     result.and(restore_raw).and(restore_screen)
+}
+
+/// Map an absolute screen cell to a pane-relative `(col, row)`, but only when
+/// it lies strictly inside `term`. Used to decide whether a left-press begins a
+/// terminal selection.
+fn cell_in_pane(col: u16, row: u16, term: ratatui::layout::Rect) -> Option<(u16, u16)> {
+    if term.width == 0 || term.height == 0 {
+        return None;
+    }
+    if col < term.x || row < term.y || col >= term.x + term.width || row >= term.y + term.height {
+        return None;
+    }
+    Some((col - term.x, row - term.y))
+}
+
+/// Like [`cell_in_pane`] but clamps the pointer into the pane instead of
+/// rejecting out-of-bounds positions, so a drag past the pane edge extends the
+/// selection to the boundary. Returns `None` only for a zero-area pane.
+fn clamp_cell(col: u16, row: u16, term: ratatui::layout::Rect) -> Option<(u16, u16)> {
+    if term.width == 0 || term.height == 0 {
+        return None;
+    }
+    let c = col.saturating_sub(term.x).min(term.width - 1);
+    let r = row.saturating_sub(term.y).min(term.height - 1);
+    Some((c, r))
 }
 
 /// Forward a mouse-wheel tick to the embedded terminal, but only when a live
