@@ -85,6 +85,7 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> O
     // `content_x + <left width> + 1 ..= + 3`.
     if let Some(r) = rows.get(idx) {
         match &r.kind {
+            RowKind::Header => {}
             RowKind::Dir { .. } => {
                 let left = dir_left(r).chars().count() as u16;
                 let bstart = layout.content_x + left + 1;
@@ -177,6 +178,9 @@ fn codex_resume_left(row: &Row) -> String {
 /// policy — staged ("Changes to be committed") green, dirty/untracked red,
 /// ignored grey.
 fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
+    if matches!(row.kind, RowKind::Header) {
+        return Some(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    }
     if matches!(
         row.kind,
         RowKind::Session { .. } | RowKind::CodexResume { .. }
@@ -194,6 +198,7 @@ fn row_style(row: &Row, git: &GitStatuses) -> Option<Style> {
 fn row_line(row: &Row) -> String {
     let indent = "  ".repeat(row.depth);
     match &row.kind {
+        RowKind::Header => row.label.clone(),
         // The button sits right after the directory name rather than far right.
         RowKind::Dir { .. } => format!("{} [+]", dir_left(row)),
         // A close button sits right after the session name, mirroring `[+]`.
@@ -741,9 +746,14 @@ mod tests {
         assert_eq!(row_style(&r, &git), None);
         let r = path_row(
             PathBuf::from("/repo/history"),
-            RowKind::CodexResume { id: "c".into() },
+            RowKind::CodexResume { id: "c".into(), running_slug: None },
         );
         assert_eq!(row_style(&r, &git), None);
+        let r = path_row(PathBuf::from("/repo"), RowKind::Header);
+        assert_eq!(
+            row_style(&r, &git),
+            Some(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        );
     }
 
     #[test]
@@ -775,9 +785,16 @@ mod tests {
             path: std::path::PathBuf::from("/"),
             label: "resume  src  — keep going".into(),
             depth: 0,
-            kind: RowKind::CodexResume { id: "c".into() },
+            kind: RowKind::CodexResume { id: "c".into(), running_slug: None },
         };
         assert_eq!(row_line(&codex_resume), "⌬ resume  src  — keep going");
+        let header = Row {
+            path: std::path::PathBuf::from("/"),
+            label: "Live sessions".into(),
+            depth: 0,
+            kind: RowKind::Header,
+        };
+        assert_eq!(row_line(&header), "Live sessions");
         assert_eq!(row_line(&file_row("a.rs")), "  a.rs");
     }
 

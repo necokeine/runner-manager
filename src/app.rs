@@ -119,6 +119,9 @@ pub struct App<R: CommandRunner> {
     pub chooser_codex_resumes: Vec<ResumeSession>,
     /// Resumable Codex sessions under the project root, shown in project view.
     pub codex_project_resumes: Vec<codex::ProjectSession>,
+    /// Codex resume id -> live tmux session slug. Populated from `@rm_resume`
+    /// tags and updated immediately when this run starts a resume session.
+    pub codex_running_resumes: HashMap<String, String>,
     pub status: String,
     pub split_pct: u16,
     /// Index of the first tree row shown (scroll position). Reconciled against
@@ -167,6 +170,7 @@ impl<R: CommandRunner> App<R> {
             chooser_resumes: Vec::new(),
             chooser_codex_resumes: Vec::new(),
             codex_project_resumes: Vec::new(),
+            codex_running_resumes: HashMap::new(),
             status: String::new(),
             split_pct,
             tree_offset: 0,
@@ -199,10 +203,14 @@ impl<R: CommandRunner> App<R> {
                 &self.root,
                 &self.briefs,
                 &self.codex_project_resumes,
+                &self.codex_running_resumes,
             ),
         };
         if !self.rows.is_empty() && self.selected >= self.rows.len() {
             self.selected = self.rows.len() - 1;
+        }
+        if self.rows.get(self.selected).is_some_and(|r| matches!(r.kind, RowKind::Header)) {
+            self.selected = self.first_selectable_row().unwrap_or(0);
         }
     }
 
@@ -223,6 +231,9 @@ impl<R: CommandRunner> App<R> {
             self.selected = 0;
             self.tree_offset = 0;
             self.rebuild_rows();
+            if self.tab == TreeTab::Project {
+                self.selected = self.first_selectable_row().unwrap_or(0);
+            }
         }
     }
 
@@ -240,15 +251,29 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if let Some(idx) = self.rows[..self.selected]
+            .iter()
+            .rposition(|r| !matches!(r.kind, RowKind::Header))
+        {
+            self.selected = idx;
         }
     }
 
     pub fn down(&mut self) {
-        if self.selected + 1 < self.rows.len() {
-            self.selected += 1;
+        if let Some(idx) = self.rows
+            .iter()
+            .enumerate()
+            .skip(self.selected + 1)
+            .find_map(|(i, r)| (!matches!(r.kind, RowKind::Header)).then_some(i))
+        {
+            self.selected = idx;
         }
+    }
+
+    fn first_selectable_row(&self) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| !matches!(r.kind, RowKind::Header))
     }
 
     /// Enter/click on the selected row, dispatched by kind.
@@ -257,6 +282,7 @@ impl<R: CommandRunner> App<R> {
             return Ok(());
         };
         match row.kind {
+            RowKind::Header => {}
             RowKind::Dir { .. } => {
                 if let Some(node) = self.tree.node_at_mut(&row.path) {
                     node.toggle();
@@ -267,9 +293,13 @@ impl<R: CommandRunner> App<R> {
             RowKind::Session { slug, .. } => {
                 self.switch_to(&slug)?;
             }
-            RowKind::CodexResume { id } => {
-                let cmd = Self::chooser_command(SessionKind::Codex, ClaudePerm::Normal, Some(&id));
-                self.create_session(&row.path, SessionKind::Codex, cmd.as_deref())?;
+            RowKind::CodexResume { id, running_slug } => {
+                if let Some(slug) = running_slug {
+                    self.switch_to(&slug)?;
+                } else {
+                    let cmd = Self::chooser_command(SessionKind::Codex, ClaudePerm::Normal, Some(&id));
+                    self.create_session(&row.path, SessionKind::Codex, cmd.as_deref(), Some(&id))?;
+                }
             }
             RowKind::File => {
                 self.open_file(&row.path);
@@ -448,10 +478,13 @@ impl<R: CommandRunner> App<R> {
         };
         let resume_id = resume
             .and_then(|i| self.chooser_resumes_for(kind).get(i))
-            .map(|s| s.id.as_str());
-        let cmd = Self::chooser_command(kind, perm, resume_id);
+            .map(|s| s.id.clone());
+        let cmd = Self::chooser_command(kind, perm, resume_id.as_deref());
         self.popup = Popup::None;
-        self.create_session(&dir, kind, cmd.as_deref())
+        let codex_resume_id = (kind == SessionKind::Codex)
+            .then_some(resume_id.as_deref())
+            .flatten();
+        self.create_session(&dir, kind, cmd.as_deref(), codex_resume_id)
     }
 
     pub fn chooser_cancel(&mut self) {
@@ -500,11 +533,16 @@ impl<R: CommandRunner> App<R> {
         dir: &Path,
         kind: SessionKind,
         command: Option<&str>,
+        codex_resume_id: Option<&str>,
     ) -> io::Result<()> {
         let slug = self.store.create(dir, &self.root, kind);
         self.tmux.new_session(&slug, dir, command)?;
         // Tag the session so a later run can re-adopt it into the tree.
         let _ = self.tmux.tag_session(&slug, dir, kind.label_base());
+        if let Some(id) = codex_resume_id {
+            let _ = self.tmux.tag_resume(&slug, id);
+            self.codex_running_resumes.insert(id.to_string(), slug.clone());
+        }
         self.rebuild_rows();
         self.switch_to(&slug)?;
         self.status = format!("started {}", kind.label_base());
@@ -550,6 +588,7 @@ impl<R: CommandRunner> App<R> {
         let slug = slug.clone();
         self.tmux.kill_session(&slug)?;
         self.store.remove(&slug);
+        self.codex_running_resumes.retain(|_, running_slug| running_slug != &slug);
         self.status = format!("closed {slug}");
         self.rebuild_rows();
         Ok(())
@@ -632,6 +671,11 @@ impl<R: CommandRunner> App<R> {
             .iter()
             .filter(|i| !i.command.is_empty())
             .map(|i| (i.name.clone(), i.command.clone()))
+            .collect();
+        self.codex_running_resumes = infos
+            .iter()
+            .filter(|i| i.kind == "codex" && !i.resume_id.is_empty())
+            .map(|i| (i.resume_id.clone(), i.name.clone()))
             .collect();
         let live: HashSet<String> = infos.into_iter().map(|i| i.name).collect();
         self.store.sync(&live);
@@ -1104,7 +1148,7 @@ mod tests {
             .any(|r| matches!(r.kind, RowKind::Session { .. })));
         app.tmux
             .runner
-            .push(true, &format!("root-shell\tshell {root}\nscratch\t\n"));
+            .push(true, &format!("root-shell\tshell {root}\t\tscratch\n"));
         app.sync().unwrap();
         let sessions: Vec<&Row> = app
             .rows
@@ -1383,6 +1427,7 @@ mod tests {
         app.chooser_click(ChooserRow::Resume(0)).unwrap();
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, ""); // set-option (@rm_resume tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         app.chooser_click(ChooserRow::Create).unwrap();
@@ -1391,6 +1436,8 @@ mod tests {
             .runner
             .nth_call(0)
             .contains(&"codex resume codex-xyz".to_string()));
+        assert_eq!(app.tmux.runner.nth_call(2)[5], "@rm_resume");
+        assert_eq!(app.tmux.runner.nth_call(2)[6], "codex-xyz");
     }
 
     #[test]
@@ -1649,7 +1696,7 @@ mod tests {
         // reports the client is attached to it.
         app.tmux
             .runner
-            .push(true, &format!("src-shell\tshell {root}/src\n"));
+            .push(true, &format!("src-shell\tshell {root}/src\t\t\n"));
         app.tmux.runner.push(true, "src-shell\n"); // list-clients (client_session)
         app.sync().unwrap();
         assert_eq!(app.current_session.as_deref(), Some("src-shell"));
@@ -1686,8 +1733,8 @@ mod tests {
             .find(|r| matches!(&r.kind, RowKind::Session { slug, .. } if slug == "src-shell"))
             .unwrap();
         assert_eq!(row.label, "shell  src  — zsh");
-        // Selection resets to the top when switching tabs.
-        assert_eq!(app.selected, 0);
+        // Selection resets to the first actionable row, skipping the header.
+        assert_eq!(app.selected, 1);
         // Switching back restores the directory tree (root dir row present).
         app.toggle_tab();
         assert_eq!(app.tab, TreeTab::Directory);
@@ -1746,6 +1793,7 @@ mod tests {
 
         app.tmux.runner.push(true, ""); // new-session
         app.tmux.runner.push(true, ""); // set-option (@rm tag)
+        app.tmux.runner.push(true, ""); // set-option (@rm_resume tag)
         app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
         app.tmux.runner.push(true, ""); // switch-client
         app.activate().unwrap();
@@ -1757,6 +1805,41 @@ mod tests {
             .contains(&"codex resume codex-xyz".to_string()));
         let tag = app.tmux.runner.nth_call(1);
         assert!(tag.iter().any(|a| a.starts_with("codex ")));
+        let resume_tag = app.tmux.runner.nth_call(2);
+        assert_eq!(resume_tag[5], "@rm_resume");
+        assert_eq!(resume_tag[6], "codex-xyz");
+        assert_eq!(app.focus, Focus::Right);
+    }
+
+    #[test]
+    fn project_view_running_codex_resume_switches_existing_session() {
+        let (_d, mut app) = app_over_tempdir();
+        let src = app.root.join("src");
+        app.tab = TreeTab::Project;
+        app.codex_project_resumes = vec![codex::ProjectSession {
+            dir: src,
+            session: ResumeSession {
+                id: "codex-xyz".into(),
+                last_command: "resume codex".into(),
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        }];
+        app.codex_running_resumes.insert("codex-xyz".into(), "src-codex".into());
+        app.rebuild_rows();
+        let idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::CodexResume { .. }))
+            .unwrap();
+        app.selected = idx;
+
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.activate().unwrap();
+
+        assert_eq!(app.tmux.runner.call_count(), 2);
+        assert_eq!(app.tmux.runner.nth_call(1)[2], "switch-client");
+        assert_eq!(app.tmux.runner.nth_call(1)[6], "src-codex");
         assert_eq!(app.focus, Focus::Right);
     }
 
@@ -1767,7 +1850,7 @@ mod tests {
         // list-sessions-full: a tagged session whose active pane runs `vim`.
         app.tmux
             .runner
-            .push(true, &format!("src-shell\tshell {root}/src\tvim\n"));
+            .push(true, &format!("src-shell\tshell {root}/src\t\tvim\n"));
         app.tmux.runner.push(true, "src-shell\n"); // client_session
         app.sync().unwrap();
         assert_eq!(app.briefs.get("src-shell").map(String::as_str), Some("vim"));

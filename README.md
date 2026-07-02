@@ -28,10 +28,12 @@ multiple tmux sessions (shell, claude, or codex), shown as rows under it.
   checkouts — each directory with its own `.git` is coloured from its own
   status. The colouring refreshes as sessions edit files.
 - The left pane has two tabs, switched with `Tab` (or by clicking a tab):
-  the **directory** view (the file tree above) and the **project** view, a flat
-  list of every open session showing its type, directory, and a short brief
-  (the command running in it). Selecting, switching, and closing sessions work
-  the same in either view.
+  the **directory** view (the file tree above) and the **project** view, grouped
+  into live sessions and local Codex history. Live session rows show type,
+  directory, and a short brief (the command running in it). Codex history rows
+  launch `codex resume <id>`; if that resume id is already running, the row is
+  marked `running` and selecting it switches to the existing tmux session instead
+  of opening a duplicate.
 - Per-project state lives in a `<root>/.pjma/` config directory (the tmux socket
   plus the saved tree state). Which directories you have expanded is remembered
   across runs.
@@ -77,6 +79,7 @@ session (shown with the last prompt it was working on) to launch
 `claude --resume <id>` and continue where it left off.
 When `codex` is selected and `~/.codex/sessions` has past sessions for that
 directory, the same **Resume** list appears and existing entries launch
-`codex resume <id>`.
+`codex resume <id>`. The project view also scans local Codex history under the
+current root and exposes those entries directly.
 Click a row to select it, or click `Cancel`/`Create`. The split between the tree
 and the right pane is adjustable with `<`/`>` or by dragging the border.

@@ -7,9 +7,10 @@ use crate::tree::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKind {
+    Header,
     Dir { expanded: bool },
     Session { slug: String, kind: SessionKind },
-    CodexResume { id: String },
+    CodexResume { id: String, running_slug: Option<String> },
     File,
 }
 
@@ -38,53 +39,71 @@ pub fn build_project_rows(
     root: &Path,
     briefs: &HashMap<String, String>,
     codex_resumes: &[ProjectSession],
+    running_codex_resumes: &HashMap<String, String>,
 ) -> Vec<Row> {
     let mut dirs: Vec<&PathBuf> = sessions.keys().collect();
     dirs.sort();
     let mut out = Vec::new();
-    for dir in dirs {
-        let rel = dir
-            .strip_prefix(root)
-            .unwrap_or(dir)
-            .to_string_lossy()
-            .into_owned();
-        let rel = if rel.is_empty() { ".".to_string() } else { rel };
-        for s in &sessions[dir] {
-            let brief = briefs.get(&s.slug).map(String::as_str).unwrap_or("");
-            let label = if brief.is_empty() {
-                format!("{}  {rel}", s.label)
+    if !dirs.is_empty() {
+        out.push(Row {
+            path: root.to_path_buf(),
+            label: "Live sessions".into(),
+            depth: 0,
+            kind: RowKind::Header,
+        });
+        for dir in dirs {
+            let rel = relative_label(dir, root);
+            for s in &sessions[dir] {
+                let brief = briefs.get(&s.slug).map(String::as_str).unwrap_or("");
+                let label = if brief.is_empty() {
+                    format!("{}  {rel}", s.label)
+                } else {
+                    format!("{}  {rel}  — {brief}", s.label)
+                };
+                out.push(Row {
+                    path: dir.clone(),
+                    label,
+                    depth: 0,
+                    kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
+                });
+            }
+        }
+    }
+    if !codex_resumes.is_empty() {
+        out.push(Row {
+            path: root.to_path_buf(),
+            label: "Codex history".into(),
+            depth: 0,
+            kind: RowKind::Header,
+        });
+        for s in codex_resumes {
+            let rel = relative_label(&s.dir, root);
+            let brief = if s.session.last_command.is_empty() {
+                let short: String = s.session.id.chars().take(8).collect();
+                format!("({short}…)")
             } else {
-                format!("{}  {rel}  — {brief}", s.label)
+                s.session.last_command.clone()
             };
+            let running_slug = running_codex_resumes.get(&s.session.id).cloned();
+            let verb = if running_slug.is_some() { "running" } else { "resume" };
             out.push(Row {
-                path: dir.clone(),
-                label,
+                path: s.dir.clone(),
+                label: format!("{verb}  {rel}  — {brief}"),
                 depth: 0,
-                kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
+                kind: RowKind::CodexResume { id: s.session.id.clone(), running_slug },
             });
         }
     }
-    for s in codex_resumes {
-        let rel = s.dir
-            .strip_prefix(root)
-            .unwrap_or(&s.dir)
-            .to_string_lossy()
-            .into_owned();
-        let rel = if rel.is_empty() { ".".to_string() } else { rel };
-        let brief = if s.session.last_command.is_empty() {
-            let short: String = s.session.id.chars().take(8).collect();
-            format!("({short}…)")
-        } else {
-            s.session.last_command.clone()
-        };
-        out.push(Row {
-            path: s.dir.clone(),
-            label: format!("resume  {rel}  — {brief}"),
-            depth: 0,
-            kind: RowKind::CodexResume { id: s.session.id.clone() },
-        });
-    }
     out
+}
+
+fn relative_label(dir: &Path, root: &Path) -> String {
+    let rel = dir
+        .strip_prefix(root)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .into_owned();
+    if rel.is_empty() { ".".to_string() } else { rel }
 }
 
 fn collect(node: &Node, depth: usize, sessions: &HashMap<PathBuf, Vec<SessionRow>>, out: &mut Vec<Row>) {
@@ -168,14 +187,16 @@ mod tests {
         let mut briefs: HashMap<String, String> = HashMap::new();
         briefs.insert("src-claude".into(), "node".into());
         // root-shell has no brief recorded -> its label omits the dash.
-        let rows = build_project_rows(&sessions, &root, &briefs, &[]);
-        // Sorted by dir: "/p" before "/p/src".
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].label, "shell  .");
-        assert!(matches!(rows[0].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
-        assert_eq!(rows[0].depth, 0);
-        assert_eq!(rows[1].label, "claude  src  — node");
-        assert!(matches!(rows[1].kind, RowKind::Session { kind: SessionKind::Claude, .. }));
+        let rows = build_project_rows(&sessions, &root, &briefs, &[], &HashMap::new());
+        // Header, then sorted by dir: "/p" before "/p/src".
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].label, "Live sessions");
+        assert!(matches!(rows[0].kind, RowKind::Header));
+        assert_eq!(rows[1].label, "shell  .");
+        assert!(matches!(rows[1].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
+        assert_eq!(rows[1].depth, 0);
+        assert_eq!(rows[2].label, "claude  src  — node");
+        assert!(matches!(rows[2].kind, RowKind::Session { kind: SessionKind::Claude, .. }));
     }
 
     #[test]
@@ -192,12 +213,41 @@ mod tests {
             },
         }];
 
-        let rows = build_project_rows(&sessions, &root, &briefs, &codex);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "resume  src  — continue local work");
+        let rows = build_project_rows(&sessions, &root, &briefs, &codex, &HashMap::new());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "Codex history");
+        assert!(matches!(rows[0].kind, RowKind::Header));
+        assert_eq!(rows[1].label, "resume  src  — continue local work");
         assert!(matches!(
-            &rows[0].kind,
-            RowKind::CodexResume { id } if id == "11111111-1111-1111-1111-111111111111"
+            &rows[1].kind,
+            RowKind::CodexResume { id, running_slug: None } if id == "11111111-1111-1111-1111-111111111111"
+        ));
+    }
+
+    #[test]
+    fn project_rows_mark_running_codex_history() {
+        let root = PathBuf::from("/p");
+        let sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
+        let briefs: HashMap<String, String> = HashMap::new();
+        let codex = vec![ProjectSession {
+            dir: PathBuf::from("/p/src"),
+            session: ResumeSession {
+                id: "11111111-1111-1111-1111-111111111111".into(),
+                last_command: "continue local work".into(),
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        }];
+        let running = HashMap::from([(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            "src-codex".to_string(),
+        )]);
+
+        let rows = build_project_rows(&sessions, &root, &briefs, &codex, &running);
+        assert_eq!(rows[1].label, "running  src  — continue local work");
+        assert!(matches!(
+            &rows[1].kind,
+            RowKind::CodexResume { id, running_slug: Some(slug) }
+                if id == "11111111-1111-1111-1111-111111111111" && slug == "src-codex"
         ));
     }
 
