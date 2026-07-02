@@ -38,6 +38,11 @@ fn spawn_git_scan(root: PathBuf, tx: Sender<GitStatuses>) {
 }
 
 pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
+    // Silence the panic message for the vt100 parser panics the reader thread
+    // deliberately catches (see `pty::install_panic_filter`); otherwise, during
+    // a rapid splitter-drag resize, that message bleeds onto the TUI.
+    crate::pty::install_panic_filter();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

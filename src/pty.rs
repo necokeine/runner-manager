@@ -1,7 +1,8 @@
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Once, RwLock, RwLockReadGuard};
 use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -39,14 +40,70 @@ pub fn read_screen(parser: &ParserHandle) -> RwLockReadGuard<'_, vt100::Parser> 
     parser.read().unwrap_or_else(|e| e.into_inner())
 }
 
+thread_local! {
+    /// Set only for the duration of the `Parser::process` call inside [`feed`].
+    /// While it is set, the panic hook installed by [`install_panic_filter`]
+    /// stays silent, because any panic there is one we deliberately catch.
+    static SILENCE_VT100_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII flag that marks the current thread as inside a guarded `process` call.
+/// Restoring on drop keeps the flag correct whether `process` returns normally
+/// or unwinds (the unwind is stopped by the surrounding `catch_unwind`).
+struct SilenceGuard;
+
+impl SilenceGuard {
+    fn new() -> Self {
+        SILENCE_VT100_PANIC.with(|c| c.set(true));
+        SilenceGuard
+    }
+}
+
+impl Drop for SilenceGuard {
+    fn drop(&mut self) {
+        SILENCE_VT100_PANIC.with(|c| c.set(false));
+    }
+}
+
+static PANIC_FILTER: Once = Once::new();
+
+/// Install a process-wide panic hook that suppresses the panic *message* for
+/// the vt100 parser panics we deliberately catch in [`feed`], while leaving the
+/// previous hook in place for every other panic.
+///
+/// [`b648388`] made the reader thread survive a vt100 panic (catch_unwind +
+/// poison recovery), but `catch_unwind` does not stop the panic hook from
+/// running: the default hook still printed `thread '…' panicked at vt100…` to
+/// the tty, and that text bled onto the alternate screen during a rapid
+/// splitter drag ("a panic information appear"). Silencing the hook for exactly
+/// those caught panics removes the stray message without hiding real crashes —
+/// the flag is only ever set on the reader thread around `Parser::process`, so
+/// a genuine panic on any other thread (or path) still prints normally.
+///
+/// Idempotent; safe to call more than once.
+pub fn install_panic_filter() {
+    PANIC_FILTER.call_once(|| {
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if SILENCE_VT100_PANIC.with(|c| c.get()) {
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
+
 /// Feed bytes to the parser, recovering a poisoned lock and swallowing any
 /// panic from vt100 itself. A malformed or resize-time escape sequence that
 /// makes the parser panic must not kill the reader thread or poison the lock —
-/// the bad chunk is dropped and parsing resumes on the next read.
+/// the bad chunk is dropped and parsing resumes on the next read. The panic
+/// message is silenced too (see [`install_panic_filter`]) so it never bleeds
+/// onto the TUI.
 fn feed(parser: &Arc<RwLock<vt100::Parser>>, bytes: &[u8]) {
     let mut p = parser.write().unwrap_or_else(|e| e.into_inner());
     // `p` lives in this frame, not the closure, so catch_unwind stops the
     // unwind before the guard drops — the lock is never marked poisoned.
+    let _guard = SilenceGuard::new();
     let _ = panic::catch_unwind(AssertUnwindSafe(|| p.process(bytes)));
 }
 
@@ -203,5 +260,40 @@ mod tests {
         feed(&parser, b"after-poison");
         let contents = read_screen(&parser).screen().contents();
         assert!(contents.contains("after-poison"));
+    }
+
+    #[test]
+    fn silence_guard_toggles_and_clears_on_unwind() {
+        assert!(!SILENCE_VT100_PANIC.with(|c| c.get()));
+        {
+            let _g = SilenceGuard::new();
+            assert!(SILENCE_VT100_PANIC.with(|c| c.get()));
+        }
+        assert!(!SILENCE_VT100_PANIC.with(|c| c.get()));
+        // Unwinding through the guard still clears the flag (RAII on drop).
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = SilenceGuard::new();
+            panic!("unwind past the guard");
+        }));
+        assert!(
+            !SILENCE_VT100_PANIC.with(|c| c.get()),
+            "flag must be cleared after an unwind"
+        );
+    }
+
+    #[test]
+    fn feed_swallows_vt100_panic_and_leaves_lock_usable() {
+        install_panic_filter();
+        // A wide (2-column) grapheme cannot fit a 1-column pane, which makes
+        // vt100 0.15.2 panic inside `process` — exactly what a splitter drag to
+        // a sliver-width pane provokes. feed must swallow it (the panic message
+        // is silenced by the filter), leave the flag clear, and keep the lock
+        // usable so the next chunk still parses.
+        let parser = Arc::new(RwLock::new(vt100::Parser::new(20, 1, 100)));
+        feed(&parser, "世界".as_bytes());
+        assert!(!SILENCE_VT100_PANIC.with(|c| c.get()));
+        assert!(!parser.is_poisoned());
+        feed(&parser, b"ok");
+        assert_eq!(read_screen(&parser).screen().size(), (20, 1));
     }
 }
