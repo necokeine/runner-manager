@@ -19,6 +19,14 @@ pub struct Pty {
     writer: Box<dyn Write + Send>,
     parser: Arc<RwLock<vt100::Parser>>,
     alive: Arc<AtomicBool>,
+    /// Set by the reader thread whenever it feeds fresh bytes into the parser
+    /// (or blanks the screen on EOF). The run loop swaps it back to `false`
+    /// each pass via [`take_dirty`]; a `true` means the embedded terminal's
+    /// screen changed and the pane needs re-rendering. This is what lets the
+    /// loop skip the expensive per-frame redraw while the terminal is idle.
+    ///
+    /// [`take_dirty`]: Pty::take_dirty
+    dirty: Arc<AtomicBool>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -73,8 +81,12 @@ impl Pty {
 
         let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
         let alive = Arc::new(AtomicBool::new(true));
+        // Starts `true` so the first frame after spawn always renders the
+        // freshly-attached session, even before any output arrives.
+        let dirty = Arc::new(AtomicBool::new(true));
         let reader_parser = Arc::clone(&parser);
         let reader_alive = Arc::clone(&alive);
+        let reader_dirty = Arc::clone(&dirty);
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -85,11 +97,16 @@ impl Pty {
                         // empty terminal instead of a stale frame, and mark the
                         // PTY dead so the caller can respawn it for a new session.
                         feed(&reader_parser, b"\x1b[2J\x1b[H");
+                        // The blanked screen is a change too — force one redraw.
+                        reader_dirty.store(true, Ordering::SeqCst);
                         reader_alive.store(false, Ordering::SeqCst);
                         break;
                     }
                     Ok(n) => {
                         feed(&reader_parser, &buf[..n]);
+                        // Signal the run loop that the screen changed so it
+                        // redraws this frame instead of skipping the render.
+                        reader_dirty.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -100,6 +117,7 @@ impl Pty {
             writer,
             parser,
             alive,
+            dirty,
             _child: child,
         })
     }
@@ -108,6 +126,15 @@ impl Pty {
     /// the right pane is blank and a new session needs a freshly spawned PTY.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Whether the reader thread has fed new bytes (or blanked the screen)
+    /// since the last call, clearing the flag as a side effect. The run loop
+    /// polls this each pass and only re-renders the terminal pane when it
+    /// returns `true`, keeping idle CPU near zero instead of redrawing at the
+    /// poll rate.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::SeqCst)
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
