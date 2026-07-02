@@ -126,6 +126,15 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut chooser_row_ys: Vec<(u16, u16, u16, crate::app::ChooserRow)> = Vec::new();
     let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
 
+    // The render is by far the most expensive thing this loop does (it copies
+    // the whole embedded-terminal grid and rebuilds every widget), so we only
+    // draw when something actually changed. `dirty` starts `true` for the first
+    // frame; thereafter it is re-armed by terminal output, input events, resize,
+    // the periodic sync, and background git results. The last computed layout is
+    // kept so mouse hit-testing still works on frames we skip drawing.
+    let mut dirty = true;
+    let mut layout: Option<ui::Layout> = None;
+
     let result = loop {
         // Apply a finished background git scan, if one landed since last frame.
         // `try_recv` never blocks, so a still-running scan just leaves the
@@ -139,6 +148,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 }
                 git_inflight = false;
                 last_git = Instant::now();
+                dirty = true;
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {}
         }
@@ -150,62 +160,91 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             git_inflight = true;
         }
 
-        let mut captured: Option<ui::Layout> = None;
-        let draw_res = terminal.draw(|f| {
-            area_width = f.area().width;
-            let screen_guard = if app.viewer.is_none() {
-                parser.as_ref().map(crate::pty::read_screen)
-            } else {
-                None
-            };
-            let screen = screen_guard.as_ref().map(|g| g.screen());
-            captured = Some(ui::render(f, f.area(), &mut app, screen));
-            drop(screen_guard);
-            match &app.popup {
-                Popup::Help => ui::render_help(f, f.area()),
-                Popup::Chooser { kind, perm, resume, .. } => {
-                    let focus_row = app.chooser_focus_row();
-                    chooser_row_ys = ui::render_chooser(
-                        f,
-                        f.area(),
-                        *kind,
-                        *perm,
-                        &app.chooser_resumes,
-                        *resume,
-                        focus_row,
-                    );
-                }
-                Popup::ConfirmClose { slug } => {
-                    confirm_row_ys = ui::render_confirm_close(f, f.area(), slug);
-                }
-                Popup::None => {}
-            }
-        });
-        if let Err(e) = draw_res {
-            break Err(e);
-        }
-        let layout = captured.expect("render returns a Layout");
-
-        if app.viewer.is_none() {
-            if let Some(p) = &mut pty {
-                let term_size = (layout.term_area.height, layout.term_area.width);
-                if term_size != last_term_size && term_size.0 > 0 && term_size.1 > 0 {
-                    let _ = p.resize(term_size.0, term_size.1);
-                    last_term_size = term_size;
-                }
+        // Fresh output from the embedded terminal is a reason to redraw.
+        if let Some(p) = &pty {
+            if p.take_dirty() {
+                dirty = true;
             }
         }
 
+        // Reconcile sessions once a second. Sync can change the row list,
+        // briefs, or the shown session (hence the terminal title), so a redraw
+        // has to follow — but at most once per second, not every poll tick.
         if last_sync.elapsed() >= Duration::from_millis(1000) {
             let _ = app.sync();
             last_sync = Instant::now();
+            dirty = true;
+        }
+
+        // Only pay for a render when something changed since the last frame.
+        if dirty {
+            let mut captured: Option<ui::Layout> = None;
+            let draw_res = terminal.draw(|f| {
+                area_width = f.area().width;
+                let screen_guard = if app.viewer.is_none() {
+                    parser.as_ref().map(crate::pty::read_screen)
+                } else {
+                    None
+                };
+                let screen = screen_guard.as_ref().map(|g| g.screen());
+                captured = Some(ui::render(f, f.area(), &mut app, screen));
+                drop(screen_guard);
+                match &app.popup {
+                    Popup::Help => ui::render_help(f, f.area()),
+                    Popup::Chooser { kind, perm, resume, .. } => {
+                        let focus_row = app.chooser_focus_row();
+                        chooser_row_ys = ui::render_chooser(
+                            f,
+                            f.area(),
+                            *kind,
+                            *perm,
+                            &app.chooser_resumes,
+                            *resume,
+                            focus_row,
+                        );
+                    }
+                    Popup::ConfirmClose { slug } => {
+                        confirm_row_ys = ui::render_confirm_close(f, f.area(), slug);
+                    }
+                    Popup::None => {}
+                }
+            });
+            if let Err(e) = draw_res {
+                break Err(e);
+            }
+            let new_layout = captured.expect("render returns a Layout");
+
+            if app.viewer.is_none() {
+                if let Some(p) = &mut pty {
+                    let term_size = (new_layout.term_area.height, new_layout.term_area.width);
+                    if term_size != last_term_size && term_size.0 > 0 && term_size.1 > 0 {
+                        let _ = p.resize(term_size.0, term_size.1);
+                        last_term_size = term_size;
+                    }
+                }
+            }
+            layout = Some(new_layout);
+            dirty = false;
         }
 
         if !event::poll(Duration::from_millis(33)).unwrap_or(false) {
             continue;
         }
 
-        match event::read() {
+        // We have drawn at least once (the first pass starts `dirty`), so a
+        // layout is always available for hit-testing here.
+        let layout = layout.as_ref().expect("a frame is drawn before any event");
+
+        let event = event::read();
+        // Any input we act on — a keypress, a mouse action, or a terminal
+        // resize — changes the next frame, so arm a redraw before dispatching.
+        match &event {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => dirty = true,
+            Ok(Event::Mouse(_)) | Ok(Event::Resize(..)) => dirty = true,
+            _ => {}
+        }
+
+        match event {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 match app.popup.clone() {
                     Popup::Help => {
