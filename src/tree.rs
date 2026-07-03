@@ -15,7 +15,13 @@ impl Node {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        Self { path, name, is_dir, expanded: false, children: None }
+        Self {
+            path,
+            name,
+            is_dir,
+            expanded: false,
+            children: None,
+        }
     }
 
     pub fn load_children(&mut self) {
@@ -209,7 +215,10 @@ mod tests {
         let mut tree = Tree::new(dir.path().to_path_buf());
         let zsub = dir.path().join("zsub");
         tree.node_at_mut(&zsub).unwrap().toggle();
-        let inner = rows_of(&tree).into_iter().find(|r| r.label == "inner.txt").unwrap();
+        let inner = rows_of(&tree)
+            .into_iter()
+            .find(|r| r.label == "inner.txt")
+            .unwrap();
         assert_eq!(inner.depth, 2);
     }
 }

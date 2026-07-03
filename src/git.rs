@@ -60,7 +60,10 @@ impl GitStatuses {
     /// An empty snapshot — what callers get when `root` is not in a git repo,
     /// `git` is missing, or the command fails. No path is ever coloured.
     pub fn empty() -> Self {
-        Self { map: HashMap::new(), ignored_dirs: Vec::new() }
+        Self {
+            map: HashMap::new(),
+            ignored_dirs: Vec::new(),
+        }
     }
 
     /// The status of `path`: an exact change/ignored-file entry, else [`Ignored`]
@@ -81,7 +84,10 @@ impl GitStatuses {
     /// real path comes from [`GitStatuses::load`].
     #[cfg(test)]
     pub fn from_entries(entries: impl IntoIterator<Item = (PathBuf, GitStatus)>) -> Self {
-        Self { map: entries.into_iter().collect(), ignored_dirs: Vec::new() }
+        Self {
+            map: entries.into_iter().collect(),
+            ignored_dirs: Vec::new(),
+        }
     }
 
     /// Build a `git status` snapshot for the tree `root`, combining two sources
@@ -300,7 +306,13 @@ fn porcelain(dir: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["status", "--porcelain", "-z", "--untracked-files=all", "--ignored=matching"])
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -431,8 +443,14 @@ mod tests {
         let st = GitStatuses::load(root);
 
         // Files carry their own status.
-        assert_eq!(st.get(&root.join("src").join("committed.rs")), Some(GitStatus::Modified));
-        assert_eq!(st.get(&root.join("staged").join("new.rs")), Some(GitStatus::Staged));
+        assert_eq!(
+            st.get(&root.join("src").join("committed.rs")),
+            Some(GitStatus::Modified)
+        );
+        assert_eq!(
+            st.get(&root.join("staged").join("new.rs")),
+            Some(GitStatus::Staged)
+        );
         assert_eq!(st.get(&root.join("loose.txt")), Some(GitStatus::Untracked));
 
         // Directories roll up: src/ is red (modified child), staged/ is green.
@@ -458,8 +476,14 @@ mod tests {
         fs::write(root.join("mix").join("b.rs"), "b").unwrap();
 
         let st = GitStatuses::load(root);
-        assert_eq!(st.get(&root.join("mix").join("a.rs")), Some(GitStatus::Staged));
-        assert_eq!(st.get(&root.join("mix").join("b.rs")), Some(GitStatus::Untracked));
+        assert_eq!(
+            st.get(&root.join("mix").join("a.rs")),
+            Some(GitStatus::Staged)
+        );
+        assert_eq!(
+            st.get(&root.join("mix").join("b.rs")),
+            Some(GitStatus::Untracked)
+        );
         assert!(st.get(&root.join("mix")).unwrap().is_red());
     }
 
@@ -485,11 +509,17 @@ mod tests {
         // The ignored directory and everything under it are grey (Ignored),
         // even though git only reported the collapsed directory entry.
         assert_eq!(st.get(&root.join("ignored_dir")), Some(GitStatus::Ignored));
-        assert_eq!(st.get(&root.join("ignored_dir").join("a.log")), Some(GitStatus::Ignored));
+        assert_eq!(
+            st.get(&root.join("ignored_dir").join("a.log")),
+            Some(GitStatus::Ignored)
+        );
         // The single ignored file is grey too.
         assert_eq!(st.get(&root.join("secret.txt")), Some(GitStatus::Ignored));
         // The untracked control file stays red, not grey.
-        assert_eq!(st.get(&root.join("visible.txt")), Some(GitStatus::Untracked));
+        assert_eq!(
+            st.get(&root.join("visible.txt")),
+            Some(GitStatus::Untracked)
+        );
         // Containing an ignored child does not grey the parent (here, the root).
         assert_eq!(st.get(root), None);
     }
@@ -510,7 +540,10 @@ mod tests {
         // its own subtree; the non-repo root and its plain files stay uncoloured.
         let dir = tempdir().unwrap();
         let root = dir.path();
-        assert!(repo_toplevel(root).is_none(), "root must not be a repo for this test");
+        assert!(
+            repo_toplevel(root).is_none(),
+            "root must not be a repo for this test"
+        );
 
         // repo A: <root>/alpha with an untracked file.
         let alpha = root.join("alpha");
@@ -595,7 +628,10 @@ mod tests {
         fs::write(repo.join("inner").join("f.rs"), "x").unwrap(); // untracked in proj
 
         let st = GitStatuses::load(root);
-        assert_eq!(st.get(&repo.join("inner").join("f.rs")), Some(GitStatus::Untracked));
+        assert_eq!(
+            st.get(&repo.join("inner").join("f.rs")),
+            Some(GitStatus::Untracked)
+        );
         assert_eq!(st.get(&repo.join("inner")), Some(GitStatus::Untracked));
     }
 }

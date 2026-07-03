@@ -15,10 +15,10 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, Focus, Popup};
+use crate::app::{col_to_split_pct, App, ChooserRow, Focus, Popup};
 use crate::git::GitStatuses;
 use crate::keys::{encode_key, encode_wheel};
-use crate::pty::{ParserHandle, Pty};
+use crate::pty::{read_screen, ParserHandle, Pty};
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui::{self, Hit, PaneHit};
 
@@ -35,6 +35,34 @@ fn spawn_git_scan(root: PathBuf, tx: Sender<GitStatuses>) {
     thread::spawn(move || {
         let _ = tx.send(GitStatuses::load(&root));
     });
+}
+
+/// Spawn the embedded terminal PTY attached to `session` on `socket`
+/// (`new-session -A` attaches if the session exists, creates it otherwise).
+fn spawn_attached_pty(socket: &str, session: &str) -> io::Result<Pty> {
+    Pty::spawn(
+        &["tmux", "-S", socket, "new-session", "-A", "-s", session],
+        24,
+        80,
+    )
+}
+
+/// Global options every tmux server we talk to must carry. Applied after a
+/// client is attached at startup and re-applied after a respawn (a brand-new
+/// server starts from the user's config, losing them):
+/// - `detach-on-destroy off` / `destroy-unattached off`: keep every session
+///   alive across our own lifetime — never detach a client because its session
+///   was destroyed, and never destroy a session because it has no attached
+///   client (which is exactly what happens to the session we were viewing when
+///   we quit). Only `exit` inside a session ends it. `destroy-unattached`
+///   defaults to off but a user's tmux config can turn it on, so force it.
+/// - `mouse on`: let the embedded client scroll its own scrollback — a
+///   forwarded wheel event puts the pane into copy-mode (showing the old logs)
+///   unless a full-screen app has grabbed the mouse itself.
+fn apply_tmux_options(tmux: &Tmux<SystemRunner>) {
+    let _ = tmux.set_global_option("detach-on-destroy", "off");
+    let _ = tmux.set_global_option("destroy-unattached", "off");
+    let _ = tmux.set_global_option("mouse", "on");
 }
 
 pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
@@ -63,15 +91,18 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut pty: Option<Pty> = None;
     let mut parser: Option<ParserHandle> = None;
     if let Some(name) = &latest {
-        let args = ["tmux", "-S", socket.as_str(), "new-session", "-A", "-s", name.as_str()];
-        match Pty::spawn(&args, 24, 80) {
+        match spawn_attached_pty(&socket, name) {
             Ok(p) => {
                 parser = Some(p.parser());
                 pty = Some(p);
             }
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture
+                );
                 return Err(e);
             }
         }
@@ -87,18 +118,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        // Keep every session alive across our own lifetime: never detach a
-        // client just because its session was destroyed, and never destroy a
-        // session just because it has no attached client (which is exactly what
-        // happens to the session we were viewing when we quit). Only `exit`
-        // inside a session ends it. `destroy-unattached` defaults to off but a
-        // user's tmux config can turn it on, so we force it off to be safe.
-        let _ = app.tmux.set_global_option("detach-on-destroy", "off");
-        let _ = app.tmux.set_global_option("destroy-unattached", "off");
-        // Let the embedded client scroll its own scrollback: with mouse on,
-        // a forwarded wheel event puts the pane into copy-mode (showing the
-        // old logs) unless a full-screen app has grabbed the mouse itself.
-        let _ = app.tmux.set_global_option("mouse", "on");
+        apply_tmux_options(&app.tmux);
     }
     let _ = app.sync();
     // Re-expand the directories the user had open last session.
@@ -123,7 +143,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut area_width: u16 = 0;
     let mut dragging_split = false;
     // Clickable chooser regions: (row y, x start, x end inclusive, the row).
-    let mut chooser_row_ys: Vec<(u16, u16, u16, crate::app::ChooserRow)> = Vec::new();
+    let mut chooser_row_ys: Vec<(u16, u16, u16, ChooserRow)> = Vec::new();
     let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
 
     // The render is by far the most expensive thing this loop does (it copies
@@ -182,7 +202,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             let draw_res = terminal.draw(|f| {
                 area_width = f.area().width;
                 let screen_guard = if app.viewer.is_none() {
-                    parser.as_ref().map(crate::pty::read_screen)
+                    parser.as_ref().map(read_screen)
                 } else {
                     None
                 };
@@ -191,7 +211,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 drop(screen_guard);
                 match &app.popup {
                     Popup::Help => ui::render_help(f, f.area()),
-                    Popup::Chooser { kind, perm, resume, .. } => {
+                    Popup::Chooser {
+                        kind, perm, resume, ..
+                    } => {
                         let focus_row = app.chooser_focus_row();
                         chooser_row_ys = ui::render_chooser(
                             f,
@@ -339,10 +361,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 MouseEventKind::Down(MouseButton::Left) => match app.popup.clone() {
                     Popup::Help => app.popup = Popup::None,
                     Popup::Chooser { .. } => {
-                        match chooser_row_ys
-                            .iter()
-                            .find(|(y, x0, x1, _)| *y == m.row && m.column >= *x0 && m.column <= *x1)
-                        {
+                        match chooser_row_ys.iter().find(|(y, x0, x1, _)| {
+                            *y == m.row && m.column >= *x0 && m.column <= *x1
+                        }) {
                             Some((_, _, _, row)) => {
                                 let _ = app.chooser_click(*row);
                             }
@@ -368,7 +389,13 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         } else if on_border {
                             dragging_split = true;
                         } else {
-                            match ui::resolve_pane_click(m.column, m.row, layout.split_col, &layout.tree, &app.rows) {
+                            match ui::resolve_pane_click(
+                                m.column,
+                                m.row,
+                                layout.split_col,
+                                &layout.tree,
+                                &app.rows,
+                            ) {
                                 PaneHit::Right => app.focus = Focus::Right,
                                 PaneHit::Tree(hit) => {
                                     app.focus = Focus::Tree;
@@ -394,7 +421,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 },
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if dragging_split {
-                        app.split_pct = crate::app::col_to_split_pct(m.column, area_width);
+                        app.split_pct = col_to_split_pct(m.column, area_width);
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
@@ -439,15 +466,12 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         if let Some(slug) = app.pending_respawn.take() {
             let needs_spawn = pty.as_ref().is_none_or(|p| !p.is_alive());
             if needs_spawn {
-                let args = ["tmux", "-S", socket.as_str(), "new-session", "-A", "-s", slug.as_str()];
-                if let Ok(p) = Pty::spawn(&args, 24, 80) {
+                if let Ok(p) = spawn_attached_pty(&socket, &slug) {
                     parser = Some(p.parser());
                     pty = Some(p);
                     last_term_size = (0, 0); // force a resize so the session fills the pane
-                    // A brand-new tmux server lost the global options; re-apply.
-                    let _ = app.tmux.set_global_option("detach-on-destroy", "off");
-                    let _ = app.tmux.set_global_option("destroy-unattached", "off");
-                    let _ = app.tmux.set_global_option("mouse", "on");
+                                             // A brand-new tmux server lost the global options; re-apply.
+                    apply_tmux_options(&app.tmux);
                     app.status = format!("reopened terminal for {slug}");
                 }
             }
@@ -462,7 +486,11 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     }
 
     let restore_raw = disable_raw_mode();
-    let restore_screen = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let restore_screen = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     result.and(restore_raw).and(restore_screen)
 }
 
@@ -476,10 +504,8 @@ fn forward_wheel(pty: &mut Option<Pty>, up: bool, col: u16, row: u16, term: rata
     if !p.is_alive() {
         return;
     }
-    let in_pane = col >= term.x
-        && row >= term.y
-        && col < term.x + term.width
-        && row < term.y + term.height;
+    let in_pane =
+        col >= term.x && row >= term.y && col < term.x + term.width && row < term.y + term.height;
     if !in_pane {
         return;
     }

@@ -47,7 +47,10 @@ pub struct Tmux<R: CommandRunner> {
 
 impl<R: CommandRunner> Tmux<R> {
     pub fn new(socket: impl Into<String>, runner: R) -> Self {
-        Self { socket: socket.into(), runner }
+        Self {
+            socket: socket.into(),
+            runner,
+        }
     }
 
     fn run(&self, extra: &[&str]) -> io::Result<CmdOutput> {
@@ -155,7 +158,12 @@ impl<R: CommandRunner> Tmux<R> {
                     Some((k, d)) => (k.to_string(), d.to_string()),
                     None => (String::new(), String::new()),
                 };
-                Some(SessionInfo { name, dir, kind, command })
+                Some(SessionInfo {
+                    name,
+                    dir,
+                    kind,
+                    command,
+                })
             })
             .collect())
     }
@@ -217,9 +225,10 @@ impl MockRunner {
         Self::default()
     }
     pub fn push(&self, success: bool, stdout: &str) {
-        self.responses
-            .borrow_mut()
-            .push_back(CmdOutput { success, stdout: stdout.to_string() });
+        self.responses.borrow_mut().push_back(CmdOutput {
+            success,
+            stdout: stdout.to_string(),
+        });
     }
     pub fn nth_call(&self, i: usize) -> Vec<String> {
         self.calls.borrow()[i].clone()
@@ -239,7 +248,10 @@ impl CommandRunner for MockRunner {
             .responses
             .borrow_mut()
             .pop_front()
-            .unwrap_or(CmdOutput { success: true, stdout: String::new() }))
+            .unwrap_or(CmdOutput {
+                success: true,
+                stdout: String::new(),
+            }))
     }
 }
 
@@ -277,10 +289,20 @@ mod tests {
         let runner = MockRunner::new();
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
-        tmux.new_session("src", Path::new("/tmp/proj/src"), None).unwrap();
+        tmux.new_session("src", Path::new("/tmp/proj/src"), None)
+            .unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src"]
+            vec![
+                "-S",
+                "runner",
+                "new-session",
+                "-d",
+                "-s",
+                "src",
+                "-c",
+                "/tmp/proj/src"
+            ]
         );
     }
 
@@ -293,7 +315,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "new-session", "-d", "-s", "src", "-c", "/tmp/proj/src", "claude"]
+            vec![
+                "-S",
+                "runner",
+                "new-session",
+                "-d",
+                "-s",
+                "src",
+                "-c",
+                "/tmp/proj/src",
+                "claude"
+            ]
         );
     }
 
@@ -305,7 +337,15 @@ mod tests {
         tmux.switch_client("/dev/ttys003", "src").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "switch-client", "-c", "/dev/ttys003", "-t", "src"]
+            vec![
+                "-S",
+                "runner",
+                "switch-client",
+                "-c",
+                "/dev/ttys003",
+                "-t",
+                "src"
+            ]
         );
     }
 
@@ -340,10 +380,19 @@ mod tests {
         // tests-shell has the newest activity, so it's the one to recover into.
         runner.push(true, "100 src-claude\n145 tests-shell\n90 root-shell\n");
         let tmux = Tmux::new("runner", runner);
-        assert_eq!(tmux.latest_session().unwrap(), Some("tests-shell".to_string()));
+        assert_eq!(
+            tmux.latest_session().unwrap(),
+            Some("tests-shell".to_string())
+        );
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "list-sessions", "-F", "#{session_activity} #{session_name}"]
+            vec![
+                "-S",
+                "runner",
+                "list-sessions",
+                "-F",
+                "#{session_activity} #{session_name}"
+            ]
         );
 
         // No server / no sessions -> None so the caller spawns nothing.
@@ -371,10 +420,19 @@ mod tests {
         let runner = MockRunner::new();
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
-        tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell").unwrap();
+        tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell")
+            .unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "set-option", "-t", "src-shell", "@rm", "shell /tmp/proj/src"]
+            vec![
+                "-S",
+                "runner",
+                "set-option",
+                "-t",
+                "src-shell",
+                "@rm",
+                "shell /tmp/proj/src"
+            ]
         );
     }
 
@@ -387,13 +445,43 @@ mod tests {
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "list-sessions", "-F", "#{session_name}\t#{@rm}\t#{pane_current_command}"]
+            vec![
+                "-S",
+                "runner",
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{@rm}\t#{pane_current_command}"
+            ]
         );
         assert_eq!(infos.len(), 3);
-        assert_eq!(infos[0], SessionInfo { name: "src-claude".into(), dir: "/tmp/proj/src".into(), kind: "claude".into(), command: "node".into() });
-        assert_eq!(infos[1], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into(), command: "vim".into() });
+        assert_eq!(
+            infos[0],
+            SessionInfo {
+                name: "src-claude".into(),
+                dir: "/tmp/proj/src".into(),
+                kind: "claude".into(),
+                command: "node".into()
+            }
+        );
+        assert_eq!(
+            infos[1],
+            SessionInfo {
+                name: "root-shell".into(),
+                dir: "/tmp/proj".into(),
+                kind: "shell".into(),
+                command: "vim".into()
+            }
+        );
         // scratch (no tag) -> empty dir/kind so it won't be adopted into the tree
-        assert_eq!(infos[2], SessionInfo { name: "scratch".into(), dir: String::new(), kind: String::new(), command: "zsh".into() });
+        assert_eq!(
+            infos[2],
+            SessionInfo {
+                name: "scratch".into(),
+                dir: String::new(),
+                kind: String::new(),
+                command: "zsh".into()
+            }
+        );
     }
 
     #[test]
@@ -404,7 +492,15 @@ mod tests {
         runner.push(true, "root-shell\tshell /tmp/proj\n");
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
-        assert_eq!(infos[0], SessionInfo { name: "root-shell".into(), dir: "/tmp/proj".into(), kind: "shell".into(), command: String::new() });
+        assert_eq!(
+            infos[0],
+            SessionInfo {
+                name: "root-shell".into(),
+                dir: "/tmp/proj".into(),
+                kind: "shell".into(),
+                command: String::new()
+            }
+        );
     }
 
     #[test]
@@ -412,7 +508,10 @@ mod tests {
         let runner = MockRunner::new();
         runner.push(true, "src-shell\n");
         let tmux = Tmux::new("runner", runner);
-        assert_eq!(tmux.client_session().unwrap(), Some("src-shell".to_string()));
+        assert_eq!(
+            tmux.client_session().unwrap(),
+            Some("src-shell".to_string())
+        );
         assert_eq!(
             tmux.runner.nth_call(0),
             vec!["-S", "runner", "list-clients", "-F", "#{client_session}"]
@@ -433,7 +532,15 @@ mod tests {
         tmux.send_keys("src", "vi -- a.rs").unwrap();
         assert_eq!(
             tmux.runner.nth_call(0),
-            vec!["-S", "runner", "send-keys", "-t", "src", "vi -- a.rs", "Enter"]
+            vec![
+                "-S",
+                "runner",
+                "send-keys",
+                "-t",
+                "src",
+                "vi -- a.rs",
+                "Enter"
+            ]
         );
     }
 }

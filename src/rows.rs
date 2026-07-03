@@ -57,20 +57,30 @@ pub fn build_project_rows(
                 path: dir.clone(),
                 label,
                 depth: 0,
-                kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
+                kind: RowKind::Session {
+                    slug: s.slug.clone(),
+                    kind: s.kind,
+                },
             });
         }
     }
     out
 }
 
-fn collect(node: &Node, depth: usize, sessions: &HashMap<PathBuf, Vec<SessionRow>>, out: &mut Vec<Row>) {
+fn collect(
+    node: &Node,
+    depth: usize,
+    sessions: &HashMap<PathBuf, Vec<SessionRow>>,
+    out: &mut Vec<Row>,
+) {
     if node.is_dir {
         out.push(Row {
             path: node.path.clone(),
             label: node.name.clone(),
             depth,
-            kind: RowKind::Dir { expanded: node.expanded },
+            kind: RowKind::Dir {
+                expanded: node.expanded,
+            },
         });
         if let Some(sess) = sessions.get(&node.path) {
             for s in sess {
@@ -78,7 +88,10 @@ fn collect(node: &Node, depth: usize, sessions: &HashMap<PathBuf, Vec<SessionRow
                     path: node.path.clone(),
                     label: s.label.clone(),
                     depth: depth + 1,
-                    kind: RowKind::Session { slug: s.slug.clone(), kind: s.kind },
+                    kind: RowKind::Session {
+                        slug: s.slug.clone(),
+                        kind: s.kind,
+                    },
                 });
             }
         }
@@ -116,7 +129,11 @@ mod tests {
         let mut sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
         sessions.insert(
             dir.path().to_path_buf(),
-            vec![SessionRow { slug: "root-shell".into(), kind: SessionKind::Shell, label: "shell".into() }],
+            vec![SessionRow {
+                slug: "root-shell".into(),
+                kind: SessionKind::Shell,
+                label: "shell".into(),
+            }],
         );
         let rows = build_rows(&tree.root, &sessions);
         // row 0 = root dir; row 1 = its shell session (depth 1); row 2 = readme.md (depth 1)
@@ -134,11 +151,19 @@ mod tests {
         let mut sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
         sessions.insert(
             PathBuf::from("/p/src"),
-            vec![SessionRow { slug: "src-claude".into(), kind: SessionKind::Claude, label: "claude".into() }],
+            vec![SessionRow {
+                slug: "src-claude".into(),
+                kind: SessionKind::Claude,
+                label: "claude".into(),
+            }],
         );
         sessions.insert(
             PathBuf::from("/p"),
-            vec![SessionRow { slug: "root-shell".into(), kind: SessionKind::Shell, label: "shell".into() }],
+            vec![SessionRow {
+                slug: "root-shell".into(),
+                kind: SessionKind::Shell,
+                label: "shell".into(),
+            }],
         );
         let mut briefs: HashMap<String, String> = HashMap::new();
         briefs.insert("src-claude".into(), "node".into());
@@ -147,10 +172,22 @@ mod tests {
         // Sorted by dir: "/p" before "/p/src".
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "shell  .");
-        assert!(matches!(rows[0].kind, RowKind::Session { kind: SessionKind::Shell, .. }));
+        assert!(matches!(
+            rows[0].kind,
+            RowKind::Session {
+                kind: SessionKind::Shell,
+                ..
+            }
+        ));
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[1].label, "claude  src  — node");
-        assert!(matches!(rows[1].kind, RowKind::Session { kind: SessionKind::Claude, .. }));
+        assert!(matches!(
+            rows[1].kind,
+            RowKind::Session {
+                kind: SessionKind::Claude,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -163,7 +200,11 @@ mod tests {
         let mut sessions: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
         sessions.insert(
             dir.path().join("sub"),
-            vec![SessionRow { slug: "sub-shell".into(), kind: SessionKind::Shell, label: "shell".into() }],
+            vec![SessionRow {
+                slug: "sub-shell".into(),
+                kind: SessionKind::Shell,
+                label: "shell".into(),
+            }],
         );
         let rows = build_rows(&tree.root, &sessions);
         // 'sub' dir row is present, immediately followed by its session row,

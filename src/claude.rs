@@ -225,10 +225,7 @@ mod tests {
         // Force a definite mtime ordering regardless of filesystem timestamp
         // resolution: old at the epoch, new well after it.
         let epoch = SystemTime::UNIX_EPOCH;
-        fs::File::open(&old)
-            .unwrap()
-            .set_modified(epoch)
-            .unwrap();
+        fs::File::open(&old).unwrap().set_modified(epoch).unwrap();
         fs::File::open(&new)
             .unwrap()
             .set_modified(epoch + std::time::Duration::from_secs(10))

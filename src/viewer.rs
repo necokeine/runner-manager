@@ -18,7 +18,11 @@ impl FileView {
     pub fn load(path: &Path) -> FileView {
         let lines = match std::fs::read(path) {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => text.lines().take(MAX_LINES).map(|l| l.to_string()).collect(),
+                Ok(text) => text
+                    .lines()
+                    .take(MAX_LINES)
+                    .map(|l| l.to_string())
+                    .collect(),
                 Err(_) => vec![format!("<binary file: {}>", name(path))],
             },
             Err(_) => vec![format!("<unable to read: {}>", name(path))],
