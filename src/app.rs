@@ -6,6 +6,7 @@ use crate::claude::ResumeSession;
 use crate::config::Config;
 use crate::git::GitStatuses;
 use crate::rows::{build_project_rows, build_rows, Row, RowKind};
+use crate::select::Selection;
 use crate::session::{SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
 use crate::tree::Tree;
@@ -129,6 +130,11 @@ pub struct App<R: CommandRunner> {
     /// Set when switching/recovering and reconciled against tmux in `sync`;
     /// used to label the terminal pane with that session's directory.
     pub current_session: Option<String>,
+    /// Active mouse text selection over the terminal pane, in pane-relative
+    /// cells. `None` when nothing is selected. Driven by the run loop's
+    /// left-button drag (or double-click word expansion) and painted reversed
+    /// by `ui::render`.
+    pub selection: Option<Selection>,
 }
 
 impl<R: CommandRunner> App<R> {
@@ -171,6 +177,7 @@ impl<R: CommandRunner> App<R> {
             tree_offset: 0,
             pending_respawn: None,
             current_session: None,
+            selection: None,
         };
         app.rebuild_rows();
         app
@@ -277,6 +284,9 @@ impl<R: CommandRunner> App<R> {
 
     fn switch_to(&mut self, slug: &str) -> io::Result<()> {
         self.viewer = None;
+        // The pane is about to show a different session's screen, so any
+        // selection painted over the old one is stale.
+        self.clear_selection();
         // The embedded client is about to show this session (either via
         // switch-client below or after a respawn), so it becomes the one the
         // terminal pane is labelled with.
@@ -469,10 +479,33 @@ impl<R: CommandRunner> App<R> {
     }
 
     pub fn toggle_focus(&mut self) {
+        // Leaving (or re-entering) the terminal pane invalidates any selection
+        // painted over it.
+        self.clear_selection();
         self.focus = match self.focus {
             Focus::Tree => Focus::Right,
             Focus::Right => Focus::Tree,
         };
+    }
+
+    /// Begin a terminal-pane selection covering the single cell `(col, row)`.
+    pub fn begin_selection(&mut self, col: u16, row: u16) {
+        self.selection = Some(Selection::new(col, row));
+    }
+
+    /// Extend the active selection's cursor to pane cell `(col, row)`. No-op
+    /// when no selection is in progress.
+    pub fn update_selection(&mut self, col: u16, row: u16) {
+        if let Some(sel) = &mut self.selection {
+            sel.cursor = (col, row);
+        }
+    }
+
+    /// Drop any selection (and its highlight). Called when the terminal content
+    /// is about to change underneath it — a keystroke, a scroll, a focus flip,
+    /// a session switch.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     /// Scroll the tree by `delta` rows within `view_h` visible rows. Keeps the
@@ -525,6 +558,42 @@ mod tests {
     use crate::tmux::{MockRunner, Tmux};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn selection_lifecycle_begin_update_clear() {
+        let (_dir, mut app) = app_over_tempdir();
+        assert_eq!(app.selection, None);
+        app.begin_selection(3, 1);
+        assert_eq!(app.selection, Some(Selection::new(3, 1)));
+        app.update_selection(7, 2);
+        assert_eq!(
+            app.selection,
+            Some(Selection {
+                anchor: (3, 1),
+                cursor: (7, 2)
+            })
+        );
+        app.clear_selection();
+        assert_eq!(app.selection, None);
+        // update without an active selection stays a no-op.
+        app.update_selection(1, 1);
+        assert_eq!(app.selection, None);
+    }
+
+    #[test]
+    fn selection_clears_on_focus_toggle_and_session_switch() {
+        let (_dir, mut app) = app_over_tempdir();
+        app.begin_selection(0, 0);
+        app.toggle_focus();
+        assert_eq!(app.selection, None);
+
+        // Switching the shown session repaints the pane, so the highlight of
+        // the old screen must go too. `create_src_shell` drives the chooser's
+        // create path, which lands in `switch_to`.
+        app.begin_selection(0, 0);
+        create_src_shell(&mut app);
+        assert_eq!(app.selection, None);
+    }
 
     #[test]
     fn startup_does_not_scan_git_and_apply_git_colours_rows() {
