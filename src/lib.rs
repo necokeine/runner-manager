@@ -2,18 +2,16 @@
 //! an embedded tmux client, so shell/agent task sessions can be started,
 //! switched, and resumed per directory. See `CLAUDE.md`/`README.md` for the
 //! architecture and keybindings.
+//!
+//! Module layout, bottom-up: [`project`] (the project dir on disk), [`tmux`]
+//! (server interaction + session bookkeeping), and [`term`] (the embedded
+//! terminal) are the leaves; [`app`] holds all state and actions over them;
+//! [`ui`] renders that state; [`run`] is the composition root that owns the
+//! real terminal and the event loop.
 
 pub mod app;
-pub mod claude;
-pub mod config;
-pub mod git;
-pub mod keys;
-pub mod lock;
-pub mod pty;
-pub mod rows;
+pub mod project;
 pub mod run;
-pub mod session;
+pub mod term;
 pub mod tmux;
-pub mod tree;
 pub mod ui;
-pub mod viewer;

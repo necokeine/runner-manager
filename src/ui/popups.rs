@@ -10,8 +10,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::ChooserRow;
-use crate::claude::ResumeSession;
-use crate::session::{ClaudePerm, SessionKind};
+use crate::project::claude::ResumeSession;
+use crate::tmux::session::{ClaudePerm, SessionKind};
 
 /// A rect of `percent_x` × `percent_y` of `area`, centered inside it.
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

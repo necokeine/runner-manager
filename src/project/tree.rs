@@ -176,21 +176,26 @@ mod tests {
         dir
     }
 
-    fn rows_of(tree: &Tree) -> Vec<crate::rows::Row> {
-        crate::rows::build_rows(&tree.root, &std::collections::HashMap::new())
+    /// Names of a node's loaded children, in display order.
+    fn child_names(node: &Node) -> Vec<&str> {
+        node.children
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect()
     }
 
     #[test]
     fn root_expands_and_orders_dirs_first_then_alpha() {
         let dir = setup();
         let tree = Tree::new(dir.path().to_path_buf());
-        let rows = rows_of(&tree);
-        // row 0 is the root itself; children follow
-        let names: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
-        let child_names = &names[1..];
-        assert_eq!(child_names, &["asub", "zsub", "readme.md"]);
-        assert!(matches!(rows[1].kind, crate::rows::RowKind::Dir { .. }));
-        assert!(!rows.iter().any(|r| r.label == "inner.txt")); // not expanded yet
+        assert!(tree.root.expanded);
+        assert_eq!(child_names(&tree.root), ["asub", "zsub", "readme.md"]);
+        let kids = tree.root.children.as_deref().unwrap();
+        assert!(kids[0].is_dir && kids[1].is_dir && !kids[2].is_dir);
+        // A subdirectory's own children stay unloaded until its first expand.
+        assert!(kids[1].children.is_none());
     }
 
     #[test]
@@ -198,10 +203,14 @@ mod tests {
         let dir = setup();
         let mut tree = Tree::new(dir.path().to_path_buf());
         let zsub = dir.path().join("zsub");
-        tree.node_at_mut(&zsub).unwrap().toggle(); // expand
-        assert!(rows_of(&tree).iter().any(|r| r.label == "inner.txt"));
-        tree.node_at_mut(&zsub).unwrap().toggle(); // collapse
-        assert!(!rows_of(&tree).iter().any(|r| r.label == "inner.txt"));
+        tree.node_at_mut(&zsub).unwrap().toggle(); // expand: loads children
+        let node = tree.node_at_mut(&zsub).unwrap();
+        assert!(node.expanded);
+        assert_eq!(child_names(node), ["inner.txt"]);
+        tree.node_at_mut(&zsub).unwrap().toggle(); // collapse keeps them loaded
+        let node = tree.node_at_mut(&zsub).unwrap();
+        assert!(!node.expanded);
+        assert!(node.children.is_some());
     }
 
     #[test]
@@ -235,18 +244,5 @@ mod tests {
         let mut tree = Tree::new(dir.path().to_path_buf());
         tree.apply_expanded(&[dir.path().join("does-not-exist")]);
         assert!(tree.expanded_dirs().is_empty());
-    }
-
-    #[test]
-    fn depth_increases_for_children() {
-        let dir = setup();
-        let mut tree = Tree::new(dir.path().to_path_buf());
-        let zsub = dir.path().join("zsub");
-        tree.node_at_mut(&zsub).unwrap().toggle();
-        let inner = rows_of(&tree)
-            .into_iter()
-            .find(|r| r.label == "inner.txt")
-            .unwrap();
-        assert_eq!(inner.depth, 2);
     }
 }

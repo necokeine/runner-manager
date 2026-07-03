@@ -1,19 +1,27 @@
+//! All application state and the action methods the run loop drives —
+//! the view-model layer between the leaf modules ([`crate::project`],
+//! [`crate::tmux`], [`crate::term`]) and the renderer ([`crate::ui`]).
+//! Submodules: the new-session [`chooser`] form, the derived visible
+//! [`rows`], and the right-pane file [`viewer`].
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::claude::ResumeSession;
-use crate::config::Config;
-use crate::git::GitStatuses;
-use crate::rows::{build_project_rows, build_rows, Row, RowKind};
-use crate::session::{SessionKind, SessionStore};
+use crate::app::rows::{build_project_rows, build_rows, Row, RowKind};
+use crate::app::viewer::FileView;
+use crate::project::claude::ResumeSession;
+use crate::project::config::Config;
+use crate::project::git::GitStatuses;
+use crate::project::tree::Tree;
+use crate::tmux::session::{SessionKind, SessionStore};
 use crate::tmux::{CommandRunner, Tmux};
-use crate::tree::Tree;
-use crate::viewer::FileView;
 
 pub mod chooser;
+pub mod rows;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod viewer;
 
 pub use chooser::{ChooserGroup, ChooserRow};
 
@@ -73,7 +81,7 @@ pub enum Popup {
     Chooser {
         dir: PathBuf,
         kind: SessionKind,
-        perm: crate::session::ClaudePerm,
+        perm: crate::tmux::session::ClaudePerm,
         /// Which existing Claude session to resume: `None` = start fresh,
         /// `Some(i)` = resume `App::chooser_resumes[i]`.
         resume: Option<usize>,
@@ -123,7 +131,7 @@ pub struct App<R: CommandRunner> {
     /// persisted. When false the run loop runs no `git status` scans and `git`
     /// stays empty, so the tree renders in its default colours.
     ///
-    /// [`Config::git_status_enabled`]: crate::config::Config::git_status_enabled
+    /// [`Config::git_status_enabled`]: crate::project::config::Config::git_status_enabled
     pub git_enabled: bool,
     /// Cached tty of the embedded tmux client (the `switch-client` target),
     /// refreshed by `ensure_host_tty`. `None` until a client attaches.
@@ -608,7 +616,7 @@ mod tests {
 
     #[test]
     fn startup_does_not_scan_git_and_apply_git_colours_rows() {
-        use crate::git::GitStatus;
+        use crate::project::git::GitStatus;
         use std::process::Command;
         // A real repo with an untracked file: a `git status` scan WOULD colour
         // it. We assert `App::new` does NOT — the scan is deferred to a
@@ -645,7 +653,7 @@ mod tests {
 
     #[test]
     fn git_status_off_by_default_and_toggle_persists_and_clears() {
-        use crate::git::GitStatus;
+        use crate::project::git::GitStatus;
         let (dir, mut app) = app_over_tempdir();
         // Off by default — no persisted `.pjma/git` file exists.
         assert!(!app.git_enabled);

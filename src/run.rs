@@ -17,9 +17,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::{col_to_split_pct, App, ChooserRow, Focus, Popup};
-use crate::git::GitStatuses;
-use crate::keys::{encode_key, encode_wheel};
-use crate::pty::{read_screen, ParserHandle, Pty};
+use crate::project::git::GitStatuses;
+use crate::term::keys::{encode_key, encode_wheel};
+use crate::term::pty::{read_screen, ParserHandle, Pty};
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui::{self, Hit, PaneHit};
 
@@ -129,7 +129,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // Silence the panic message for the vt100 parser panics the reader thread
     // deliberately catches (see `pty::install_panic_filter`); otherwise, during
     // a rapid splitter-drag resize, that message bleeds onto the TUI.
-    crate::pty::install_panic_filter();
+    crate::term::pty::install_panic_filter();
 
     enable_raw_mode()?;
     // From here on, every exit — `?`, early return, or unwind — must restore

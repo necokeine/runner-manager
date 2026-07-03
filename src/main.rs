@@ -2,8 +2,8 @@ use std::env;
 use std::io;
 use std::process::Command;
 
-use runner_manager::config::Config;
-use runner_manager::lock::{InstanceLock, LockError};
+use runner_manager::project::config::Config;
+use runner_manager::project::lock::{InstanceLock, LockError};
 use runner_manager::run;
 
 fn main() -> io::Result<()> {
@@ -62,7 +62,7 @@ fn main() -> io::Result<()> {
     // own socket rather than a shared named one. `RM_SOCKET` can still override
     // with an explicit socket path.
     let socket = env::var("RM_SOCKET").unwrap_or_else(|_| {
-        root.join(runner_manager::config::DIR_NAME)
+        root.join(runner_manager::project::config::DIR_NAME)
             .join("pjma.sock")
             .to_string_lossy()
             .into_owned()
