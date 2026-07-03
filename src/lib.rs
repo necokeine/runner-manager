@@ -1,5 +1,6 @@
 pub mod app;
 pub mod claude;
+pub mod clipboard;
 pub mod config;
 pub mod git;
 pub mod keys;
@@ -7,6 +8,7 @@ pub mod lock;
 pub mod pty;
 pub mod rows;
 pub mod run;
+pub mod select;
 pub mod session;
 pub mod tmux;
 pub mod tree;

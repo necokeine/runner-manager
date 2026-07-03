@@ -69,7 +69,19 @@ runner-manager
 | `Ctrl-q`       | toggle focus between tree and the right pane        |
 | left-click     | focus a pane; in the tree, act on the clicked row   |
 | scroll wheel   | over the tree: scroll it · over the terminal: scroll its history (old logs) |
+| drag in terminal | select text (spans lines); releasing copies it to the system clipboard |
+| double-click in terminal | select the word under the pointer and copy it |
 | drag border    | resize the tree/terminal split                      |
+
+**Copying from a session.** The app captures the mouse, so your terminal
+emulator can't drag-select over the embedded session itself — the in-app
+selection above stands in for it: drag (or double-click a word), and the text
+is already on the system clipboard when you release, via OSC 52 plus the local
+clipboard tool (`pbcopy` / `wl-copy` / `xclip` / `xsel`). Right-click still
+opens your terminal's own context menu (e.g. iTerm2's), and paste works
+everywhere as usual. For the emulator's *native* selection, hold the bypass
+modifier while dragging (`⌥ Option` in iTerm2) — then the right-click menu's
+Copy operates on that native selection too.
 
 The new-session form is laid out as labelled groups (Kind, Permission, Resume,
 and the Cancel/Create buttons) and navigated in two axes:
