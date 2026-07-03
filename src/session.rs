@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Map a root-relative path into a tmux-safe session-name fragment: `/` becomes
+/// `-`, other non-alphanumerics become `_`, and the empty path (the root
+/// itself) becomes `root`.
 pub fn slugify(rel: &str) -> String {
     if rel.is_empty() || rel == "." {
         return "root".to_string();
@@ -24,20 +27,28 @@ pub fn slugify(rel: &str) -> String {
     }
 }
 
+/// What runs inside a task session: a plain shell or one of the agent CLIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
+    /// The user's default shell.
     Shell,
+    /// Claude Code (`claude`).
     Claude,
+    /// OpenAI Codex (`codex`).
     Codex,
 }
 
+/// Claude Code permission mode chosen in the new-session form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudePerm {
+    /// Default permissions (Claude asks before acting).
     Normal,
+    /// `--dangerously-skip-permissions`.
     Skip,
 }
 
 impl SessionKind {
+    /// The kind's short name, used in labels, slugs, and the `@rm` tag.
     pub fn label_base(&self) -> &'static str {
         match self {
             SessionKind::Shell => "shell",
@@ -64,29 +75,48 @@ struct Entry {
     slug: String,
 }
 
+/// One session as shown under its directory in the tree: the tmux slug plus a
+/// display label ("shell", "claude 2", …) numbered per dir+kind by `by_dir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
+    /// The tmux session name.
     pub slug: String,
+    /// What runs inside the session.
     pub kind: SessionKind,
+    /// Display label within the directory group.
     pub label: String,
 }
 
+/// In-memory source of truth for which sessions exist, reconciled against live
+/// tmux state by `sync`/`adopt`.
 #[derive(Default)]
 pub struct SessionStore {
     entries: Vec<Entry>,
 }
 
 impl SessionStore {
+    /// An empty store; sessions arrive via `create` and `adopt`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn create(&mut self, dir: &Path, root: &Path, kind: SessionKind) -> String {
+    /// Register a new session for `dir` and return its unique slug
+    /// (`<dirslug>-<kind>`, suffixed `-2`, `-3`, … on collision). Uniqueness
+    /// considers both tracked entries and `taken` — live tmux session names
+    /// the store doesn't track (untagged/hand-made) — because `new-session`
+    /// hard-fails on a duplicate name.
+    pub fn create(
+        &mut self,
+        dir: &Path,
+        root: &Path,
+        kind: SessionKind,
+        taken: &HashSet<String>,
+    ) -> String {
         let dir_slug = slugify(&dir.strip_prefix(root).unwrap_or(dir).to_string_lossy());
         let base = format!("{dir_slug}-{}", kind.label_base());
         let mut slug = base.clone();
         let mut n = 2;
-        while self.entries.iter().any(|e| e.slug == slug) {
+        while self.entries.iter().any(|e| e.slug == slug) || taken.contains(&slug) {
             slug = format!("{base}-{n}");
             n += 1;
         }
@@ -98,6 +128,8 @@ impl SessionStore {
         slug
     }
 
+    /// Reconcile against the live tmux session set: entries whose session no
+    /// longer exists (its shell exited) are pruned.
     pub fn sync(&mut self, live: &HashSet<String>) {
         self.entries.retain(|e| live.contains(&e.slug));
     }
@@ -138,6 +170,8 @@ impl SessionStore {
             .map(|e| e.dir.as_path())
     }
 
+    /// Group the tracked sessions by directory with display labels numbered
+    /// per dir+kind ("shell", "shell 2", …), for nesting under tree rows.
     pub fn by_dir(&self) -> HashMap<PathBuf, Vec<SessionRow>> {
         let mut map: HashMap<PathBuf, Vec<SessionRow>> = HashMap::new();
         let mut counts: HashMap<(PathBuf, SessionKind), usize> = HashMap::new();
@@ -164,6 +198,23 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// No live-but-untracked sessions — the common case in these tests.
+    fn none() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn store_create_avoids_live_untracked_names() {
+        // A session only the tmux server knows about (untagged/hand-made)
+        // occupies its name; create must step over it or new-session would
+        // fail with "duplicate session" on every retry.
+        let mut s = SessionStore::new();
+        let root = Path::new("/p");
+        let taken: HashSet<String> = ["src-shell".to_string()].into_iter().collect();
+        let slug = s.create(Path::new("/p/src"), root, SessionKind::Shell, &taken);
+        assert_eq!(slug, "src-shell-2");
+    }
+
     #[test]
     fn slugify_basic_and_separators() {
         assert_eq!(slugify("src"), "src");
@@ -184,9 +235,9 @@ mod tests {
     fn store_creates_unique_slugs_per_kind() {
         let mut s = SessionStore::new();
         let root = Path::new("/p");
-        let a = s.create(Path::new("/p/src"), root, SessionKind::Shell);
-        let b = s.create(Path::new("/p/src"), root, SessionKind::Shell);
-        let c = s.create(Path::new("/p/src"), root, SessionKind::Claude);
+        let a = s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
+        let b = s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
+        let c = s.create(Path::new("/p/src"), root, SessionKind::Claude, &none());
         assert_eq!(a, "src-shell");
         assert_eq!(b, "src-shell-2");
         assert_eq!(c, "src-claude");
@@ -196,9 +247,9 @@ mod tests {
     fn store_labels_index_duplicates_by_dir_and_kind() {
         let mut s = SessionStore::new();
         let root = Path::new("/p");
-        s.create(Path::new("/p/src"), root, SessionKind::Shell);
-        s.create(Path::new("/p/src"), root, SessionKind::Shell);
-        s.create(Path::new("/p/src"), root, SessionKind::Claude);
+        s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
+        s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
+        s.create(Path::new("/p/src"), root, SessionKind::Claude, &none());
         let by = s.by_dir();
         let rows = &by[&PathBuf::from("/p/src")];
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
@@ -209,7 +260,7 @@ mod tests {
     fn adopt_adds_untracked_sessions_and_skips_known() {
         let mut s = SessionStore::new();
         let root = Path::new("/p");
-        let existing = s.create(Path::new("/p/src"), root, SessionKind::Shell);
+        let existing = s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
         // a prior-run session (would come back from tmux on restart) plus the
         // already-tracked one; only the new one should be adopted.
         let adopted = s.adopt(&[
@@ -250,7 +301,7 @@ mod tests {
     fn dir_of_returns_session_dir_or_none() {
         let mut s = SessionStore::new();
         let root = Path::new("/p");
-        let slug = s.create(Path::new("/p/src/proto"), root, SessionKind::Shell);
+        let slug = s.create(Path::new("/p/src/proto"), root, SessionKind::Shell, &none());
         assert_eq!(s.dir_of(&slug), Some(Path::new("/p/src/proto")));
         assert_eq!(s.dir_of("nope"), None);
     }
@@ -259,8 +310,8 @@ mod tests {
     fn store_sync_prunes_dead_sessions() {
         let mut s = SessionStore::new();
         let root = Path::new("/p");
-        let a = s.create(Path::new("/p/src"), root, SessionKind::Shell);
-        let _b = s.create(Path::new("/p/src"), root, SessionKind::Claude);
+        let a = s.create(Path::new("/p/src"), root, SessionKind::Shell, &none());
+        let _b = s.create(Path::new("/p/src"), root, SessionKind::Claude, &none());
         let live: std::collections::HashSet<String> = [a.clone()].into_iter().collect();
         s.sync(&live);
         let by = s.by_dir();

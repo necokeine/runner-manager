@@ -318,7 +318,14 @@ fn porcelain(dir: &Path) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok()
+    // Lossy fallback: a non-UTF-8 filename must only lose *its own* colouring
+    // (its key won't match any node path), not disable parsing for the whole
+    // repo. The happy path stays zero-copy — this reruns every ~1 s and the
+    // output can be large.
+    Some(match String::from_utf8(out.stdout) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 /// Parse `git status --porcelain -z` into `(repo-relative path, status)` pairs.

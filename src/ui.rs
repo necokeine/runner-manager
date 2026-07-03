@@ -8,6 +8,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, TreeTab};
 use crate::git::{GitStatus, GitStatuses};
@@ -19,7 +20,9 @@ mod popups;
 
 pub use popups::{centered_rect, render_chooser, render_confirm_close, render_help};
 
+/// Geometry of the rendered tree list, used to map mouse clicks back to rows.
 pub struct ListLayout {
+    /// Screen row of the first visible list row.
     pub origin_y: u16,
     /// Left column of the tree content (inside the border). The `[+]` button sits
     /// right after each directory's name, so its column span is per-row, derived
@@ -29,19 +32,27 @@ pub struct ListLayout {
     /// First row index shown (scroll offset) and the visible row count. Needed
     /// to map a screen row back to its absolute row index when the tree scrolls.
     pub offset: usize,
+    /// Number of visible list rows.
     pub view_h: u16,
 }
 
+/// What a click inside the tree list landed on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
+    /// The row body (select / activate).
     Row(usize),
+    /// A directory's `[+]` new-session button.
     Button(usize),
+    /// A session's `[×]` close button.
     Close(usize),
 }
 
+/// Which pane a click landed in, with the tree hit resolved when applicable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneHit {
+    /// The tree pane; `None` when the click hit no row.
     Tree(Option<Hit>),
+    /// The right (terminal/viewer) pane.
     Right,
 }
 
@@ -53,10 +64,17 @@ pub struct TabBar {
     pub hits: Vec<(u16, u16, TreeTab)>,
 }
 
+/// Everything `run.rs` needs from one rendered frame: the tree geometry for
+/// click resolution, the split column for border drags, the terminal rect for
+/// PTY sizing/wheel forwarding, and the tab bar spans.
 pub struct Layout {
+    /// Tree-list geometry for row/button hit-testing.
     pub tree: ListLayout,
+    /// First column of the right pane (the draggable border sits here).
     pub split_col: u16,
+    /// Inner rect of the right pane the embedded terminal renders into.
     pub term_area: Rect,
+    /// Clickable tab-bar geometry.
     pub tabs: TabBar,
 }
 
@@ -71,6 +89,19 @@ pub fn resolve_tab_click(col: u16, row: u16, tabs: &TabBar) -> Option<TreeTab> {
         .map(|(_, _, tab)| *tab)
 }
 
+/// The payload of the first span `(y, x_start, x_end, payload)` containing the
+/// click at `(col, row)`, x-inclusive. Shared by every popup that returns
+/// clickable spans (the chooser rows, the confirm-close buttons) so their
+/// hit-testing can't drift apart.
+pub fn resolve_span<T>(col: u16, row: u16, spans: &[(u16, u16, u16, T)]) -> Option<&T> {
+    spans
+        .iter()
+        .find(|(y, x0, x1, _)| *y == row && col >= *x0 && col <= *x1)
+        .map(|(_, _, _, payload)| payload)
+}
+
+/// Resolve a click at `(col, row)` against the tree list: a row, one of its
+/// `[+]`/`[×]` buttons, or `None` outside the visible rows.
 pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> Option<Hit> {
     if row < layout.origin_y {
         return None;
@@ -85,18 +116,20 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> O
     }
     // The `[+]` (dir) and `[×]` (session) buttons are drawn right after the
     // row's name (see `row_line`), so each hit region is per-row:
-    // `content_x + <left width> + 1 ..= + 3`.
+    // `content_x + <left width> + 1 ..= + 3`. Measured in display columns, not
+    // chars — a wide (e.g. CJK) name renders more cells than characters, and
+    // the hit span must line up with what's drawn.
     if let Some(r) = rows.get(idx) {
         match &r.kind {
             RowKind::Dir { .. } => {
-                let left = dir_left(r).chars().count() as u16;
+                let left = dir_left(r).width() as u16;
                 let bstart = layout.content_x + left + 1;
                 if col >= bstart && col <= bstart + 2 {
                     return Some(Hit::Button(idx));
                 }
             }
             RowKind::Session { .. } => {
-                let left = session_left(r).chars().count() as u16;
+                let left = session_left(r).width() as u16;
                 let bstart = layout.content_x + left + 1;
                 if col >= bstart && col <= bstart + 2 {
                     return Some(Hit::Close(idx));
@@ -108,6 +141,7 @@ pub fn resolve_click(col: u16, row: u16, layout: &ListLayout, rows: &[Row]) -> O
     Some(Hit::Row(idx))
 }
 
+/// Split a click between the two panes on `split_col`, resolving tree hits.
 pub fn resolve_pane_click(
     col: u16,
     row: u16,
@@ -271,6 +305,10 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
     let mut spans: Vec<Span> = Vec::new();
     let mut hits: Vec<(u16, u16, TreeTab)> = Vec::new();
     let mut x = area.x;
+    // Rendering clips at the pane edge, so the recorded spans must too — a
+    // label spilling past a narrow pane must not register clicks over the
+    // right pane.
+    let right_edge = area.right();
     for (i, tab) in [TreeTab::Directory, TreeTab::Project]
         .into_iter()
         .enumerate()
@@ -288,7 +326,10 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        hits.push((x, x + w.saturating_sub(1), tab));
+        if x < right_edge {
+            let end = (x + w.saturating_sub(1)).min(right_edge.saturating_sub(1));
+            hits.push((x, end, tab));
+        }
         spans.push(Span::styled(text, style));
         x += w;
     }
@@ -296,6 +337,12 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
     TabBar { y: area.y, hits }
 }
 
+/// Draw the whole frame (banner, tabs, tree, right pane) and return the
+/// [`Layout`] geometry `run.rs` uses for mouse hit-testing and PTY sizing.
+/// `screen` is the embedded terminal's vt100 screen — `None` when the viewer
+/// is shown or no session exists yet. Pure rendering: the only state written
+/// back is `app.tree_offset` (the List widget may nudge it to keep the
+/// selection visible).
 pub fn render<R: CommandRunner>(
     f: &mut Frame,
     area: Rect,
@@ -591,6 +638,48 @@ mod tests {
         assert_eq!(resolve_click(7, 3, &layout, &rows), Some(Hit::Row(2)));
         assert_eq!(resolve_click(5, 0, &layout, &rows), None);
         assert_eq!(resolve_click(5, 11, &layout, &rows), None);
+    }
+
+    #[test]
+    fn resolve_click_measures_wide_labels_in_columns() {
+        // "▾ 日本語" renders 8 columns (2 for the icon, 6 for the CJK name)
+        // but is only 5 chars; the `[+]` button is drawn at columns 9-11 and
+        // the hit-test must line up with that, not with the char count.
+        let rows = vec![dir_row("日本語", 0)];
+        let layout = ListLayout {
+            origin_y: 1,
+            content_x: 0,
+            row_count: 1,
+            offset: 0,
+            view_h: 10,
+        };
+        assert_eq!(resolve_click(9, 1, &layout, &rows), Some(Hit::Button(0)));
+        // Where the char-count math used to put the button is just the name.
+        assert_eq!(resolve_click(6, 1, &layout, &rows), Some(Hit::Row(0)));
+    }
+
+    #[test]
+    fn tab_hits_are_clipped_to_the_bar_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // A 12-column pane cuts off " project "; its hit span must not spill
+        // into the columns to the right (the terminal pane).
+        let mut bar = None;
+        let mut terminal = Terminal::new(TestBackend::new(30, 1)).unwrap();
+        terminal
+            .draw(|f| {
+                let narrow = Rect {
+                    x: 0,
+                    y: 0,
+                    width: 12,
+                    height: 1,
+                };
+                bar = Some(render_tabs(f, narrow, TreeTab::Directory));
+            })
+            .unwrap();
+        let bar = bar.unwrap();
+        assert!(bar.hits.iter().all(|(_, end, _)| *end < 12));
+        assert_eq!(resolve_tab_click(14, bar.y, &bar), None);
     }
 
     #[test]

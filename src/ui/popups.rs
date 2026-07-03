@@ -7,11 +7,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::ChooserRow;
 use crate::claude::ResumeSession;
 use crate::session::{ClaudePerm, SessionKind};
 
+/// A rect of `percent_x` × `percent_y` of `area`, centered inside it.
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let v = RtLayout::default()
         .direction(Direction::Vertical)
@@ -32,6 +34,7 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     h[1]
 }
 
+/// Draw the keybinding help overlay (dismissed by any key).
 pub fn render_help(f: &mut Frame, area: Rect) {
     let lines = [
         "j / ↓      move down",
@@ -88,7 +91,7 @@ fn options_line(
             spans.push(Span::raw(" ".repeat(GAP as usize)));
             col += GAP;
         }
-        let w = cell.chars().count() as u16;
+        let w = cell.width() as u16;
         let style = if *row == focus_row {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
@@ -104,8 +107,10 @@ fn options_line(
 /// Draw the new-session form. Options are grouped (Kind / Permission / Resume /
 /// actions); the layout puts each group's label on its own line with its
 /// options laid out horizontally below it, mirroring the navigation model
-/// (Up/Down between groups, Left/Right between options). Returns the clickable
-/// column span `(y, x_start, x_end, row)` of every option for mouse hit-testing.
+/// (Up/Down between groups, Left/Right between options). Returns the popup's
+/// rect plus the clickable column span `(y, x_start, x_end, row)` of every
+/// *drawn* option — lines clipped off a short popup register no hits, so a
+/// click below the popup can never activate an invisible control.
 pub fn render_chooser(
     f: &mut Frame,
     area: Rect,
@@ -114,7 +119,7 @@ pub fn render_chooser(
     resumes: &[ResumeSession],
     resume_sel: Option<usize>,
     focus_row: ChooserRow,
-) -> Vec<(u16, u16, u16, ChooserRow)> {
+) -> (Rect, Vec<(u16, u16, u16, ChooserRow)>) {
     let popup = centered_rect(50, 70, area);
     f.render_widget(Clear, popup);
     let block = Block::default().title("New session").borders(Borders::ALL);
@@ -228,16 +233,30 @@ pub fn render_chooser(
         Style::default().fg(Color::DarkGray),
     )));
 
+    // `Paragraph` silently clips lines below `inner`; drop their hits so an
+    // invisible control can never be clicked (previously a click *below* the
+    // popup could change the resume selection).
+    hits.retain(|(y, _, _, _)| *y < inner.bottom());
+
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
-    hits
+    (popup, hits)
 }
 
-/// Draw the "really close this session?" confirmation. Returns the screen `y` of
-/// each clickable button paired with its choice (`true` = Yes), so `run.rs` can
-/// resolve a mouse click the same way it does the chooser's rows.
-pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, bool)> {
-    let popup = centered_rect(50, 30, area);
+/// Draw the "really close this session?" confirmation. Returns the clickable
+/// column span `(y, x_start, x_end, is_yes)` of each button, so `run.rs` can
+/// resolve a mouse click the same way it does the chooser's rows — only a
+/// click on the button text itself may confirm the (destructive) close.
+pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, u16, u16, bool)> {
+    let mut popup = centered_rect(50, 30, area);
+    // The dialog is 5 fixed lines plus the border; a percentage of a short
+    // terminal is not enough and would clip the buttons. Grow to the needed
+    // height (re-centered) whenever the terminal has room for it.
+    let needed = 7.min(area.height);
+    if popup.height < needed {
+        popup.height = needed;
+        popup.y = area.y + (area.height - needed) / 2;
+    }
     f.render_widget(Clear, popup);
     let block = Block::default()
         .title("Close session")
@@ -246,7 +265,7 @@ pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, 
     f.render_widget(block, popup);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut row_ys: Vec<(u16, bool)> = Vec::new();
+    let mut buttons: Vec<(u16, u16, u16, bool)> = Vec::new();
     let mut y = inner.y;
 
     lines.push(Line::from(format!("Close session \"{slug}\"?")));
@@ -256,14 +275,19 @@ pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, 
     lines.push(Line::from(String::new()));
     y += 1;
     lines.push(Line::from("[ Yes ]   y / Enter".to_string()));
-    row_ys.push((y, true));
+    buttons.push((y, inner.x, inner.x + "[ Yes ]".len() as u16 - 1, true));
     y += 1;
     lines.push(Line::from("[ No ]    n / Esc".to_string()));
-    row_ys.push((y, false));
+    buttons.push((y, inner.x, inner.x + "[ No ]".len() as u16 - 1, false));
+
+    // Same clipping rule as the chooser: a button on a line `Paragraph` clips
+    // off a short popup must not stay clickable — doubly so here, where the
+    // invisible control kills a session.
+    buttons.retain(|(y, _, _, _)| *y < inner.bottom());
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
-    row_ys
+    buttons
 }
 
 /// One-line label for a resumable session: its last prompt, or a short id when
@@ -278,15 +302,27 @@ fn resume_label(s: &ResumeSession, max: usize) -> String {
     truncate(&text, max)
 }
 
-/// Truncate to at most `max` columns, appending '…' when shortened.
+/// Truncate to at most `max` display columns, appending '…' when shortened.
+/// Measured in columns, not chars, so wide (e.g. CJK) labels cannot overflow
+/// the popup border.
 fn truncate(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if text.chars().count() <= max {
+    if text.width() <= max {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    let budget = max.saturating_sub(1);
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
     out.push('…');
     out
 }
@@ -322,7 +358,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                let rows = render_chooser(
+                let (_, rows) = render_chooser(
                     f,
                     f.area(),
                     SessionKind::Claude,
@@ -353,7 +389,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal
             .draw(|f| {
-                let rows = render_chooser(
+                let (_, rows) = render_chooser(
                     f,
                     f.area(),
                     SessionKind::Claude,
@@ -379,12 +415,101 @@ mod tests {
     }
 
     #[test]
+    fn confirm_close_buttons_carry_column_spans() {
+        // A click must land on the button text itself — previously the whole
+        // screen row of "[ Yes ]" confirmed the (destructive) close.
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut buttons = Vec::new();
+        terminal
+            .draw(|f| {
+                buttons = render_confirm_close(f, f.area(), "src-shell");
+            })
+            .unwrap();
+        let yes = buttons.iter().find(|(_, _, _, b)| *b).unwrap();
+        let no = buttons.iter().find(|(_, _, _, b)| !*b).unwrap();
+        assert_eq!((yes.2 - yes.1 + 1) as usize, "[ Yes ]".len());
+        assert_eq!((no.2 - no.1 + 1) as usize, "[ No ]".len());
+        assert_ne!(yes.0, no.0);
+        // The span ends well before the popup's right edge (the shortcut hint
+        // "y / Enter" on the same line is not clickable).
+        assert!(yes.2 < 40);
+    }
+
+    #[test]
+    fn confirm_close_registers_no_buttons_when_clipped() {
+        // On a hopelessly short terminal the button lines are clipped off the
+        // popup; an invisible "[ Yes ]" must not remain clickable.
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        let mut buttons = Vec::new();
+        terminal
+            .draw(|f| {
+                buttons = render_confirm_close(f, f.area(), "src-shell");
+            })
+            .unwrap();
+        assert!(
+            buttons.is_empty(),
+            "clipped buttons must register no hits, got {buttons:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_close_grows_past_the_percent_on_short_terminals() {
+        // At 8 rows the 30%-of-area rect would clip both buttons; the popup
+        // must grow to its fixed content height so Yes AND No stay visible
+        // and clickable.
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut buttons = Vec::new();
+        terminal
+            .draw(|f| {
+                buttons = render_confirm_close(f, f.area(), "src-shell");
+            })
+            .unwrap();
+        assert!(buttons.iter().any(|(_, _, _, yes)| *yes));
+        assert!(buttons.iter().any(|(_, _, _, yes)| !*yes));
+    }
+
+    #[test]
+    fn chooser_registers_no_hits_for_clipped_lines() {
+        // On a short terminal the resume list overflows the popup and is
+        // clipped by Paragraph; the invisible lines must register no hits —
+        // previously a click *below* the popup could change the selection.
+        let resumes: Vec<ResumeSession> = (0..10)
+            .map(|i| ResumeSession {
+                id: format!("00000000-0000-0000-0000-0000000000{i:02}"),
+                last_command: format!("prompt {i}"),
+                modified: std::time::SystemTime::UNIX_EPOCH,
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut popup = Rect::default();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| {
+                (popup, hits) = render_chooser(
+                    f,
+                    f.area(),
+                    SessionKind::Claude,
+                    ClaudePerm::Normal,
+                    &resumes,
+                    None,
+                    ChooserRow::KindClaude,
+                );
+            })
+            .unwrap();
+        let inner_bottom = popup.y + popup.height - 1; // last border row
+        assert!(
+            hits.iter().all(|(y, _, _, _)| *y < inner_bottom),
+            "no hit may lie on or below the popup's bottom border"
+        );
+    }
+
+    #[test]
     fn render_chooser_lays_kind_options_horizontally() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         let mut hits = Vec::new();
         terminal
             .draw(|f| {
-                hits = render_chooser(
+                (_, hits) = render_chooser(
                     f,
                     f.area(),
                     SessionKind::Shell,

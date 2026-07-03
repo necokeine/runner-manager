@@ -47,12 +47,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// Build the config handle for a tree root. Performs no I/O; call
+    /// [`Config::ensure_dir`] before anything needs to be persisted.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let dir = root.join(DIR_NAME);
         Self { root, dir }
     }
 
+    /// The config directory itself (`<root>/.pjma`).
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -69,6 +72,8 @@ impl Config {
 
     /// Load the saved set of expanded directories as absolute paths. A missing
     /// or unreadable state file yields an empty list (nothing pre-expanded).
+    /// Lines that are absolute or escape the root (`..`) — only possible in a
+    /// hand-edited or corrupt file — are dropped rather than joined.
     pub fn load_expanded(&self) -> Vec<PathBuf> {
         let Ok(text) = fs::read_to_string(self.expanded_path()) else {
             return Vec::new();
@@ -76,20 +81,27 @@ impl Config {
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
+            .filter(|l| {
+                Path::new(l)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            })
             .map(|rel| self.root.join(rel))
             .collect()
     }
 
     /// Persist the given expanded directories (absolute paths) as root-relative
-    /// lines, sorted for a stable file. The root itself, and any path outside
-    /// the root, are skipped. Best-effort: the config dir is created first.
+    /// lines, sorted for a stable file. The root itself, any path outside the
+    /// root, and any path whose name contains a newline (which would corrupt
+    /// the line-based format) are skipped. Best-effort: the config dir is
+    /// created first.
     pub fn save_expanded(&self, dirs: &[PathBuf]) -> io::Result<()> {
         self.ensure_dir()?;
         let mut lines: Vec<String> = dirs
             .iter()
             .filter_map(|d| d.strip_prefix(&self.root).ok())
             .map(|rel| rel.to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.contains(['\n', '\r']))
             .collect();
         lines.sort();
         fs::write(self.expanded_path(), lines.join("\n"))
@@ -167,6 +179,33 @@ mod tests {
         // The on-disk form is root-relative, one per line.
         let text = fs::read_to_string(root.join(".pjma").join("expanded")).unwrap();
         assert_eq!(text, "src\nsrc/proto");
+    }
+
+    #[test]
+    fn load_drops_absolute_and_parent_escaping_lines() {
+        // Only reachable via a hand-edited or corrupt state file: an absolute
+        // line would *replace* the root in `root.join`, and `..` would escape
+        // it. Both are dropped instead of joined.
+        let d = tempdir().unwrap();
+        let root = d.path();
+        let cfg = Config::new(root);
+        cfg.ensure_dir().unwrap();
+        fs::write(
+            root.join(".pjma").join("expanded"),
+            "/etc\n../outside\nsrc\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.load_expanded(), vec![root.join("src")]);
+    }
+
+    #[test]
+    fn save_skips_paths_that_would_corrupt_the_line_format() {
+        let d = tempdir().unwrap();
+        let root = d.path();
+        let cfg = Config::new(root);
+        cfg.save_expanded(&[root.join("a\nb"), root.join("ok")])
+            .unwrap();
+        assert_eq!(cfg.load_expanded(), vec![root.join("ok")]);
     }
 
     #[test]

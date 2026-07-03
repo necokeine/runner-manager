@@ -2,9 +2,12 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
+/// Result of one tmux invocation: its exit status and captured stdout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdOutput {
+    /// Whether tmux exited with status 0.
     pub success: bool,
+    /// Captured standard output, lossily decoded as UTF-8.
     pub stdout: String,
 }
 
@@ -21,10 +24,14 @@ pub struct SessionInfo {
     pub command: String,
 }
 
+/// How tmux is actually invoked. Everything downstream is generic over this so
+/// tests can substitute a mock and assert the exact argument vectors.
 pub trait CommandRunner {
+    /// Run `tmux <args>` and report its exit status and stdout.
     fn run(&self, args: &[&str]) -> io::Result<CmdOutput>;
 }
 
+/// The production [`CommandRunner`]: spawns the real `tmux` binary.
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
@@ -46,6 +53,7 @@ pub struct Tmux<R: CommandRunner> {
 }
 
 impl<R: CommandRunner> Tmux<R> {
+    /// Wrap a runner with the socket path every call is prefixed with.
     pub fn new(socket: impl Into<String>, runner: R) -> Self {
         Self {
             socket: socket.into(),
@@ -59,30 +67,59 @@ impl<R: CommandRunner> Tmux<R> {
         self.runner.run(&args)
     }
 
-    pub fn has_session(&self, slug: &str) -> io::Result<bool> {
-        Ok(self.run(&["has-session", "-t", slug])?.success)
+    /// Like [`Tmux::run`] but for mutating commands where a non-zero tmux exit
+    /// status is a real failure (e.g. `new-session` on a duplicate name), not a
+    /// "no server yet" condition to be tolerated. `what` names the operation in
+    /// the error message.
+    fn run_ok(&self, extra: &[&str], what: &str) -> io::Result<()> {
+        if self.run(extra)?.success {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("tmux {what} failed")))
+        }
     }
 
+    /// Create a detached session named `slug` in `dir`, running `command` (or
+    /// the default shell when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` is not valid UTF-8 (tmux takes `-c` as a string), if tmux
+    /// could not be spawned, or if tmux itself rejects the command — most
+    /// notably `duplicate session` when the slug is already taken on the socket.
     pub fn new_session(&self, slug: &str, dir: &Path, command: Option<&str>) -> io::Result<()> {
-        let dir = dir.to_str().unwrap_or(".");
+        let dir = path_str(dir)?;
         let mut args: Vec<&str> = vec!["new-session", "-d", "-s", slug, "-c", dir];
         if let Some(cmd) = command {
             args.push(cmd);
         }
-        self.run(&args)?;
-        Ok(())
+        self.run_ok(&args, "new-session")
     }
 
+    /// Point the client on `tty` at the session named exactly `slug` (the `=`
+    /// prefix disables tmux's prefix-matching, so `src-shell` can never resolve
+    /// to its sibling `src-shell-2` after the exact target is gone).
+    ///
+    /// # Errors
+    ///
+    /// Fails if tmux could not be spawned or exited non-zero (no such session,
+    /// no such client).
     pub fn switch_client(&self, tty: &str, slug: &str) -> io::Result<()> {
-        self.run(&["switch-client", "-c", tty, "-t", slug])?;
-        Ok(())
+        let target = exact(slug);
+        self.run_ok(
+            &["switch-client", "-c", tty, "-t", &target],
+            "switch-client",
+        )
     }
 
     /// Detach the given client (by its tty) from the server without destroying
     /// any session. Used on quit so the server and its sessions outlive us.
+    ///
+    /// # Errors
+    ///
+    /// Fails if tmux could not be spawned or exited non-zero (no such client).
     pub fn detach_client(&self, tty: &str) -> io::Result<()> {
-        self.run(&["detach-client", "-t", tty])?;
-        Ok(())
+        self.run_ok(&["detach-client", "-t", tty], "detach-client")
     }
 
     /// The live session most recently active (highest `session_activity`). Used
@@ -107,6 +144,8 @@ impl<R: CommandRunner> Tmux<R> {
             .map(|(_, name)| name))
     }
 
+    /// Names of all live sessions on the socket; empty when the server is not
+    /// running (a failed `list-sessions` is a normal fresh-start condition).
     pub fn list_sessions(&self) -> io::Result<Vec<String>> {
         let out = self.run(&["list-sessions", "-F", "#{session_name}"])?;
         if !out.success {
@@ -123,17 +162,29 @@ impl<R: CommandRunner> Tmux<R> {
     /// Tag a session with its directory and kind so it can be re-adopted into
     /// the tree on a later run. Stored as one user option `@rm` = "<kind> <dir>"
     /// (kind has no spaces, so the dir is everything after the first space).
+    /// A dir containing a tab or newline would corrupt the tab-delimited
+    /// `list_sessions_full` format, so such a session is left untagged (it
+    /// still works; it just won't be re-adopted on a later run).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` is not valid UTF-8, or if tmux could not be spawned or
+    /// exited non-zero (no such session).
     pub fn tag_session(&self, slug: &str, dir: &Path, kind: &str) -> io::Result<()> {
-        let dir = dir.to_str().unwrap_or(".");
+        let dir = path_str(dir)?;
+        if dir.contains(['\t', '\n']) {
+            return Ok(());
+        }
         let value = format!("{kind} {dir}");
-        self.run(&["set-option", "-t", slug, "@rm", &value])?;
-        Ok(())
+        let target = exact(slug);
+        self.run_ok(&["set-option", "-t", &target, "@rm", &value], "set-option")
     }
 
     /// List live sessions with their `@rm` tag split back into kind + dir, plus
     /// the active pane's foreground command. The three fields are tab-delimited;
-    /// the `@rm` tag itself is "<kind> <dir>" (space-separated, never a tab) and
-    /// a command never contains a tab, so a three-way `splitn` is unambiguous.
+    /// the `@rm` tag itself is "<kind> <dir>" (space-separated, and `tag_session`
+    /// refuses tab-containing dirs) and a command never contains a tab, so a
+    /// three-way `splitn` is unambiguous.
     pub fn list_sessions_full(&self) -> io::Result<Vec<SessionInfo>> {
         let out = self.run(&[
             "list-sessions",
@@ -168,6 +219,9 @@ impl<R: CommandRunner> Tmux<R> {
             .collect())
     }
 
+    /// The tty of the (first) client attached to the socket — the embedded
+    /// client's tty, used as the `-c` target of `switch-client`. `None` when no
+    /// client is attached or the server is not running.
     pub fn host_tty(&self) -> io::Result<Option<String>> {
         let out = self.run(&["list-clients", "-F", "#{client_tty}"])?;
         if !out.success {
@@ -196,20 +250,42 @@ impl<R: CommandRunner> Tmux<R> {
             .find(|l| !l.is_empty()))
     }
 
-    pub fn send_keys(&self, slug: &str, keys: &str) -> io::Result<()> {
-        self.run(&["send-keys", "-t", slug, keys, "Enter"])?;
-        Ok(())
-    }
-
+    /// Destroy the session named exactly `slug` (see [`Tmux::switch_client`]
+    /// for why the target is exact-matched).
+    ///
+    /// # Errors
+    ///
+    /// Fails if tmux could not be spawned or exited non-zero — most commonly
+    /// because the session already exited on its own.
     pub fn kill_session(&self, slug: &str) -> io::Result<()> {
-        self.run(&["kill-session", "-t", slug])?;
-        Ok(())
+        let target = exact(slug);
+        self.run_ok(&["kill-session", "-t", &target], "kill-session")
     }
 
+    /// Set a global server option (`tmux set -g <name> <value>`), e.g.
+    /// `detach-on-destroy off` at startup.
+    ///
+    /// # Errors
+    ///
+    /// Fails if tmux could not be spawned or exited non-zero (unknown option,
+    /// no server).
     pub fn set_global_option(&self, name: &str, value: &str) -> io::Result<()> {
-        self.run(&["set", "-g", name, value])?;
-        Ok(())
+        self.run_ok(&["set", "-g", name, value], "set")
     }
+}
+
+/// An exact-match tmux target for a session name: tmux resolves bare `-t`
+/// targets by prefix when no exact match exists, which is dangerous with our
+/// deliberately prefix-shaped sibling slugs (`src-shell`, `src-shell-2`).
+fn exact(slug: &str) -> String {
+    format!("={slug}")
+}
+
+/// `path` as UTF-8, or an error naming the problem — tmux arguments are
+/// strings, and silently substituting another directory would be worse.
+fn path_str(path: &Path) -> io::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| io::Error::other(format!("non-UTF-8 path: {}", path.display())))
 }
 
 #[cfg(test)]
@@ -259,18 +335,6 @@ impl CommandRunner for MockRunner {
 mod tests {
     use super::*;
     use std::path::Path;
-
-    #[test]
-    fn has_session_prefixes_socket_and_reads_success() {
-        let runner = MockRunner::new();
-        runner.push(true, "");
-        let tmux = Tmux::new("runner", runner);
-        assert!(tmux.has_session("src").unwrap());
-        assert_eq!(
-            tmux.runner.nth_call(0),
-            vec!["-S", "runner", "has-session", "-t", "src"]
-        );
-    }
 
     #[test]
     fn set_global_option_builds_set_g() {
@@ -335,6 +399,8 @@ mod tests {
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
         tmux.switch_client("/dev/ttys003", "src").unwrap();
+        // `=src` forces an exact session-name match; a bare `src` would
+        // prefix-match `src-2` once `src` itself is gone.
         assert_eq!(
             tmux.runner.nth_call(0),
             vec![
@@ -344,9 +410,38 @@ mod tests {
                 "-c",
                 "/dev/ttys003",
                 "-t",
-                "src"
+                "=src"
             ]
         );
+    }
+
+    #[test]
+    fn kill_session_targets_exact_name() {
+        let runner = MockRunner::new();
+        runner.push(true, "");
+        let tmux = Tmux::new("runner", runner);
+        tmux.kill_session("src-shell").unwrap();
+        assert_eq!(
+            tmux.runner.nth_call(0),
+            vec!["-S", "runner", "kill-session", "-t", "=src-shell"]
+        );
+    }
+
+    #[test]
+    fn mutating_commands_surface_tmux_failure() {
+        // A tmux exit status of 1 (e.g. "duplicate session") must become an
+        // Err, not a silent Ok.
+        let runner = MockRunner::new();
+        runner.push(false, "");
+        let tmux = Tmux::new("runner", runner);
+        assert!(tmux
+            .new_session("src", Path::new("/tmp/proj/src"), None)
+            .is_err());
+
+        let runner = MockRunner::new();
+        runner.push(false, "");
+        let tmux = Tmux::new("runner", runner);
+        assert!(tmux.kill_session("src").is_err());
     }
 
     #[test]
@@ -429,11 +524,20 @@ mod tests {
                 "runner",
                 "set-option",
                 "-t",
-                "src-shell",
+                "=src-shell",
                 "@rm",
                 "shell /tmp/proj/src"
             ]
         );
+    }
+
+    #[test]
+    fn tag_session_skips_dirs_that_would_corrupt_the_tag() {
+        let runner = MockRunner::new();
+        let tmux = Tmux::new("runner", runner);
+        tmux.tag_session("x-shell", Path::new("/tmp/a\tb"), "shell")
+            .unwrap();
+        assert_eq!(tmux.runner.call_count(), 0);
     }
 
     #[test]
@@ -522,25 +626,5 @@ mod tests {
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
         assert_eq!(tmux.client_session().unwrap(), None);
-    }
-
-    #[test]
-    fn send_keys_appends_enter() {
-        let runner = MockRunner::new();
-        runner.push(true, "");
-        let tmux = Tmux::new("runner", runner);
-        tmux.send_keys("src", "vi -- a.rs").unwrap();
-        assert_eq!(
-            tmux.runner.nth_call(0),
-            vec![
-                "-S",
-                "runner",
-                "send-keys",
-                "-t",
-                "src",
-                "vi -- a.rs",
-                "Enter"
-            ]
-        );
     }
 }

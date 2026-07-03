@@ -1,6 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender, TryRecvError};
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,13 +66,75 @@ fn apply_tmux_options(tmux: &Tmux<SystemRunner>) {
     let _ = tmux.set_global_option("mouse", "on");
 }
 
+/// Put the user's terminal back into a usable state — cooked mode, main
+/// screen, mouse reporting off — reporting any failure. This is the single
+/// definition of "restore"; every exit path funnels through it.
+fn restore_terminal_checked() -> io::Result<()> {
+    let raw = disable_raw_mode();
+    let screen = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    raw.and(screen)
+}
+
+/// Best-effort [`restore_terminal_checked`] for paths that can't report
+/// (the panic hook, `Drop`). Idempotent.
+fn restore_terminal() {
+    let _ = restore_terminal_checked();
+}
+
+/// Restores the terminal on drop unless defused. Guards every exit from `run`
+/// after raw mode is enabled — including `?`s and early returns added later —
+/// so no path can strand the user's shell on the alternate screen. The normal
+/// teardown defuses it and calls the error-reporting restore itself.
+struct RestoreGuard {
+    defused: bool,
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            restore_terminal();
+        }
+    }
+}
+
+/// Chain a panic hook that restores the terminal before the previous hook
+/// prints the panic message. Without this, a panic on the UI thread unwinds
+/// past the normal teardown and leaves the shell in raw mode on the alternate
+/// screen — with the message drawn there and immediately lost. Only main-thread
+/// panics restore (a background-thread panic doesn't end the process, and
+/// yanking the alternate screen away from a still-running UI would be worse).
+/// Must be installed *before* `pty::install_panic_filter` so the filter's
+/// silence check runs first and skips this hook for the vt100 panics that are
+/// deliberately caught while the UI keeps running.
+fn install_restore_on_panic() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if thread::current().name() == Some("main") {
+                restore_terminal();
+            }
+            prev(info);
+        }));
+    });
+}
+
+/// Set up the terminal and drive the whole TUI until the user quits: draws via
+/// `ui::render`, routes key/mouse events by popup and focus, forwards
+/// keystrokes to the embedded PTY, and runs the periodic tmux sync and
+/// background git scans. Returns when `q` is pressed or on a terminal I/O
+/// error, restoring the terminal either way.
 pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
+    install_restore_on_panic();
     // Silence the panic message for the vt100 parser panics the reader thread
     // deliberately catches (see `pty::install_panic_filter`); otherwise, during
     // a rapid splitter-drag resize, that message bleeds onto the TUI.
     crate::pty::install_panic_filter();
 
     enable_raw_mode()?;
+    // From here on, every exit — `?`, early return, or unwind — must restore
+    // the terminal; the guard makes that structural instead of per-call-site.
+    let mut guard = RestoreGuard { defused: false };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -101,15 +164,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 parser = Some(p.parser());
                 pty = Some(p);
             }
-            Err(e) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(
-                    terminal.backend_mut(),
-                    LeaveAlternateScreen,
-                    DisableMouseCapture
-                );
-                return Err(e);
-            }
+            Err(e) => return Err(e), // the guard restores the terminal
         }
     }
 
@@ -147,9 +202,13 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     let mut last_sync = Instant::now();
     let mut area_width: u16 = 0;
     let mut dragging_split = false;
-    // Clickable chooser regions: (row y, x start, x end inclusive, the row).
+    // Clickable chooser regions: (row y, x start, x end inclusive, the row),
+    // plus the popup rect so a click inside it that misses every control is a
+    // harmless no-op rather than a cancel.
+    let mut chooser_rect = ratatui::layout::Rect::default();
     let mut chooser_row_ys: Vec<(u16, u16, u16, ChooserRow)> = Vec::new();
-    let mut confirm_row_ys: Vec<(u16, bool)> = Vec::new();
+    // Confirm-close buttons: (row y, x start, x end inclusive, true = Yes).
+    let mut confirm_buttons: Vec<(u16, u16, u16, bool)> = Vec::new();
 
     // The render is by far the most expensive thing this loop does (it copies
     // the whole embedded-terminal grid and rebuilds every widget), so we only
@@ -220,7 +279,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         kind, perm, resume, ..
                     } => {
                         let focus_row = app.chooser_focus_row();
-                        chooser_row_ys = ui::render_chooser(
+                        (chooser_rect, chooser_row_ys) = ui::render_chooser(
                             f,
                             f.area(),
                             *kind,
@@ -231,7 +290,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         );
                     }
                     Popup::ConfirmClose { slug } => {
-                        confirm_row_ys = ui::render_confirm_close(f, f.area(), slug);
+                        confirm_buttons = ui::render_confirm_close(f, f.area(), slug);
                     }
                     Popup::None => {}
                 }
@@ -254,8 +313,12 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             dirty = false;
         }
 
-        if !event::poll(Duration::from_millis(33)).unwrap_or(false) {
-            continue;
+        match event::poll(Duration::from_millis(33)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // A persistently failing poll would otherwise spin this loop at
+            // 100% CPU with no way to quit; treat it like a read error.
+            Err(e) => break Err(e),
         }
 
         // We have drawn at least once (the first pass starts `dirty`), so a
@@ -366,21 +429,26 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 MouseEventKind::Down(MouseButton::Left) => match app.popup.clone() {
                     Popup::Help => app.popup = Popup::None,
                     Popup::Chooser { .. } => {
-                        match chooser_row_ys.iter().find(|(y, x0, x1, _)| {
-                            *y == m.row && m.column >= *x0 && m.column <= *x1
-                        }) {
-                            Some((_, _, _, row)) => {
+                        match ui::resolve_span(m.column, m.row, &chooser_row_ys) {
+                            Some(row) => {
                                 let _ = app.chooser_click(*row);
                             }
-                            None => app.chooser_cancel(),
+                            // A miss inside the popup (a group label, a blank
+                            // line) keeps the form; only a click outside
+                            // cancels it.
+                            None if !chooser_rect.contains((m.column, m.row).into()) => {
+                                app.chooser_cancel()
+                            }
+                            None => {}
                         }
                     }
                     Popup::ConfirmClose { .. } => {
-                        match confirm_row_ys.iter().find(|(y, _)| *y == m.row) {
-                            Some((_, true)) => {
+                        // Only a click on the "[ Yes ]" text itself confirms
+                        // the kill; the No button or anywhere else dismisses.
+                        match ui::resolve_span(m.column, m.row, &confirm_buttons) {
+                            Some(true) => {
                                 let _ = app.confirm_close();
                             }
-                            // The No button or anywhere else dismisses.
                             _ => app.cancel_close(),
                         }
                     }
@@ -490,13 +558,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         let _ = app.tmux.detach_client(&tty);
     }
 
-    let restore_raw = disable_raw_mode();
-    let restore_screen = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    result.and(restore_raw).and(restore_screen)
+    // Normal teardown reports restore failures instead of swallowing them, so
+    // defuse the guard and run the checked restore directly.
+    guard.defused = true;
+    result.and(restore_terminal_checked())
 }
 
 /// Forward a mouse-wheel tick to the embedded terminal, but only when a live

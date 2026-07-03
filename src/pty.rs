@@ -15,6 +15,10 @@ use tui_term::vt100;
 /// the screen out). Optional in `run.rs`: `None` when no embedded client exists.
 pub type ParserHandle = Arc<RwLock<vt100::Parser>>;
 
+/// The one embedded terminal: a PTY running the tmux client, a reader thread
+/// feeding its output into a shared vt100 parser, and the write half for
+/// forwarding keystrokes. Dropping it kills the child process (the reader
+/// thread then exits on the resulting EOF).
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -28,7 +32,17 @@ pub struct Pty {
     ///
     /// [`take_dirty`]: Pty::take_dirty
     dirty: Arc<AtomicBool>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // portable-pty children do not die with their handle; without this a
+        // dropped-but-live Pty would leak the tmux client process and leave the
+        // reader thread blocked forever. Killing an already-exited child (the
+        // normal respawn/quit paths) is a harmless no-op error.
+        let _ = self.child.kill();
+    }
 }
 
 /// Acquire the parser for reading, recovering the guard if a previous panic
@@ -108,7 +122,17 @@ fn feed(parser: &Arc<RwLock<vt100::Parser>>, bytes: &[u8]) {
 }
 
 impl Pty {
+    /// Spawn `args` (program + arguments) on a fresh PTY of `rows`×`cols` and
+    /// start the reader thread that keeps the shared parser current.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `args` is empty, or if the PTY cannot be opened or the command
+    /// spawned.
     pub fn spawn(args: &[&str], rows: u16, cols: u16) -> io::Result<Self> {
+        let (program, rest) = args.split_first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Pty::spawn needs a program")
+        })?;
         let pty_system = native_pty_system();
         let size = PtySize {
             rows,
@@ -120,8 +144,8 @@ impl Pty {
             .openpty(size)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let mut cmd = CommandBuilder::new(args[0]);
-        cmd.args(&args[1..]);
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(rest);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -175,7 +199,7 @@ impl Pty {
             parser,
             alive,
             dirty,
-            _child: child,
+            child,
         })
     }
 
@@ -194,6 +218,8 @@ impl Pty {
         self.dirty.swap(false, Ordering::SeqCst)
     }
 
+    /// Forward `bytes` (encoded keystrokes) to the child; empty input is a
+    /// no-op.
     pub fn write_input(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -202,6 +228,7 @@ impl Pty {
         self.writer.flush()
     }
 
+    /// Resize both the PTY (so the child sees SIGWINCH) and the parser screen.
     pub fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         self.master
             .resize(PtySize {
@@ -216,6 +243,7 @@ impl Pty {
         Ok(())
     }
 
+    /// A shared handle to the vt100 parser for the render loop.
     pub fn parser(&self) -> ParserHandle {
         Arc::clone(&self.parser)
     }
@@ -224,6 +252,16 @@ impl Pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_with_no_program_is_an_error_not_a_panic() {
+        // The empty-args guard runs before any PTY is opened, so this is safe
+        // to exercise without a terminal.
+        match Pty::spawn(&[], 24, 80) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("empty argv must be rejected"),
+        }
+    }
 
     fn new_parser() -> Arc<RwLock<vt100::Parser>> {
         Arc::new(RwLock::new(vt100::Parser::new(24, 80, 0)))

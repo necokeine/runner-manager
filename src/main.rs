@@ -67,10 +67,8 @@ fn main() -> io::Result<()> {
             .to_string_lossy()
             .into_owned()
     });
-    let result = run::run(root, socket);
-    // `_lock` lives until here, releasing the flock as the process exits.
-    drop(_lock);
-    result
+    // `_lock` stays alive until `main` returns, releasing the flock on exit.
+    run::run(root, socket)
 }
 
 /// Probe for a usable `tmux` binary before we touch the terminal. tmux is the

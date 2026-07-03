@@ -134,8 +134,21 @@ mod tests {
         let first = InstanceLock::try_acquire(d.path()).unwrap();
         drop(first);
         // Once the holder is dropped the fd closes and the flock is released, so
-        // a fresh acquire on the same dir succeeds.
-        InstanceLock::try_acquire(d.path()).expect("reacquire after drop should succeed");
+        // a fresh acquire on the same dir succeeds. Retry briefly on `Held`:
+        // other tests in this binary fork children (git, PTY spawns), and a
+        // fork between our acquire and drop duplicates the locked fd into the
+        // child until its exec closes it (CLOEXEC), transiently keeping the
+        // flock alive from another process.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match InstanceLock::try_acquire(d.path()) {
+                Ok(_) => break,
+                Err(LockError::Held) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("reacquire after drop should succeed: {e:?}"),
+            }
+        }
     }
 
     #[test]

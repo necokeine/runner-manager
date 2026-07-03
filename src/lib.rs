@@ -1,3 +1,8 @@
+//! runner-manager: a NERDTree-style TUI that pairs a lazy filesystem tree with
+//! an embedded tmux client, so shell/agent task sessions can be started,
+//! switched, and resumed per directory. See `CLAUDE.md`/`README.md` for the
+//! architecture and keybindings.
+
 pub mod app;
 pub mod claude;
 pub mod config;

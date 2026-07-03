@@ -1,15 +1,28 @@
+//! Lazy filesystem tree for the left pane: children are read from disk on
+//! first expand, directories sorted before files. The expanded set can be
+//! collected (`expanded_dirs`) and re-applied (`apply_expanded`) so it
+//! survives restarts via `config.rs`.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// One entry in the tree: a directory (expandable, children loaded lazily) or
+/// a file.
 pub struct Node {
+    /// Absolute path of the entry.
     pub path: PathBuf,
+    /// Display name (the final path component).
     pub name: String,
+    /// Whether this is a directory (files never expand).
     pub is_dir: bool,
+    /// Whether this directory is currently expanded in the view.
     pub expanded: bool,
+    /// Child entries: `None` until first loaded (see [`Node::load_children`]).
     pub children: Option<Vec<Node>>,
 }
 
 impl Node {
+    /// A collapsed node for `path` with no children loaded yet.
     pub fn new(path: PathBuf, is_dir: bool) -> Self {
         let name = path
             .file_name()
@@ -24,6 +37,9 @@ impl Node {
         }
     }
 
+    /// Read this directory's entries from disk, directories first then files,
+    /// both alphabetical (case-insensitive). An unreadable directory (e.g.
+    /// permission denied) loads as empty rather than erroring. No-op on files.
     pub fn load_children(&mut self) {
         if !self.is_dir {
             return;
@@ -44,6 +60,8 @@ impl Node {
         self.children = Some(entries);
     }
 
+    /// Flip a directory between expanded and collapsed, loading its children on
+    /// the first expand. No-op on files.
     pub fn toggle(&mut self) {
         if !self.is_dir {
             return;
@@ -59,11 +77,15 @@ impl Node {
     }
 }
 
+/// The whole tree; the root node is always expanded.
 pub struct Tree {
+    /// The root directory node.
     pub root: Node,
 }
 
 impl Tree {
+    /// Build a tree rooted at `root_path` with the first level loaded and the
+    /// root expanded.
     pub fn new(root_path: PathBuf) -> Self {
         let mut root = Node::new(root_path, true);
         root.load_children();
@@ -71,6 +93,7 @@ impl Tree {
         Self { root }
     }
 
+    /// The loaded node whose path is exactly `path`, if present.
     pub fn node_at_mut(&mut self, path: &Path) -> Option<&mut Node> {
         Self::find_mut(&mut self.root, path)
     }
@@ -121,6 +144,11 @@ impl Tree {
     fn find_mut<'a>(node: &'a mut Node, path: &Path) -> Option<&'a mut Node> {
         if node.path == path {
             return Some(node);
+        }
+        // Every descendant's path starts with the node's own, so a mismatch
+        // prunes the whole subtree instead of walking it.
+        if !path.starts_with(&node.path) {
+            return None;
         }
         if let Some(children) = node.children.as_mut() {
             for c in children.iter_mut() {

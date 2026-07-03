@@ -32,9 +32,13 @@ pub fn col_to_split_pct(col: u16, width: u16) -> u16 {
     pct.clamp(MIN_SPLIT, MAX_SPLIT)
 }
 
+/// Which pane owns the keyboard: the tree list or the right (terminal/viewer)
+/// pane. Toggled with Tab and by activating a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    /// The left tree/session list receives navigation keys.
     Tree,
+    /// The right pane receives keys (forwarded to the PTY, or viewer scrolling).
     Right,
 }
 
@@ -57,10 +61,15 @@ impl TreeTab {
     }
 }
 
+/// The modal overlay currently shown, if any. While a popup is open it owns
+/// all key and mouse input (see the routing in `run.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
+    /// No popup; input goes to the focused pane.
     None,
+    /// The keybinding help overlay.
     Help,
+    /// The new-session form (kind / permission / resume radio groups).
     Chooser {
         dir: PathBuf,
         kind: SessionKind,
@@ -78,18 +87,25 @@ pub enum Popup {
     /// "Really close this session?" — opened by `x`/`[×]`, resolved by
     /// `confirm_close`/`cancel_close`. Keyed off the slug (not a row index) so a
     /// periodic `sync` between opening and confirming can't redirect the kill.
-    ConfirmClose {
-        slug: String,
-    },
+    ConfirmClose { slug: String },
 }
 
+/// All application state plus the action methods the run loop drives. Generic
+/// over the [`CommandRunner`] so tests can run against a mock tmux.
 pub struct App<R: CommandRunner> {
+    /// The lazy filesystem tree under `root`.
     pub tree: Tree,
+    /// In-memory source of truth for which sessions exist (see `session.rs`).
     pub store: SessionStore,
+    /// All tmux interaction, prefixed with this project's socket.
     pub tmux: Tmux<R>,
+    /// The per-project config dir (`<root>/.pjma`) and its persisted state.
     pub config: Config,
+    /// The tree root — the working directory the app was started in.
     pub root: PathBuf,
+    /// Index of the selected row in `rows`.
     pub selected: usize,
+    /// The flattened, visible row list — derived state; see [`App::rebuild_rows`].
     pub rows: Vec<Row>,
     /// Which left-pane view is active. The directory tree and the flat session
     /// list share the `rows`/`selected` machinery; `rebuild_rows` fills `rows`
@@ -109,14 +125,21 @@ pub struct App<R: CommandRunner> {
     ///
     /// [`Config::git_status_enabled`]: crate::config::Config::git_status_enabled
     pub git_enabled: bool,
+    /// Cached tty of the embedded tmux client (the `switch-client` target),
+    /// refreshed by `ensure_host_tty`. `None` until a client attaches.
     pub host_tty: Option<String>,
+    /// When `Some`, the right pane shows this file instead of the terminal.
     pub viewer: Option<FileView>,
+    /// Which pane currently receives keyboard input.
     pub focus: Focus,
+    /// The modal overlay currently shown, if any.
     pub popup: Popup,
     /// Resumable Claude sessions for the directory the chooser is open on,
     /// discovered when the chooser opens. Indexed by `ChooserRow::Resume`.
     pub chooser_resumes: Vec<ResumeSession>,
+    /// One-line message shown in the status bar (last action or error).
     pub status: String,
+    /// Width of the tree pane as a percent of the terminal, clamped 15–80.
     pub split_pct: u16,
     /// Index of the first tree row shown (scroll position). Reconciled against
     /// the real viewport height in `ui::render`; driven by the mouse wheel.
@@ -129,9 +152,17 @@ pub struct App<R: CommandRunner> {
     /// Set when switching/recovering and reconciled against tmux in `sync`;
     /// used to label the terminal pane with that session's directory.
     pub current_session: Option<String>,
+    /// Every live session name on the socket as of the last `sync` — including
+    /// untagged ones the store never adopts. `create_session` dedupes new
+    /// slugs against this set, since a name only the tmux server knows about
+    /// would make `new-session` fail on every retry.
+    pub live_sessions: HashSet<String>,
 }
 
 impl<R: CommandRunner> App<R> {
+    /// Build the initial state over `root`: tree loaded one level deep,
+    /// persisted split width and git toggle restored, no sessions yet (the
+    /// first `sync` adopts live ones). Performs no git or tmux I/O.
     pub fn new(root: PathBuf, tmux: Tmux<R>) -> Self {
         let tree = Tree::new(root.clone());
         let config = Config::new(root.clone());
@@ -171,6 +202,7 @@ impl<R: CommandRunner> App<R> {
             tree_offset: 0,
             pending_respawn: None,
             current_session: None,
+            live_sessions: HashSet::new(),
         };
         app.rebuild_rows();
         app
@@ -190,13 +222,16 @@ impl<R: CommandRunner> App<R> {
         let _ = self.config.save_expanded(&self.tree.expanded_dirs());
     }
 
+    /// Re-derive `rows` from the tree, sessions, and active tab, and clamp the
+    /// selection into range. Must be called after any tree expand/collapse or
+    /// session change — `rows` is derived state.
     pub fn rebuild_rows(&mut self) {
         self.rows = match self.tab {
             TreeTab::Directory => build_rows(&self.tree.root, &self.store.by_dir()),
             TreeTab::Project => build_project_rows(&self.store.by_dir(), &self.root, &self.briefs),
         };
-        if !self.rows.is_empty() && self.selected >= self.rows.len() {
-            self.selected = self.rows.len() - 1;
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len().saturating_sub(1);
         }
     }
 
@@ -220,16 +255,19 @@ impl<R: CommandRunner> App<R> {
         self.set_tab(next);
     }
 
+    /// The currently selected row, if any rows exist.
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.selected)
     }
 
+    /// Move the selection up one row, stopping at the top.
     pub fn up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
         }
     }
 
+    /// Move the selection down one row, stopping at the bottom.
     pub fn down(&mut self) {
         if self.selected + 1 < self.rows.len() {
             self.selected += 1;
@@ -265,8 +303,17 @@ impl<R: CommandRunner> App<R> {
         kind: SessionKind,
         command: Option<&str>,
     ) -> io::Result<()> {
-        let slug = self.store.create(dir, &self.root, kind);
-        self.tmux.new_session(&slug, dir, command)?;
+        let slug = self
+            .store
+            .create(dir, &self.root, kind, &self.live_sessions);
+        if let Err(e) = self.tmux.new_session(&slug, dir, command) {
+            // Roll back the speculative store entry (it would otherwise occupy
+            // the slug until the next sync prunes it) and tell the user —
+            // callers discard the Err, so the status line is the only feedback.
+            self.store.remove(&slug);
+            self.status = format!("could not start {}: {e}", kind.label_base());
+            return Err(e);
+        }
         // Tag the session so a later run can re-adopt it into the tree.
         let _ = self.tmux.tag_session(&slug, dir, kind.label_base());
         self.rebuild_rows();
@@ -276,25 +323,34 @@ impl<R: CommandRunner> App<R> {
     }
 
     fn switch_to(&mut self, slug: &str) -> io::Result<()> {
+        // Talk to tmux first and only commit UI state once the client is (or is
+        // about to be) showing the session — otherwise a failed switch leaves
+        // the pane labelled with a session the client never moved to.
+        let switched = self.ensure_host_tty().and_then(|tty| match tty {
+            Some(tty) => self.tmux.switch_client(&tty, slug).map(|()| true),
+            None => Ok(false),
+        });
+        match switched {
+            Ok(true) => self.status = format!("switched to {slug}"),
+            Ok(false) => {
+                // No client attached means the embedded terminal PTY exited
+                // after the last session was destroyed. Ask the run loop to
+                // respawn it attached to this session.
+                self.pending_respawn = Some(slug.to_string());
+                self.status = "reopening terminal".to_string();
+            }
+            Err(e) => {
+                self.status = format!("switch to {slug} failed: {e}");
+                return Err(e);
+            }
+        }
         self.viewer = None;
-        // The embedded client is about to show this session (either via
-        // switch-client below or after a respawn), so it becomes the one the
-        // terminal pane is labelled with.
+        // The embedded client now shows (or will show, after the respawn) this
+        // session, so it becomes the one the terminal pane is labelled with.
         self.current_session = Some(slug.to_string());
         // Selecting a session means the user wants to work in it, so hand
-        // keyboard focus to the terminal pane right away (bug: focus used to
-        // stay on the tree after picking a session).
+        // keyboard focus to the terminal pane right away.
         self.focus = Focus::Right;
-        if let Some(tty) = self.ensure_host_tty()? {
-            self.tmux.switch_client(&tty, slug)?;
-            self.status = format!("switched to {slug}");
-        } else {
-            // No client attached means the embedded terminal PTY exited after
-            // the last session was destroyed. Ask the run loop to respawn it
-            // attached to this session so the right pane fills again.
-            self.pending_respawn = Some(slug.to_string());
-            self.status = "reopening terminal".to_string();
-        }
         Ok(())
     }
 
@@ -312,9 +368,16 @@ impl<R: CommandRunner> App<R> {
             return Ok(());
         };
         let slug = slug.clone();
-        self.tmux.kill_session(&slug)?;
+        // Drop the row whether or not the kill succeeded: the usual failure is
+        // "session already exited" (its shell quit inside the confirm window),
+        // where removing matches reality; if it was somehow alive, the next
+        // sync re-adopts it. Either way the user gets immediate feedback —
+        // callers discard the Result, so the status line is the only channel.
+        match self.tmux.kill_session(&slug) {
+            Ok(()) => self.status = format!("closed {slug}"),
+            Err(e) => self.status = format!("close {slug} failed: {e}"),
+        }
         self.store.remove(&slug);
-        self.status = format!("closed {slug}");
         self.rebuild_rows();
         Ok(())
     }
@@ -357,11 +420,15 @@ impl<R: CommandRunner> App<R> {
         self.popup = Popup::None;
     }
 
+    /// Show `path` in the right-pane file viewer (replacing the terminal view
+    /// until the next session switch).
     pub fn open_file(&mut self, path: &Path) {
         self.viewer = Some(FileView::load(path));
         self.status = format!("viewing {}", path.display());
     }
 
+    /// Scroll the file viewer by one step (or a 10-row page): `delta < 0` is
+    /// up, anything else down. No-op when no viewer is open.
     pub fn viewer_scroll(&mut self, delta: i32, page: bool) {
         if let Some(v) = &mut self.viewer {
             let step = if page { 10 } else { 1 };
@@ -373,6 +440,11 @@ impl<R: CommandRunner> App<R> {
         }
     }
 
+    /// Reconcile against live tmux state; called ~once/second by the run loop.
+    /// Re-adopts tagged sessions from a prior run, prunes rows whose session
+    /// exited, refreshes the per-session briefs, and follows the embedded
+    /// client's real session (it can move on its own via `detach-on-destroy
+    /// off`). Deliberately does **no** git work — see [`App::apply_git`].
     pub fn sync(&mut self) -> io::Result<()> {
         let infos = self.tmux.list_sessions_full()?;
         // Re-adopt sessions this tool created on a prior run (those tagged with a
@@ -399,6 +471,9 @@ impl<R: CommandRunner> App<R> {
             .collect();
         let live: HashSet<String> = infos.into_iter().map(|i| i.name).collect();
         self.store.sync(&live);
+        // Remember every live name — untagged ones included — so create_session
+        // never picks a slug the server already has (see `live_sessions`).
+        self.live_sessions = live;
         // Track which session the embedded client actually shows. It can change
         // without a `switch_to` — when the viewed session's shell exits,
         // `detach-on-destroy off` switches the client to another session — so
@@ -415,13 +490,13 @@ impl<R: CommandRunner> App<R> {
         Ok(())
     }
 
-    /// Install a git-status snapshot computed off the UI thread and rebuild the
-    /// derived rows so the new colours show. The run loop calls this when a
-    /// background `GitStatuses::load` finishes; the scan never runs inline
-    /// because it can take seconds on a parent-of-many-repos tree.
+    /// Install a git-status snapshot computed off the UI thread; the colours
+    /// show on the next frame (`ui::render` styles each row from `self.git`,
+    /// so no row rebuild is needed). The run loop calls this when a background
+    /// `GitStatuses::load` finishes; the scan never runs inline because it can
+    /// take seconds on a parent-of-many-repos tree.
     pub fn apply_git(&mut self, git: GitStatuses) {
         self.git = git;
-        self.rebuild_rows();
     }
 
     /// Toggle git-status colouring, persist the new state, and return whether it
@@ -436,7 +511,6 @@ impl<R: CommandRunner> App<R> {
         let _ = self.config.save_git_status(self.git_enabled);
         if !self.git_enabled {
             self.git = GitStatuses::empty();
-            self.rebuild_rows();
         }
         self.status = if self.git_enabled {
             "git status: on".into()
@@ -468,6 +542,7 @@ impl<R: CommandRunner> App<R> {
         }
     }
 
+    /// Move keyboard focus to the other pane.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Tree => Focus::Right,
@@ -490,11 +565,13 @@ impl<R: CommandRunner> App<R> {
         self.selected = self.selected.clamp(new_off, bottom);
     }
 
+    /// Widen the tree pane by one step, clamped and persisted.
     pub fn widen_split(&mut self) {
         self.split_pct = (self.split_pct + SPLIT_STEP).min(MAX_SPLIT);
         self.persist_split();
     }
 
+    /// Narrow the tree pane by one step, clamped and persisted.
     pub fn narrow_split(&mut self) {
         self.split_pct = self.split_pct.saturating_sub(SPLIT_STEP).max(MIN_SPLIT);
         self.persist_split();
@@ -506,7 +583,10 @@ impl<R: CommandRunner> App<R> {
         let _ = self.config.save_split(self.split_pct);
     }
 
-    pub fn host_client_ready(&mut self) -> bool {
+    /// Whether an embedded tmux client is attached and addressable. A tmux
+    /// failure counts as "not ready" — this is a readiness probe used to gate
+    /// the respawn path, not an error surface.
+    pub fn host_client_ready(&self) -> bool {
         matches!(self.tmux.host_tty(), Ok(Some(_)))
     }
 
@@ -809,6 +889,69 @@ mod tests {
     }
 
     #[test]
+    fn create_session_failure_rolls_back_and_reports() {
+        // tmux rejecting new-session (e.g. "duplicate session") must not leave
+        // a phantom store entry occupying the slug, and the status line must
+        // say what happened (callers discard the Err).
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(false, ""); // new-session fails
+        assert!(app.chooser_activate().is_err());
+        assert!(app.store.by_dir().is_empty(), "phantom entry must be gone");
+        assert!(app.status.contains("could not start"));
+        // A retry gets the base slug again, not a bumped `-2`.
+        push_create_seq(&mut app);
+        app.open_chooser();
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        assert_eq!(app.current_session.as_deref(), Some("src-shell"));
+    }
+
+    #[test]
+    fn create_session_steps_over_live_untracked_names() {
+        // An untagged session named like our slug lives on the socket (hand
+        // made, or its @rm tag was lost). sync never adopts it, but it must
+        // still be counted as taken or new-session would fail on every retry.
+        let (_d, mut app) = app_over_tempdir();
+        app.tmux.runner.push(true, "src-shell\t\tzsh\n"); // list-sessions-full: untagged
+        app.tmux.runner.push(true, ""); // list-clients (client_session)
+        app.sync().unwrap();
+        assert!(app.store.by_dir().is_empty(), "untagged is not adopted");
+
+        open_dir_chooser(&mut app);
+        push_create_seq(&mut app);
+        focus_create(&mut app);
+        app.chooser_activate().unwrap();
+        // The new session took the bumped slug, not the occupied one.
+        let new_session = app.tmux.runner.nth_call(2);
+        assert_eq!(new_session[2], "new-session");
+        assert_eq!(new_session[5], "src-shell-2");
+    }
+
+    #[test]
+    fn switch_to_failure_leaves_ui_state_untouched() {
+        // A failed switch-client must not relabel the terminal pane or move
+        // focus — the embedded client never moved.
+        let (_d, mut app) = app_over_tempdir();
+        create_src_shell(&mut app);
+        app.current_session = None;
+        app.focus = Focus::Tree;
+        let sess_idx = app
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, RowKind::Session { .. }))
+            .unwrap();
+        app.selected = sess_idx;
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(false, ""); // switch-client fails
+        assert!(app.activate().is_err());
+        assert_eq!(app.current_session, None);
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.status.contains("failed"));
+    }
+
+    #[test]
     fn switch_with_host_client_does_not_request_respawn() {
         let (_d, mut app) = app_over_tempdir();
         create_src_shell(&mut app);
@@ -864,7 +1007,7 @@ mod tests {
         // the kill-session call targets the session's slug
         let kill = app.tmux.runner.nth_call(calls_before);
         assert_eq!(kill[2], "kill-session");
-        assert_eq!(kill[4], "src-shell");
+        assert_eq!(kill[4], "=src-shell");
         // and the session row is gone immediately
         assert!(!app
             .rows
@@ -897,7 +1040,7 @@ mod tests {
         app.confirm_close().unwrap();
         let kill = app.tmux.runner.nth_call(calls_before);
         assert_eq!(kill[2], "kill-session");
-        assert_eq!(kill[4], "src-shell");
+        assert_eq!(kill[4], "=src-shell");
         assert!(matches!(app.popup, Popup::None));
         assert!(!app
             .rows
