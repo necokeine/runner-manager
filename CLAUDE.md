@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Style guide
+
+**Always follow the Rust style guide in [`docs/policy/rust.md`](docs/policy/rust.md)** for every code change: naming, doc comments, error handling, testing, and the pre-commit checklist (`cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`) defined there.
+
 ## Commands
 
 - Build: `cargo build` (release: `cargo build --release`)
@@ -10,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Single test: `cargo test <name>` (e.g. `cargo test chooser_create_makes_shell`)
 - Tests for one module: `cargo test --lib session::` etc.
 
-There is no separate lint config; use `cargo clippy` and `cargo fmt`.
+There is no separate lint config; use `cargo clippy` and `cargo fmt`, and follow `docs/policy/rust.md` (see above).
 
 ## Architecture
 
