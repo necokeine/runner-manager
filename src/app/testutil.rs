@@ -6,7 +6,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use crate::claude::ResumeSession;
+use crate::project::claude::ResumeSession;
 use crate::tmux::{MockRunner, Tmux};
 
 use super::{App, ChooserGroup, Popup};

@@ -1,3 +1,11 @@
+//! All tmux server interaction. [`Tmux<R>`] prefixes every call with this
+//! project's socket (`-S <path>`) and routes it through the [`CommandRunner`]
+//! trait — [`SystemRunner`] in production, a mock in tests — which is what
+//! makes everything downstream unit-testable without a real tmux. The
+//! in-memory session bookkeeping lives in [`session`].
+
+pub mod session;
+
 use std::io;
 use std::path::Path;
 use std::process::Command;

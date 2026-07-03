@@ -7,9 +7,9 @@
 
 use std::io;
 
-use crate::claude;
-use crate::rows::RowKind;
-use crate::session::{ClaudePerm, SessionKind};
+use crate::app::rows::RowKind;
+use crate::project::claude;
+use crate::tmux::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
 
 use super::{App, Popup};
@@ -50,7 +50,7 @@ pub enum ChooserGroup {
     Perm,
     /// new session · one entry per resumable transcript (claude only)
     Resume,
-    /// [ Cancel ] · [ Create ]
+    /// `[ Cancel ]` · `[ Create ]`
     Actions,
 }
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::session::{SessionKind, SessionRow};
-use crate::tree::Node;
+use crate::project::tree::Node;
+use crate::tmux::session::{SessionKind, SessionRow};
 
 /// What a visible row represents; drives its rendering and what activating or
 /// clicking it does.
@@ -128,8 +128,8 @@ fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionKind, SessionRow};
-    use crate::tree::Tree;
+    use crate::project::tree::Tree;
+    use crate::tmux::session::{SessionKind, SessionRow};
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
@@ -156,6 +156,23 @@ mod tests {
         assert_eq!(rows[1].depth, 1);
         assert!(matches!(rows[2].kind, RowKind::File));
         assert_eq!(rows[2].label, "readme.md");
+    }
+
+    #[test]
+    fn depth_follows_nesting_and_collapsed_dirs_hide_files() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("zsub")).unwrap();
+        fs::write(dir.path().join("zsub").join("inner.txt"), "y").unwrap();
+        let mut tree = Tree::new(dir.path().to_path_buf());
+        // Collapsed: the file under zsub is not flattened into the row list.
+        let rows = build_rows(&tree.root, &HashMap::new());
+        assert!(!rows.iter().any(|r| r.label == "inner.txt"));
+        // Expanded: it appears at depth 2 (root = 0, zsub = 1).
+        let zsub = dir.path().join("zsub");
+        tree.node_at_mut(&zsub).unwrap().toggle();
+        let rows = build_rows(&tree.root, &HashMap::new());
+        let inner = rows.iter().find(|r| r.label == "inner.txt").unwrap();
+        assert_eq!(inner.depth, 2);
     }
 
     #[test]

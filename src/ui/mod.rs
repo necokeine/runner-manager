@@ -1,3 +1,8 @@
+//! Pure rendering + hit-testing: draws the whole frame from `App` state and
+//! returns the geometry (`Layout`, popup spans) that `run.rs` resolves mouse
+//! clicks against. Nothing here mutates application state beyond the List
+//! widget's scroll-offset reconciliation; popup rendering lives in [`popups`].
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout as RtLayout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,10 +15,10 @@ use tui_term::vt100;
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
 
+use crate::app::rows::{Row, RowKind};
 use crate::app::{App, Focus, TreeTab};
-use crate::git::{GitStatus, GitStatuses};
-use crate::rows::{Row, RowKind};
-use crate::session::SessionKind;
+use crate::project::git::{GitStatus, GitStatuses};
+use crate::tmux::session::SessionKind;
 use crate::tmux::CommandRunner;
 
 mod popups;
@@ -516,7 +521,7 @@ mod tests {
 
     #[test]
     fn row_style_colours_files_and_dirs_by_git_status() {
-        use crate::git::{GitStatus, GitStatuses};
+        use crate::project::git::{GitStatus, GitStatuses};
         use std::path::PathBuf;
 
         let staged = PathBuf::from("/repo/staged.rs");
@@ -722,9 +727,9 @@ mod tests {
 
     #[test]
     fn scrollbar_appears_only_when_tree_overflows() {
+        use crate::app::viewer::FileView;
         use crate::app::App;
         use crate::tmux::{MockRunner, Tmux};
-        use crate::viewer::FileView;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::path::{Path, PathBuf};
@@ -772,9 +777,9 @@ mod tests {
 
     #[test]
     fn scrollbar_thumb_reaches_ends() {
+        use crate::app::viewer::FileView;
         use crate::app::App;
         use crate::tmux::{MockRunner, Tmux};
-        use crate::viewer::FileView;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::path::{Path, PathBuf};
@@ -848,9 +853,9 @@ mod tests {
         // because the offset was recomputed from zero every frame; with a
         // tracked tree_offset, scrolling down then stepping back up moves the
         // cursor within the viewport instead of re-pinning it to the bottom.
+        use crate::app::viewer::FileView;
         use crate::app::App;
         use crate::tmux::{MockRunner, Tmux};
-        use crate::viewer::FileView;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::path::{Path, PathBuf};
