@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Style guide
+
+**Always follow the Rust style guide in [`docs/policy/rust.md`](docs/policy/rust.md)** for every code change: naming, doc comments, error handling, testing, and the pre-commit checklist (`cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`) defined there.
+
 ## Commands
 
 - Build: `cargo build` (release: `cargo build --release`)
@@ -10,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Single test: `cargo test <name>` (e.g. `cargo test chooser_create_makes_shell`)
 - Tests for one module: `cargo test --lib session::` etc.
 
-There is no separate lint config; use `cargo clippy` and `cargo fmt`.
+There is no separate lint config; use `cargo clippy` and `cargo fmt`, and follow `docs/policy/rust.md` (see above).
 
 ## Architecture
 
@@ -28,9 +32,9 @@ A ratatui/crossterm TUI with a NERDTree-style file tree (left) and a right pane 
 - `config.rs` — the per-project config dir `<root>/.pjma/` (`Config`). `ensure_dir()` creates it at startup; `save_expanded`/`load_expanded` persist the expanded-directory set to `<root>/.pjma/expanded` as root-relative paths (one per line, no serde dependency). `RM_SOCKET` aside, the tmux socket also lives in this dir.
 - `tree.rs` — lazy filesystem tree; `Node::load_children` reads a dir on first expand, dirs sorted before files. `expanded_dirs()` collects the visible expanded subtree (for persistence) and `apply_expanded()` re-expands a saved set shallow-to-deep, loading children lazily.
 - `rows.rs` — flattens the tree + per-dir sessions into a single `Vec<Row>` (the visible list). `RowKind` is `Dir | Session | File`; `selected` indexes into this vec. **Rebuild rows (`App::rebuild_rows`) after any tree expand/collapse or session change** — the row vec is derived state.
-- `app.rs` — `App<R>` holds all state and the action methods (`activate`, `open_chooser`, chooser state machine, `switch_to`, `sync`, split sizing). `restore_expanded()` (called once at startup) re-expands the saved dirs; `persist_expanded()` is called after every dir toggle in `activate` to save the new state. No I/O event handling here. The chooser (`Popup::Chooser`) is a small radio-form state machine: `chooser_rows()` derives the visible focusable rows (the claude permission rows only appear when kind == Claude; a `Resume` group — `ResumeNew` + one `Resume(i)` per discovered session — appears when kind == Claude and `chooser_resumes` is non-empty), and selection follows focus. `open_chooser` populates `chooser_resumes` (via `claude::list_sessions`) for the chosen dir, and `chooser_command(kind, perm, resume_id)` builds the launch command per kind: shell → none (default shell), claude → `claude [--resume <id>] [--dangerously-skip-permissions]`, codex → `codex` (the perm/resume inputs are claude-only and ignored).
+- `app.rs` — `App<R>` holds all state and the action methods (`activate`, `switch_to`, `sync`, split sizing). `restore_expanded()` (called once at startup) re-expands the saved dirs; `persist_expanded()` is called after every dir toggle in `activate` to save the new state. No I/O event handling here. The chooser (`Popup::Chooser`) lives in the `app/chooser.rs` submodule: a small radio-form state machine where `chooser_rows()` derives the visible focusable rows (the claude permission rows only appear when kind == Claude; a `Resume` group — `ResumeNew` + one `Resume(i)` per discovered session — appears when kind == Claude and `chooser_resumes` is non-empty), and selection follows focus. `open_chooser` populates `chooser_resumes` (via `claude::list_sessions`) for the chosen dir, and `chooser_command(kind, perm, resume_id)` builds the launch command per kind: shell → none (default shell), claude → `claude [--resume <id>] [--dangerously-skip-permissions]`, codex → `codex` (the perm/resume inputs are claude-only and ignored). Shared unit-test helpers (a tempdir `App<MockRunner>`, the canned create-session response sequence) live in `app/testutil.rs`.
 - `run.rs` — owns the terminal setup/teardown, the PTY, and the event loop: draws via `ui::render`, routes key/mouse events depending on `app.popup` and `app.focus`, drives PTY resize from the rendered terminal area, and runs the periodic sync. Keystrokes to the terminal pane are translated by `keys.rs::encode_key` and written to the PTY. **Git colouring is computed off the UI thread**: `spawn_git_scan` runs `GitStatuses::load` on a worker thread and the loop applies each result via `App::apply_git` (one scan in flight at a time, re-triggered ~1 s after the previous finished). A full `git status` of a large tree takes seconds, so it must never run inline — neither `App::new` nor `App::sync` touch git.
-- `ui.rs` — pure rendering + hit-testing. `render` returns a `Layout` (tree list geometry, split column, terminal rect) that `run.rs` uses to resolve mouse clicks (`resolve_pane_click` → tree row / `[+]` button / right pane) and to detect splitter drags.
+- `ui.rs` — pure rendering + hit-testing. `render` returns a `Layout` (tree list geometry, split column, terminal rect) that `run.rs` uses to resolve mouse clicks (`resolve_pane_click` → tree row / `[+]` button / right pane) and to detect splitter drags. Popup rendering (help overlay, chooser form, close confirmation) lives in the `ui/popups.rs` submodule; each popup renderer returns its clickable geometry, re-exported through `ui`.
 - `viewer.rs` — when `app.viewer` is `Some`, the right pane shows a file (capped at 5000 lines, binary-safe) and the PTY parser is *not* read that frame.
 
 ### Conventions

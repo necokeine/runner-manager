@@ -118,7 +118,11 @@ impl SessionStore {
             if self.entries.iter().any(|e| &e.slug == slug) {
                 continue;
             }
-            self.entries.push(Entry { dir: dir.clone(), kind: *kind, slug: slug.clone() });
+            self.entries.push(Entry {
+                dir: dir.clone(),
+                kind: *kind,
+                slug: slug.clone(),
+            });
             adopted.push(slug.clone());
         }
         adopted
@@ -128,7 +132,10 @@ impl SessionStore {
     /// `None` for an untracked slug (e.g. an untagged hand-made session that
     /// was never adopted into the store).
     pub fn dir_of(&self, slug: &str) -> Option<&Path> {
-        self.entries.iter().find(|e| e.slug == slug).map(|e| e.dir.as_path())
+        self.entries
+            .iter()
+            .find(|e| e.slug == slug)
+            .map(|e| e.dir.as_path())
     }
 
     pub fn by_dir(&self) -> HashMap<PathBuf, Vec<SessionRow>> {
@@ -206,7 +213,11 @@ mod tests {
         // a prior-run session (would come back from tmux on restart) plus the
         // already-tracked one; only the new one should be adopted.
         let adopted = s.adopt(&[
-            (existing.clone(), PathBuf::from("/p/src"), SessionKind::Shell),
+            (
+                existing.clone(),
+                PathBuf::from("/p/src"),
+                SessionKind::Shell,
+            ),
             ("p-claude".into(), PathBuf::from("/p"), SessionKind::Claude),
         ]);
         assert_eq!(adopted, vec!["p-claude".to_string()]);
@@ -217,7 +228,9 @@ mod tests {
         assert_eq!(root_rows[0].slug, "p-claude");
         assert_eq!(root_rows[0].kind, SessionKind::Claude);
         // a re-adopt of the same set is a no-op (slugs already present)
-        assert!(s.adopt(&[("p-claude".into(), PathBuf::from("/p"), SessionKind::Claude)]).is_empty());
+        assert!(s
+            .adopt(&[("p-claude".into(), PathBuf::from("/p"), SessionKind::Claude)])
+            .is_empty());
     }
 
     #[test]
@@ -227,7 +240,10 @@ mod tests {
         assert_eq!(SessionKind::from_tag("shell"), SessionKind::Shell);
         assert_eq!(SessionKind::from_tag(""), SessionKind::Shell);
         // label_base round-trips through from_tag for every agent kind.
-        assert_eq!(SessionKind::from_tag(SessionKind::Codex.label_base()), SessionKind::Codex);
+        assert_eq!(
+            SessionKind::from_tag(SessionKind::Codex.label_base()),
+            SessionKind::Codex
+        );
     }
 
     #[test]

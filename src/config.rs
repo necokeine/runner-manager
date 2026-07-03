@@ -103,7 +103,11 @@ impl Config {
     /// persisted (missing/unreadable file, or non-numeric contents). The caller
     /// is responsible for clamping into its allowed range.
     pub fn load_split(&self) -> Option<u16> {
-        fs::read_to_string(self.split_path()).ok()?.trim().parse().ok()
+        fs::read_to_string(self.split_path())
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Persist the tree-pane width percent. Best-effort: the config dir is
@@ -155,7 +159,8 @@ mod tests {
         let d = tempdir().unwrap();
         let root = d.path();
         let cfg = Config::new(root);
-        cfg.save_expanded(&[root.join("src"), root.join("src/proto")]).unwrap();
+        cfg.save_expanded(&[root.join("src"), root.join("src/proto")])
+            .unwrap();
         let mut loaded = cfg.load_expanded();
         loaded.sort();
         assert_eq!(loaded, vec![root.join("src"), root.join("src/proto")]);
@@ -169,8 +174,12 @@ mod tests {
         let d = tempdir().unwrap();
         let root = d.path();
         let cfg = Config::new(root);
-        cfg.save_expanded(&[root.to_path_buf(), PathBuf::from("/elsewhere"), root.join("a")])
-            .unwrap();
+        cfg.save_expanded(&[
+            root.to_path_buf(),
+            PathBuf::from("/elsewhere"),
+            root.join("a"),
+        ])
+        .unwrap();
         assert_eq!(cfg.load_expanded(), vec![root.join("a")]);
     }
 
