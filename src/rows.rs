@@ -4,21 +4,34 @@ use std::path::{Path, PathBuf};
 use crate::session::{SessionKind, SessionRow};
 use crate::tree::Node;
 
+/// What a visible row represents; drives its rendering and what activating or
+/// clicking it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowKind {
+    /// A directory (toggles expansion; carries the `[+]` new-session button).
     Dir { expanded: bool },
+    /// A tmux session (switches the embedded client; carries the `[×]` button).
     Session { slug: String, kind: SessionKind },
+    /// A regular file (opens in the read-only viewer).
     File,
 }
 
+/// One visible row of the left pane. The row list is derived state — rebuilt
+/// by `App::rebuild_rows` after any tree or session change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// The filesystem path this row refers to (the session's dir for sessions).
     pub path: PathBuf,
+    /// Rendered text (without the trailing `[+]`/`[×]` button).
     pub label: String,
+    /// Nesting depth for indentation (root = 0).
     pub depth: usize,
+    /// What the row is, with its kind-specific payload.
     pub kind: RowKind,
 }
 
+/// Flatten the visible (expanded) tree into rows, nesting each directory's
+/// sessions right under it.
 pub fn build_rows(root: &Node, sessions: &HashMap<PathBuf, Vec<SessionRow>>) -> Vec<Row> {
     let mut out = Vec::new();
     collect(root, 0, sessions, &mut out);

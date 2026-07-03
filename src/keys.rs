@@ -1,17 +1,29 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Translate a key press into the bytes a PTY expects. Returns an empty vec
-/// for keys we don't forward. `Ctrl-q` is intercepted by the caller (focus
-/// toggle) before this is called, so it is not special-cased here.
+/// for keys we don't forward. Alt-modified characters get the classic ESC
+/// prefix (`alt-b` → `ESC b`, so shell word-motion works); Ctrl combines with
+/// letters and the standard punctuation (`Ctrl-Space` → NUL, `Ctrl-/` → 0x1f,
+/// …). `Ctrl-q` is intercepted by the caller (focus toggle) before this is
+/// called, so it is not special-cased here.
 pub fn encode_key(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
+    let mut bytes = match key.code {
         KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
             vec![(c.to_ascii_lowercase() as u8) & 0x1f]
         }
+        // The traditional Ctrl+punctuation control bytes are all `char & 0x1f`
+        // for '@'..='_' (uppercase letters were consumed by the arm above);
+        // ' ', '/', '?' are the historical aliases a raw terminal also sends.
+        // Ctrl with anything else falls through to the bare char.
+        KeyCode::Char(c) if ctrl && ('@'..='_').contains(&c) => vec![c as u8 & 0x1f],
+        KeyCode::Char(' ') if ctrl => vec![0x00],
+        KeyCode::Char('/') if ctrl => vec![0x1f],
+        KeyCode::Char('?') if ctrl => vec![0x7f],
         KeyCode::Char(c) => c.to_string().into_bytes(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => b"\x1b[A".to_vec(),
@@ -24,7 +36,14 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         _ => Vec::new(),
+    };
+    if key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char(_))
+        && !bytes.is_empty()
+    {
+        bytes.insert(0, 0x1b);
     }
+    bytes
 }
 
 /// Encode a mouse-wheel tick as an SGR mouse report (`ESC [ < Cb ; Cx ; Cy M`)
@@ -85,6 +104,42 @@ mod tests {
     fn unmapped_keys_produce_no_bytes() {
         assert!(encode_key(k(KeyCode::F(5))).is_empty());
         assert!(encode_key(k(KeyCode::Insert)).is_empty());
+    }
+
+    #[test]
+    fn back_tab_sends_reverse_tab_sequence() {
+        // Shift-Tab arrives as BackTab and matters inside the pane (Claude
+        // Code cycles permission modes with it).
+        assert_eq!(encode_key(k(KeyCode::BackTab)), b"\x1b[Z".to_vec());
+    }
+
+    #[test]
+    fn ctrl_punctuation_maps_to_control_bytes() {
+        assert_eq!(encode_key(ctrl(' ')), vec![0x00]); // NUL — common tmux prefix
+        assert_eq!(encode_key(ctrl('@')), vec![0x00]);
+        assert_eq!(encode_key(ctrl('[')), vec![0x1b]);
+        assert_eq!(encode_key(ctrl('\\')), vec![0x1c]);
+        assert_eq!(encode_key(ctrl(']')), vec![0x1d]);
+        assert_eq!(encode_key(ctrl('^')), vec![0x1e]);
+        assert_eq!(encode_key(ctrl('_')), vec![0x1f]);
+        assert_eq!(encode_key(ctrl('/')), vec![0x1f]);
+        assert_eq!(encode_key(ctrl('?')), vec![0x7f]);
+    }
+
+    #[test]
+    fn alt_chars_get_escape_prefix() {
+        let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(encode_key(alt_b), b"\x1bb".to_vec());
+        // Ctrl+Alt combines: ESC then the control byte.
+        let ctrl_alt_f = KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+        );
+        assert_eq!(encode_key(ctrl_alt_f), vec![0x1b, 0x06]);
+        // Alt on non-character keys is left alone (terminals use CSI modifiers
+        // there, and a stray ESC would be worse than none).
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(encode_key(alt_up), b"\x1b[A".to_vec());
     }
 
     #[test]

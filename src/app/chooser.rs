@@ -14,18 +14,27 @@ use crate::tmux::CommandRunner;
 
 use super::{App, Popup};
 
+/// One focusable option in the new-session form; the visible set is derived
+/// per-frame by `App::chooser_rows` (Perm/Resume rows only exist for claude).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChooserRow {
+    /// Kind radio: plain shell.
     KindShell,
+    /// Kind radio: Claude Code.
     KindClaude,
+    /// Kind radio: Codex.
     KindCodex,
+    /// Permission radio: normal prompts.
     PermNormal,
+    /// Permission radio: `--dangerously-skip-permissions`.
     PermSkip,
     /// Start a fresh claude session (the default when resumes are offered).
     ResumeNew,
     /// Resume the i-th discovered session in `App::chooser_resumes`.
     Resume(usize),
+    /// The `[ Cancel ]` button.
     Cancel,
+    /// The `[ Create ]` button.
     Create,
 }
 
@@ -356,6 +365,7 @@ impl<R: CommandRunner> App<R> {
         self.create_session(&dir, kind, cmd.as_deref())
     }
 
+    /// Dismiss the chooser without creating anything.
     pub fn chooser_cancel(&mut self) {
         self.popup = Popup::None;
     }

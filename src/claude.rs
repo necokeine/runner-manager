@@ -31,8 +31,17 @@ const MAX_COMMAND_LEN: usize = 200;
 /// stays snappy even in a project with a long Claude history.
 const MAX_SESSIONS: usize = 10;
 
+/// Tail windows tried, smallest first, when scanning a transcript backwards
+/// for the last user prompt. Transcripts grow to tens of MB and
+/// `list_sessions` runs on the UI thread (the chooser opens synchronously), so
+/// whole-file reads would freeze the TUI. Most sessions hit in the first
+/// window; a long agentic turn can bury the prompt under megabytes of tool
+/// output, so the scan deepens before giving up. The largest window bounds the
+/// work per transcript.
+const TAIL_READ_SIZES: [u64; 3] = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
 /// Encode a working directory the way Claude Code names its per-project folder:
-/// every byte that is not an ASCII letter or digit becomes `-`. e.g.
+/// every character that is not an ASCII letter or digit becomes `-`. e.g.
 /// `/Users/x/Projects/runner-manager` → `-Users-x-Projects-runner-manager`.
 pub fn encode_project_dir(dir: &Path) -> String {
     dir.to_string_lossy()
@@ -80,6 +89,12 @@ pub fn list_sessions(base: &Path, dir: &Path) -> Vec<ResumeSession> {
         .into_iter()
         .filter_map(|(path, modified)| {
             let id = path.file_stem()?.to_str()?.to_string();
+            // The id is spliced into the `claude --resume <id>` launch command,
+            // which tmux hands to a shell. Real ids are UUIDs; refuse anything
+            // that isn't shell-safe rather than quote arbitrary filenames.
+            if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return None;
+            }
             Some(ResumeSession {
                 id,
                 last_command: last_user_command(&path).unwrap_or_default(),
@@ -89,13 +104,35 @@ pub fn list_sessions(base: &Path, dir: &Path) -> Vec<ResumeSession> {
         .collect()
 }
 
-/// Scan a transcript and return its last genuine human prompt as a single line.
-/// Skips meta entries, tool results, and the angle-bracketed local-command
-/// bookkeeping Claude injects, so the result reads like something the user typed.
+/// Return a transcript's last genuine human prompt as a single line: skips
+/// meta entries, tool results, and the angle-bracketed bookkeeping Claude
+/// injects, so the result reads like something the user typed. Reads the file
+/// tail in growing windows (see [`TAIL_READ_SIZES`]) — this runs on the UI
+/// thread, so the whole file is never slurped.
 fn last_user_command(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
+    let len = fs::metadata(path).ok()?.len();
+    for size in TAIL_READ_SIZES {
+        let (text, cut) = read_tail(path, size)?;
+        if let Some(cmd) = scan_transcript(&text, cut) {
+            return Some(cmd);
+        }
+        if size >= len {
+            break; // the whole file was scanned; no deeper window exists
+        }
+    }
+    None
+}
+
+/// Scan transcript JSONL text for the last genuine human prompt. `skip_first`
+/// drops the first line — a fragment of a record when the text came from a
+/// mid-file byte cut.
+fn scan_transcript(text: &str, skip_first: bool) -> Option<String> {
+    let mut lines = text.lines();
+    if skip_first {
+        lines.next();
+    }
     let mut last: Option<String> = None;
-    for line in content.lines() {
+    for line in lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -111,14 +148,47 @@ fn last_user_command(path: &Path) -> Option<String> {
         }
         let text = message_text(value.get("message").and_then(|m| m.get("content")));
         let text = text.trim();
-        // Angle-bracket-prefixed bodies are tool results / local-command wrappers,
-        // not a prompt the user would recognise.
-        if text.is_empty() || text.starts_with('<') {
+        if text.is_empty() || is_wrapper(text) {
             continue;
         }
         last = Some(collapse(text));
     }
     last
+}
+
+/// True for the angle-bracketed bookkeeping bodies Claude injects as `user`
+/// entries (`<tool_result>`, `<task-notification>`, `<local-command-stdout>`,
+/// `<bash-input>`, …): they all open with a bare lowercase tag. A genuine
+/// prompt that merely starts with pasted markup (`<div class=x>`, `<H1>`) has
+/// attributes, digits, or uppercase in the tag and is kept.
+fn is_wrapper(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    match rest.find('>') {
+        Some(end) if end > 0 => rest[..end]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-'),
+        _ => false,
+    }
+}
+
+/// Read at most the last `max` bytes of `path` as UTF-8; the flag reports
+/// whether the file was cut mid-record (the first line is then a fragment the
+/// caller must skip). Decoding is zero-copy for valid UTF-8 — the lossy copy
+/// only happens when the cut split a multibyte character or the file holds
+/// genuine junk.
+fn read_tail(path: &Path, max: u64) -> Option<(String, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let skipped = len.saturating_sub(max);
+    file.seek(SeekFrom::Start(skipped)).ok()?;
+    let mut buf = Vec::with_capacity(len.min(max) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Some((text, skipped > 0))
 }
 
 /// Flatten a message `content` field into plain text. Claude stores it either as
@@ -235,6 +305,107 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].last_command, "newer");
         assert_eq!(sessions[1].last_command, "older");
+    }
+
+    #[test]
+    fn prompt_starting_with_pasted_markup_is_still_a_prompt() {
+        // Only the known bookkeeping wrappers are skipped; a genuine prompt
+        // that happens to start with pasted HTML must not be discarded.
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let dir = Path::new("/proj/app");
+        write_session(
+            base,
+            dir,
+            "33333333-3333-3333-3333-333333333333",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"earlier prompt"}}"#,
+                r#"{"type":"user","message":{"role":"user","content":"<div class=x> why does this overflow?"}}"#,
+            ],
+        );
+        let sessions = list_sessions(base, dir);
+        assert_eq!(
+            sessions[0].last_command,
+            "<div class=x> why does this overflow?"
+        );
+    }
+
+    #[test]
+    fn non_shell_safe_session_ids_are_skipped() {
+        // The id is spliced into the `claude --resume <id>` command line, so a
+        // transcript whose file stem isn't a plain UUID-ish name is refused.
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let dir = Path::new("/proj/app");
+        write_session(
+            base,
+            dir,
+            "evil; touch pwned",
+            &[r#"{"type":"user","message":{"role":"user","content":"hi"}}"#],
+        );
+        write_session(
+            base,
+            dir,
+            "44444444-4444-4444-4444-444444444444",
+            &[r#"{"type":"user","message":{"role":"user","content":"ok"}}"#],
+        );
+        let sessions = list_sessions(base, dir);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "44444444-4444-4444-4444-444444444444");
+    }
+
+    #[test]
+    fn huge_transcripts_are_read_from_the_tail() {
+        // A transcript larger than the first tail window still yields its last
+        // prompt (which lives near the end), and the partial first line the
+        // byte cut leaves behind is ignored rather than parsed.
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let dir = Path::new("/proj/app");
+        let filler =
+            r#"{"type":"assistant","message":{"role":"assistant","content":"xxxxxxxxxx"}}"#;
+        let window = TAIL_READ_SIZES[0] as usize;
+        let mut lines: Vec<&str> = vec![filler; (window / filler.len()) * 2];
+        lines.push(r#"{"type":"user","message":{"role":"user","content":"the last prompt"}}"#);
+        write_session(base, dir, "55555555-5555-5555-5555-555555555555", &lines);
+        let sessions = list_sessions(base, dir);
+        assert_eq!(sessions[0].last_command, "the last prompt");
+    }
+
+    #[test]
+    fn prompt_buried_beyond_the_first_window_is_still_found() {
+        // One long agentic turn: the user's last prompt is followed by more
+        // tool/assistant output than the first tail window holds. The scan
+        // must deepen to the next window rather than fall back to no label.
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path();
+        let dir = Path::new("/proj/app");
+        let filler =
+            r#"{"type":"assistant","message":{"role":"assistant","content":"xxxxxxxxxx"}}"#;
+        let window = TAIL_READ_SIZES[0] as usize;
+        let mut lines: Vec<&str> =
+            vec![r#"{"type":"user","message":{"role":"user","content":"buried prompt"}}"#];
+        lines.extend(vec![filler; (window / filler.len()) * 2]);
+        write_session(base, dir, "66666666-6666-6666-6666-666666666666", &lines);
+        let sessions = list_sessions(base, dir);
+        assert_eq!(sessions[0].last_command, "buried prompt");
+    }
+
+    #[test]
+    fn bare_lowercase_tags_are_wrappers_markup_prompts_are_not() {
+        // The wrapper rule is structural, not a blocklist: any bare lowercase
+        // tag opener is bookkeeping, anything else is a prompt.
+        for wrapper in [
+            "<bash-input>git status</bash-input>",
+            "<user-memory-input>note</user-memory-input>",
+            "<retrieval_status>done</retrieval_status>",
+            "<task-notification>...</task-notification>",
+        ] {
+            assert!(is_wrapper(wrapper), "{wrapper} should be skipped");
+        }
+        for prompt in ["<div class=x> why?", "<H1> heading", "< 5 && > 3", "plain"] {
+            assert!(!is_wrapper(prompt), "{prompt} should be kept");
+        }
     }
 
     #[test]
