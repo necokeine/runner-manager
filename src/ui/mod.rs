@@ -1,5 +1,5 @@
 //! Pure rendering + hit-testing: draws the whole frame from `App` state and
-//! returns the geometry (`Layout`, popup spans) that `run.rs` resolves mouse
+//! returns the geometry (`Layout`, popup spans) that `run/input.rs` resolves mouse
 //! clicks against. Nothing here mutates application state beyond the List
 //! widget's scroll-offset reconciliation; popup rendering lives in [`popups`].
 
@@ -62,14 +62,14 @@ pub enum PaneHit {
 }
 
 /// Clickable geometry of the tab bar: the row it sits on and, per tab, the
-/// inclusive column span of its label. `run.rs` resolves a mouse click against
+/// inclusive column span of its label. `run/input.rs` resolves a mouse click against
 /// these to switch views.
 pub struct TabBar {
     pub y: u16,
     pub hits: Vec<(u16, u16, TreeTab)>,
 }
 
-/// Everything `run.rs` needs from one rendered frame: the tree geometry for
+/// Everything the run loop needs from one rendered frame: the tree geometry for
 /// click resolution, the split column for border drags, the terminal rect for
 /// PTY sizing/wheel forwarding, and the tab bar spans.
 pub struct Layout {
@@ -343,7 +343,7 @@ fn render_tabs(f: &mut Frame, area: Rect, active: TreeTab) -> TabBar {
 }
 
 /// Draw the whole frame (banner, tabs, tree, right pane) and return the
-/// [`Layout`] geometry `run.rs` uses for mouse hit-testing and PTY sizing.
+/// [`Layout`] geometry the run loop uses for mouse hit-testing and PTY sizing.
 /// `screen` is the embedded terminal's vt100 screen — `None` when the viewer
 /// is shown or no session exists yet. Pure rendering: the only state written
 /// back is `app.tree_offset` (the List widget may nudge it to keep the
@@ -449,7 +449,7 @@ pub fn render<R: CommandRunner>(
     };
 
     // ---- right: terminal or viewer ----
-    // The embedded PTY's vt100 parser is owned by run.rs, so the screen is
+    // The embedded PTY's vt100 parser is owned by the run loop, so the screen is
     // passed in: Some when the terminal is shown, None when the viewer is.
     let right_focused = app.focus == Focus::Right;
     let right_inner = Block::default().borders(Borders::ALL).inner(right_area);

@@ -12,7 +12,7 @@ use tui_term::vt100;
 
 /// Shared handle to the embedded terminal's vt100 parser. Held by both the
 /// reader thread (which feeds bytes into it) and the render loop (which reads
-/// the screen out). Optional in `run.rs`: `None` when no embedded client exists.
+/// the screen out). Optional in the run loop: `None` when no embedded client exists.
 pub type ParserHandle = Arc<RwLock<vt100::Parser>>;
 
 /// The one embedded terminal: a PTY running the tmux client, a reader thread
