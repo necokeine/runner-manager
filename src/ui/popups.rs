@@ -1,6 +1,6 @@
 //! Popup rendering: the help overlay, the new-session chooser form, and the
 //! close-session confirmation. Each renderer returns the clickable geometry of
-//! its options so `run.rs` can resolve mouse clicks against what was drawn.
+//! its options so `run/input.rs` can resolve mouse clicks against what was drawn.
 
 use ratatui::layout::{Constraint, Direction, Layout as RtLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -244,7 +244,7 @@ pub fn render_chooser(
 }
 
 /// Draw the "really close this session?" confirmation. Returns the clickable
-/// column span `(y, x_start, x_end, is_yes)` of each button, so `run.rs` can
+/// column span `(y, x_start, x_end, is_yes)` of each button, so `run/input.rs` can
 /// resolve a mouse click the same way it does the chooser's rows — only a
 /// click on the button text itself may confirm the (destructive) close.
 pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, u16, u16, bool)> {
@@ -294,7 +294,7 @@ pub fn render_confirm_close(f: &mut Frame, area: Rect, slug: &str) -> Vec<(u16, 
 /// the transcript has no plain prompt yet, truncated to `max` columns.
 fn resume_label(s: &ResumeSession, max: usize) -> String {
     let text = if s.last_command.is_empty() {
-        let short: String = s.id.chars().take(8).collect();
+        let short: String = s.id.as_str().chars().take(8).collect();
         format!("({short}…)")
     } else {
         s.last_command.clone()
@@ -330,6 +330,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::claude::ResumeId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -382,7 +383,7 @@ mod tests {
     #[test]
     fn render_chooser_shows_resume_rows() {
         let resumes = vec![ResumeSession {
-            id: "deadbeef-0000".into(),
+            id: ResumeId::new("deadbeef-0000").expect("test id is shell-safe"),
             last_command: "refactor the chooser".into(),
             modified: std::time::SystemTime::UNIX_EPOCH,
         }];
@@ -475,7 +476,8 @@ mod tests {
         // previously a click *below* the popup could change the selection.
         let resumes: Vec<ResumeSession> = (0..10)
             .map(|i| ResumeSession {
-                id: format!("00000000-0000-0000-0000-0000000000{i:02}"),
+                id: ResumeId::new(format!("00000000-0000-0000-0000-0000000000{i:02}"))
+                    .expect("test id is shell-safe"),
                 last_command: format!("prompt {i}"),
                 modified: std::time::SystemTime::UNIX_EPOCH,
             })

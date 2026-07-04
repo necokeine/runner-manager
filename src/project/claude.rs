@@ -12,12 +12,39 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// A validated, shell-safe Claude session id.
+///
+/// The id is spliced verbatim into the `claude --resume <id>` launch command,
+/// which tmux hands to a shell — so the only way to obtain one is through
+/// [`ResumeId::new`], which accepts nothing but ASCII alphanumerics and `-`
+/// (real ids are UUIDs). Tying the guarantee to the type keeps the splice site
+/// (`chooser_command`) safe no matter where an id comes from, instead of
+/// relying on whichever caller happens to filter today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeId(String);
+
+impl ResumeId {
+    /// Wrap `id` if it is shell-safe: non-empty and built only from ASCII
+    /// alphanumerics and `-`. Anything else — and thus anything a shell could
+    /// interpret — yields `None`.
+    pub fn new(id: impl Into<String>) -> Option<Self> {
+        let id = id.into();
+        let safe = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        safe.then_some(Self(id))
+    }
+
+    /// The id as a plain string slice, e.g. to splice into a launch command.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One resumable Claude session discovered on disk for a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeSession {
     /// Session id — the JSONL filename without its extension. This is the value
     /// passed to `claude --resume <id>`.
-    pub id: String,
+    pub id: ResumeId,
     /// The last human prompt in the transcript, collapsed to a single line.
     /// Empty when the transcript has no plain user message yet.
     pub last_command: String,
@@ -88,13 +115,9 @@ pub fn list_sessions(base: &Path, dir: &Path) -> Vec<ResumeSession> {
     files
         .into_iter()
         .filter_map(|(path, modified)| {
-            let id = path.file_stem()?.to_str()?.to_string();
-            // The id is spliced into the `claude --resume <id>` launch command,
-            // which tmux hands to a shell. Real ids are UUIDs; refuse anything
-            // that isn't shell-safe rather than quote arbitrary filenames.
-            if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                return None;
-            }
+            // `ResumeId::new` refuses anything that isn't shell-safe, so a
+            // transcript with a hostile filename is skipped rather than quoted.
+            let id = ResumeId::new(path.file_stem()?.to_str()?)?;
             Some(ResumeSession {
                 id,
                 last_command: last_user_command(&path).unwrap_or_default(),
@@ -270,7 +293,10 @@ mod tests {
 
         let sessions = list_sessions(base, dir);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(
+            sessions[0].id.as_str(),
+            "11111111-1111-1111-1111-111111111111"
+        );
         // newlines/extra spaces collapsed; meta + tool-result lines skipped
         assert_eq!(sessions[0].last_command, "fix the bug please");
     }
@@ -351,7 +377,19 @@ mod tests {
         );
         let sessions = list_sessions(base, dir);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "44444444-4444-4444-4444-444444444444");
+        assert_eq!(
+            sessions[0].id.as_str(),
+            "44444444-4444-4444-4444-444444444444"
+        );
+    }
+
+    #[test]
+    fn resume_id_accepts_uuids_and_rejects_shell_metacharacters() {
+        assert!(ResumeId::new("11111111-1111-1111-1111-111111111111").is_some());
+        assert!(ResumeId::new("abc-DEF-123").is_some());
+        for bad in ["", "evil; touch pwned", "a b", "$(x)", "a'b", "id\n", "a/b"] {
+            assert!(ResumeId::new(bad).is_none(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

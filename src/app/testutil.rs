@@ -6,7 +6,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use crate::project::claude::ResumeSession;
+use crate::project::claude::{ResumeId, ResumeSession};
 use crate::tmux::{MockRunner, Tmux};
 
 use super::{App, ChooserGroup, Popup};
@@ -58,7 +58,7 @@ pub(crate) fn create_src_shell(app: &mut App<MockRunner>) {
 
 pub(crate) fn fake_resume(id: &str, last: &str) -> ResumeSession {
     ResumeSession {
-        id: id.to_string(),
+        id: ResumeId::new(id).expect("test ids are shell-safe"),
         last_command: last.to_string(),
         modified: std::time::SystemTime::UNIX_EPOCH,
     }
