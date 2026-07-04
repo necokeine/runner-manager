@@ -1,21 +1,25 @@
 //! The new-session chooser: a small radio-form state machine opened on a
-//! directory row (`Popup::Chooser`). The form is navigated in two axes —
-//! Up/Down moves between selection groups, Left/Right changes the option
-//! within the focused group — and which groups exist depends on the chosen
-//! kind (Perm/Resume are claude-only). `chooser_command` maps the final
-//! selections to the launch command for the new session.
+//! directory row. All form state — the chosen dir/kind/permission, the resume
+//! picker and its discovered sessions, and the focus position — lives in one
+//! [`ChooserForm`] carried by `Popup::Chooser`, so the form cannot outlive or
+//! drift from its popup. The form is navigated in two axes — Up/Down moves
+//! between selection groups, Left/Right changes the option within the focused
+//! group — and which groups exist depends on the chosen kind (Perm/Resume are
+//! claude-only). [`launch_command`] maps the final selections to the launch
+//! command for the new session.
 
 use std::io;
+use std::path::PathBuf;
 
 use crate::app::rows::RowKind;
-use crate::project::claude::{self, ResumeId};
+use crate::project::claude::{self, ResumeId, ResumeSession};
 use crate::tmux::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
 
 use super::{App, Popup};
 
 /// One focusable option in the new-session form; the visible set is derived
-/// per-frame by `App::chooser_rows` (Perm/Resume rows only exist for claude).
+/// per-frame by [`ChooserForm::rows`] (Perm/Resume rows only exist for claude).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChooserRow {
     /// Kind radio: plain shell.
@@ -30,7 +34,7 @@ pub enum ChooserRow {
     PermSkip,
     /// Start a fresh claude session (the default when resumes are offered).
     ResumeNew,
-    /// Resume the i-th discovered session in `App::chooser_resumes`.
+    /// Resume the i-th discovered session in [`ChooserForm::resumes`].
     Resume(usize),
     /// The `[ Cancel ]` button.
     Cancel,
@@ -40,11 +44,11 @@ pub enum ChooserRow {
 
 /// A selection group in the new-session form. The form is navigated in two
 /// axes: **Up/Down** moves between groups, **Left/Right** changes the option
-/// within the focused group. Which groups are present depends on `kind`
-/// (Perm/Resume only show for claude) — see `App::chooser_groups`.
+/// within the focused group. Which groups are present depends on the chosen
+/// kind (Perm/Resume only show for claude) — see [`ChooserForm::groups`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChooserGroup {
-    /// shell · claude
+    /// shell · claude · codex
     Kind,
     /// normal · skip (claude only)
     Perm,
@@ -54,47 +58,60 @@ pub enum ChooserGroup {
     Actions,
 }
 
-impl<R: CommandRunner> App<R> {
-    /// Open the shell/claude chooser for the selected directory row.
-    pub fn open_chooser(&mut self) {
-        if let Some(row) = self.selected_row() {
-            if matches!(row.kind, RowKind::Dir { .. }) {
-                let dir = row.path.clone();
-                // Discover any resumable Claude sessions for this directory now,
-                // so the chooser can offer them once the user picks "claude".
-                self.chooser_resumes = claude::projects_base()
-                    .map(|base| claude::list_sessions(&base, &dir))
-                    .unwrap_or_default();
-                self.popup = Popup::Chooser {
-                    dir,
-                    kind: SessionKind::Shell,
-                    perm: ClaudePerm::Normal,
-                    resume: None,
-                    group: ChooserGroup::Kind,
-                    action: true,
-                };
-            }
+/// The complete state of one open new-session form. Owned by
+/// `Popup::Chooser`, so it exists exactly as long as the popup is shown and
+/// the resume list can never go stale against a different directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChooserForm {
+    /// The directory the session will be created in.
+    pub dir: PathBuf,
+    /// Selected session kind (the Kind radio group).
+    pub kind: SessionKind,
+    /// Selected Claude permission mode (the Perm radio group; claude-only).
+    pub perm: ClaudePerm,
+    /// Which existing Claude session to resume: `None` = start fresh,
+    /// `Some(i)` = resume `resumes[i]`.
+    pub resume: Option<usize>,
+    /// Which selection group has focus (moved by Up/Down). The selected
+    /// option within each radio group lives in `kind`/`perm`/`resume`; the
+    /// focused button within `Actions` is `action`.
+    pub group: ChooserGroup,
+    /// Focused action button: `false` = Cancel, `true` = Create.
+    pub action: bool,
+    /// Resumable Claude sessions discovered for `dir` when the form opened.
+    /// Indexed by `ChooserRow::Resume`.
+    pub resumes: Vec<ResumeSession>,
+}
+
+impl ChooserForm {
+    /// A fresh form for `dir` with the defaults selected: a plain shell,
+    /// normal permissions, no resume, focus on the Kind group.
+    pub fn new(dir: PathBuf, resumes: Vec<ResumeSession>) -> Self {
+        Self {
+            dir,
+            kind: SessionKind::Shell,
+            perm: ClaudePerm::Normal,
+            resume: None,
+            group: ChooserGroup::Kind,
+            action: true,
+            resumes,
         }
     }
 
-    /// Visible focusable rows for the current chooser kind.
-    pub fn chooser_rows(&self) -> Vec<ChooserRow> {
+    /// Visible focusable rows for the current kind.
+    pub fn rows(&self) -> Vec<ChooserRow> {
         let mut rows = vec![
             ChooserRow::KindShell,
             ChooserRow::KindClaude,
             ChooserRow::KindCodex,
         ];
-        if let Popup::Chooser {
-            kind: SessionKind::Claude,
-            ..
-        } = self.popup
-        {
+        if self.kind == SessionKind::Claude {
             rows.push(ChooserRow::PermNormal);
             rows.push(ChooserRow::PermSkip);
             // Offer the resume picker only when there is history to resume.
-            if !self.chooser_resumes.is_empty() {
+            if !self.resumes.is_empty() {
                 rows.push(ChooserRow::ResumeNew);
-                for i in 0..self.chooser_resumes.len() {
+                for i in 0..self.resumes.len() {
                     rows.push(ChooserRow::Resume(i));
                 }
             }
@@ -107,15 +124,11 @@ impl<R: CommandRunner> App<R> {
     /// The selection groups present for the current kind, in display order.
     /// Perm and Resume only exist for claude (and Resume only when this
     /// directory has history). Up/Down navigation walks this list.
-    pub fn chooser_groups(&self) -> Vec<ChooserGroup> {
+    pub fn groups(&self) -> Vec<ChooserGroup> {
         let mut groups = vec![ChooserGroup::Kind];
-        if let Popup::Chooser {
-            kind: SessionKind::Claude,
-            ..
-        } = self.popup
-        {
+        if self.kind == SessionKind::Claude {
             groups.push(ChooserGroup::Perm);
-            if !self.chooser_resumes.is_empty() {
+            if !self.resumes.is_empty() {
                 groups.push(ChooserGroup::Resume);
             }
         }
@@ -123,45 +136,26 @@ impl<R: CommandRunner> App<R> {
         groups
     }
 
-    /// The currently focused group (defaults to `Kind` when no chooser is open).
-    fn chooser_group(&self) -> ChooserGroup {
-        match self.popup {
-            Popup::Chooser { group, .. } => group,
-            _ => ChooserGroup::Kind,
-        }
-    }
-
     /// The `ChooserRow` that currently has focus: the selected option of the
-    /// focused radio group, or the focused button in `Actions`. Drives both the
-    /// render highlight and what `Enter`/`Space` act on.
-    pub fn chooser_focus_row(&self) -> ChooserRow {
-        let Popup::Chooser {
-            kind,
-            perm,
-            resume,
-            group,
-            action,
-            ..
-        } = self.popup
-        else {
-            return ChooserRow::KindShell;
-        };
-        match group {
-            ChooserGroup::Kind => match kind {
+    /// focused radio group, or the focused button in `Actions`. Drives both
+    /// the render highlight and what `Enter`/`Space` act on.
+    pub fn focus_row(&self) -> ChooserRow {
+        match self.group {
+            ChooserGroup::Kind => match self.kind {
                 SessionKind::Shell => ChooserRow::KindShell,
                 SessionKind::Claude => ChooserRow::KindClaude,
                 SessionKind::Codex => ChooserRow::KindCodex,
             },
-            ChooserGroup::Perm => match perm {
+            ChooserGroup::Perm => match self.perm {
                 ClaudePerm::Normal => ChooserRow::PermNormal,
                 ClaudePerm::Skip => ChooserRow::PermSkip,
             },
-            ChooserGroup::Resume => match resume {
+            ChooserGroup::Resume => match self.resume {
                 None => ChooserRow::ResumeNew,
                 Some(i) => ChooserRow::Resume(i),
             },
             ChooserGroup::Actions => {
-                if action {
+                if self.action {
                     ChooserRow::Create
                 } else {
                     ChooserRow::Cancel
@@ -171,20 +165,19 @@ impl<R: CommandRunner> App<R> {
     }
 
     /// Move focus between groups by `delta` (Up/Down — clamps at the ends).
-    pub fn chooser_group_move(&mut self, delta: i32) {
-        self.chooser_group_step(delta, false);
+    pub fn group_move(&mut self, delta: i32) {
+        self.group_step(delta, false);
     }
 
     /// Cycle focus between groups by `delta` (Tab/Shift-Tab — wraps past the
     /// ends so every group is reachable with one key).
-    pub fn chooser_group_cycle(&mut self, delta: i32) {
-        self.chooser_group_step(delta, true);
+    pub fn group_cycle(&mut self, delta: i32) {
+        self.group_step(delta, true);
     }
 
-    fn chooser_group_step(&mut self, delta: i32, wrap: bool) {
-        let groups = self.chooser_groups();
-        let cur = self.chooser_group();
-        let Some(pos) = groups.iter().position(|g| *g == cur) else {
+    fn group_step(&mut self, delta: i32, wrap: bool) {
+        let groups = self.groups();
+        let Some(pos) = groups.iter().position(|g| *g == self.group) else {
             return;
         };
         let len = groups.len() as i32;
@@ -193,66 +186,149 @@ impl<R: CommandRunner> App<R> {
         } else {
             (pos as i32 + delta).clamp(0, len - 1)
         } as usize;
-        if let Popup::Chooser { group, .. } = &mut self.popup {
-            *group = groups[next];
-        }
+        self.group = groups[next];
     }
 
     /// Change the selected option within the focused group by `delta`
-    /// (Left/Right — clamps within the group). Switching `kind` here may add or
-    /// remove the Perm/Resume groups, which is fine: focus stays on `Kind`.
-    pub fn chooser_option_move(&mut self, delta: i32) {
-        let resume_count = self.chooser_resumes.len() as i32;
-        if let Popup::Chooser {
-            kind,
-            perm,
-            resume,
-            group,
-            action,
-            ..
-        } = &mut self.popup
-        {
-            match group {
-                ChooserGroup::Kind => {
-                    // shell · claude · codex (clamped).
-                    let cur = match *kind {
-                        SessionKind::Shell => 0,
-                        SessionKind::Claude => 1,
-                        SessionKind::Codex => 2,
-                    };
-                    *kind = match (cur + delta).clamp(0, 2) {
-                        0 => SessionKind::Shell,
-                        1 => SessionKind::Claude,
-                        _ => SessionKind::Codex,
-                    };
+    /// (Left/Right — clamps within the group). Switching `kind` here may add
+    /// or remove the Perm/Resume groups, which is fine: focus stays on `Kind`.
+    pub fn option_move(&mut self, delta: i32) {
+        match self.group {
+            ChooserGroup::Kind => {
+                // shell · claude · codex (clamped).
+                let cur = match self.kind {
+                    SessionKind::Shell => 0,
+                    SessionKind::Claude => 1,
+                    SessionKind::Codex => 2,
+                };
+                self.kind = match (cur + delta).clamp(0, 2) {
+                    0 => SessionKind::Shell,
+                    1 => SessionKind::Claude,
+                    _ => SessionKind::Codex,
+                };
+            }
+            ChooserGroup::Perm => {
+                if delta > 0 {
+                    self.perm = ClaudePerm::Skip;
+                } else if delta < 0 {
+                    self.perm = ClaudePerm::Normal;
                 }
-                ChooserGroup::Perm => {
-                    if delta > 0 {
-                        *perm = ClaudePerm::Skip;
-                    } else if delta < 0 {
-                        *perm = ClaudePerm::Normal;
-                    }
+            }
+            ChooserGroup::Resume => {
+                // Option index: 0 = new (None), 1..=n = Some(i-1).
+                let cur = match self.resume {
+                    None => 0,
+                    Some(i) => i as i32 + 1,
+                };
+                let next = (cur + delta).clamp(0, self.resumes.len() as i32);
+                self.resume = if next == 0 {
+                    None
+                } else {
+                    Some((next - 1) as usize)
+                };
+            }
+            ChooserGroup::Actions => {
+                if delta > 0 {
+                    self.action = true;
+                } else if delta < 0 {
+                    self.action = false;
                 }
-                ChooserGroup::Resume => {
-                    // Option index: 0 = new (None), 1..=n = Some(i-1).
-                    let cur = match resume {
-                        None => 0,
-                        Some(i) => *i as i32 + 1,
-                    };
-                    let next = (cur + delta).clamp(0, resume_count);
-                    *resume = if next == 0 {
-                        None
-                    } else {
-                        Some((next - 1) as usize)
-                    };
-                }
-                ChooserGroup::Actions => {
-                    if delta > 0 {
-                        *action = true;
-                    } else if delta < 0 {
-                        *action = false;
-                    }
-                }
+            }
+        }
+    }
+
+    /// Select the option `row` and focus its group — the state half of a
+    /// mouse click. (Acting on the `Cancel`/`Create` buttons needs the app
+    /// and lives in `App::chooser_click`.)
+    pub fn select(&mut self, row: ChooserRow) {
+        match row {
+            ChooserRow::KindShell => {
+                self.kind = SessionKind::Shell;
+                self.group = ChooserGroup::Kind;
+            }
+            ChooserRow::KindClaude => {
+                self.kind = SessionKind::Claude;
+                self.group = ChooserGroup::Kind;
+            }
+            ChooserRow::KindCodex => {
+                self.kind = SessionKind::Codex;
+                self.group = ChooserGroup::Kind;
+            }
+            ChooserRow::PermNormal => {
+                self.perm = ClaudePerm::Normal;
+                self.group = ChooserGroup::Perm;
+            }
+            ChooserRow::PermSkip => {
+                self.perm = ClaudePerm::Skip;
+                self.group = ChooserGroup::Perm;
+            }
+            ChooserRow::ResumeNew => {
+                self.resume = None;
+                self.group = ChooserGroup::Resume;
+            }
+            ChooserRow::Resume(i) => {
+                self.resume = Some(i);
+                self.group = ChooserGroup::Resume;
+            }
+            ChooserRow::Cancel => {
+                self.action = false;
+                self.group = ChooserGroup::Actions;
+            }
+            ChooserRow::Create => {
+                self.action = true;
+                self.group = ChooserGroup::Actions;
+            }
+        }
+    }
+
+    /// The launch command for the form's current selections (see
+    /// [`launch_command`]).
+    pub fn command(&self) -> Option<String> {
+        let resume_id = self.resume.and_then(|i| self.resumes.get(i)).map(|s| &s.id);
+        launch_command(self.kind, self.perm, resume_id)
+    }
+}
+
+/// Build the launch command for a session. Shell sessions run the default
+/// shell (`None`). Claude sessions run `claude`, optionally resuming an
+/// existing session (`--resume <id>`) and/or skipping permission prompts.
+/// Codex sessions run `codex` (the perm/resume inputs are claude-only and
+/// ignored). The command string is handed to a shell by tmux; splicing the
+/// resume id is safe because a [`ResumeId`] is shell-safe by construction.
+pub fn launch_command(
+    kind: SessionKind,
+    perm: ClaudePerm,
+    resume_id: Option<&ResumeId>,
+) -> Option<String> {
+    match kind {
+        SessionKind::Shell => None,
+        SessionKind::Codex => Some(String::from("codex")),
+        SessionKind::Claude => {
+            let mut cmd = String::from("claude");
+            if let Some(id) = resume_id {
+                cmd.push_str(" --resume ");
+                cmd.push_str(id.as_str());
+            }
+            if perm == ClaudePerm::Skip {
+                cmd.push_str(" --dangerously-skip-permissions");
+            }
+            Some(cmd)
+        }
+    }
+}
+
+impl<R: CommandRunner> App<R> {
+    /// Open the new-session chooser for the selected directory row.
+    pub fn open_chooser(&mut self) {
+        if let Some(row) = self.selected_row() {
+            if matches!(row.kind, RowKind::Dir { .. }) {
+                let dir = row.path.clone();
+                // Discover any resumable Claude sessions for this directory now,
+                // so the chooser can offer them once the user picks "claude".
+                let resumes = claude::projects_base()
+                    .map(|base| claude::list_sessions(&base, &dir))
+                    .unwrap_or_default();
+                self.popup = Popup::Chooser(ChooserForm::new(dir, resumes));
             }
         }
     }
@@ -260,53 +336,8 @@ impl<R: CommandRunner> App<R> {
     /// Clicking a row focuses its group, selects that option, and — for the
     /// `Cancel`/`Create` buttons — acts immediately.
     pub fn chooser_click(&mut self, row: ChooserRow) -> io::Result<()> {
-        if let Popup::Chooser {
-            kind,
-            perm,
-            resume,
-            group,
-            action,
-            ..
-        } = &mut self.popup
-        {
-            match row {
-                ChooserRow::KindShell => {
-                    *kind = SessionKind::Shell;
-                    *group = ChooserGroup::Kind;
-                }
-                ChooserRow::KindClaude => {
-                    *kind = SessionKind::Claude;
-                    *group = ChooserGroup::Kind;
-                }
-                ChooserRow::KindCodex => {
-                    *kind = SessionKind::Codex;
-                    *group = ChooserGroup::Kind;
-                }
-                ChooserRow::PermNormal => {
-                    *perm = ClaudePerm::Normal;
-                    *group = ChooserGroup::Perm;
-                }
-                ChooserRow::PermSkip => {
-                    *perm = ClaudePerm::Skip;
-                    *group = ChooserGroup::Perm;
-                }
-                ChooserRow::ResumeNew => {
-                    *resume = None;
-                    *group = ChooserGroup::Resume;
-                }
-                ChooserRow::Resume(i) => {
-                    *resume = Some(i);
-                    *group = ChooserGroup::Resume;
-                }
-                ChooserRow::Cancel => {
-                    *action = false;
-                    *group = ChooserGroup::Actions;
-                }
-                ChooserRow::Create => {
-                    *action = true;
-                    *group = ChooserGroup::Actions;
-                }
-            }
+        if let Popup::Chooser(form) = &mut self.popup {
+            form.select(row);
         }
         if matches!(row, ChooserRow::Cancel | ChooserRow::Create) {
             self.chooser_activate()?;
@@ -316,12 +347,12 @@ impl<R: CommandRunner> App<R> {
 
     /// Act on the focused row (Space / click): the `Cancel`/`Create` buttons
     /// fire; radio options are no-ops here (Left/Right already selected them).
-    /// For "Enter anywhere creates", see `chooser_commit`.
+    /// For "Enter anywhere creates", see [`App::chooser_commit`].
     pub fn chooser_activate(&mut self) -> io::Result<()> {
-        if !matches!(self.popup, Popup::Chooser { .. }) {
+        let Popup::Chooser(form) = &self.popup else {
             return Ok(());
-        }
-        match self.chooser_focus_row() {
+        };
+        match form.focus_row() {
             ChooserRow::Cancel => self.popup = Popup::None,
             ChooserRow::Create => self.create_from_form()?,
             _ => {}
@@ -333,69 +364,30 @@ impl<R: CommandRunner> App<R> {
     /// no matter which group has focus, so the user need not travel to
     /// `[ Create ]`. Enter while parked on `Cancel` still cancels — least surprise.
     pub fn chooser_commit(&mut self) -> io::Result<()> {
-        if !matches!(self.popup, Popup::Chooser { .. }) {
+        let Popup::Chooser(form) = &self.popup else {
             return Ok(());
-        }
-        if matches!(self.chooser_focus_row(), ChooserRow::Cancel) {
+        };
+        if form.focus_row() == ChooserRow::Cancel {
             self.popup = Popup::None;
             return Ok(());
         }
         self.create_from_form()
     }
 
-    /// Build the launch command from the open chooser's selections, close the
-    /// popup, and start the session. Shared by `chooser_activate` (Create button)
-    /// and `chooser_commit` (Enter).
+    /// Close the popup, taking its form, and start the session it describes.
+    /// Shared by [`App::chooser_activate`] (Create button) and
+    /// [`App::chooser_commit`] (Enter).
     fn create_from_form(&mut self) -> io::Result<()> {
-        let Popup::Chooser {
-            dir,
-            kind,
-            perm,
-            resume,
-            ..
-        } = self.popup.clone()
-        else {
+        let Popup::Chooser(form) = std::mem::replace(&mut self.popup, Popup::None) else {
             return Ok(());
         };
-        let resume_id = resume
-            .and_then(|i| self.chooser_resumes.get(i))
-            .map(|s| &s.id);
-        let cmd = Self::chooser_command(kind, perm, resume_id);
-        self.popup = Popup::None;
-        self.create_session(&dir, kind, cmd.as_deref())
+        let cmd = form.command();
+        self.create_session(&form.dir, form.kind, cmd.as_deref())
     }
 
     /// Dismiss the chooser without creating anything.
     pub fn chooser_cancel(&mut self) {
         self.popup = Popup::None;
-    }
-
-    /// Build the launch command for a session. Shell sessions run the default
-    /// shell (`None`). Claude sessions run `claude`, optionally resuming an
-    /// existing session (`--resume <id>`) and/or skipping permission prompts.
-    /// Codex sessions run `codex`. The command string is handed to a shell by
-    /// tmux; splicing the resume id is safe because a [`ResumeId`] is
-    /// shell-safe by construction.
-    pub fn chooser_command(
-        kind: SessionKind,
-        perm: ClaudePerm,
-        resume_id: Option<&ResumeId>,
-    ) -> Option<String> {
-        match kind {
-            SessionKind::Shell => None,
-            SessionKind::Codex => Some(String::from("codex")),
-            SessionKind::Claude => {
-                let mut cmd = String::from("claude");
-                if let Some(id) = resume_id {
-                    cmd.push_str(" --resume ");
-                    cmd.push_str(id.as_str());
-                }
-                if perm == ClaudePerm::Skip {
-                    cmd.push_str(" --dangerously-skip-permissions");
-                }
-                Some(cmd)
-            }
-        }
     }
 }
 
@@ -408,18 +400,27 @@ mod tests {
     use crate::app::Focus;
     use crate::tmux::MockRunner;
 
+    /// The open chooser form, or a panic when no chooser is open.
+    fn form(app: &App<MockRunner>) -> &ChooserForm {
+        match &app.popup {
+            Popup::Chooser(form) => form,
+            other => panic!("expected an open chooser, got {other:?}"),
+        }
+    }
+
+    fn form_mut(app: &mut App<MockRunner>) -> &mut ChooserForm {
+        match &mut app.popup {
+            Popup::Chooser(form) => form,
+            other => panic!("expected an open chooser, got {other:?}"),
+        }
+    }
+
     #[test]
     fn chooser_create_makes_shell_and_switches() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                group: ChooserGroup::Kind,
-                kind: SessionKind::Shell,
-                ..
-            }
-        ));
+        assert_eq!(form(&app).group, ChooserGroup::Kind);
+        assert_eq!(form(&app).kind, SessionKind::Shell);
         push_create_seq(&mut app);
         // focus starts on the tree before the session is created
         assert_eq!(app.focus, Focus::Tree);
@@ -461,7 +462,7 @@ mod tests {
     fn chooser_create_claude_appends_command() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_option_move(1); // Kind group: shell -> claude
+        form_mut(&mut app).option_move(1); // Kind group: shell -> claude
         push_create_seq(&mut app);
         focus_create(&mut app);
         app.chooser_activate().unwrap();
@@ -474,13 +475,7 @@ mod tests {
         // group (shell selected), no travelling down to [ Create ].
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                group: ChooserGroup::Kind,
-                ..
-            }
-        ));
+        assert_eq!(form(&app).group, ChooserGroup::Kind);
         push_create_seq(&mut app);
         app.chooser_commit().unwrap();
         assert!(matches!(app.popup, Popup::None));
@@ -497,93 +492,65 @@ mod tests {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
         // Focus the Actions group on the Cancel button.
-        if let Popup::Chooser { group, action, .. } = &mut app.popup {
-            *group = ChooserGroup::Actions;
-            *action = false;
-        }
+        let form = form_mut(&mut app);
+        form.group = ChooserGroup::Actions;
+        form.action = false;
         app.chooser_commit().unwrap();
         assert!(matches!(app.popup, Popup::None));
         assert_eq!(app.tmux.runner.call_count(), 0); // no session created
     }
 
     #[test]
-    fn chooser_group_move_navigates_groups_and_clamps() {
+    fn form_group_move_navigates_groups_and_clamps() {
         // claude reveals Perm; Up/Down walk groups (Kind -> Perm -> Actions),
         // and Down at the last group clamps.
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
-        app.chooser_option_move(1); // Kind -> claude (reveals Perm group)
-        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
-        app.chooser_group_move(1); // -> Perm
-        assert_eq!(app.chooser_group(), ChooserGroup::Perm);
-        app.chooser_group_move(1); // -> Actions (no resumes here)
-        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
-        app.chooser_group_move(1); // clamp at the end
-        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
-        app.chooser_group_move(-10); // clamp at the start
-        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
+        form.option_move(1); // Kind -> claude (reveals Perm group)
+        assert_eq!(form.group, ChooserGroup::Kind);
+        form.group_move(1); // -> Perm
+        assert_eq!(form.group, ChooserGroup::Perm);
+        form.group_move(1); // -> Actions (no resumes here)
+        assert_eq!(form.group, ChooserGroup::Actions);
+        form.group_move(1); // clamp at the end
+        assert_eq!(form.group, ChooserGroup::Actions);
+        form.group_move(-10); // clamp at the start
+        assert_eq!(form.group, ChooserGroup::Kind);
     }
 
     #[test]
-    fn chooser_option_move_changes_selection_within_group() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
+    fn form_option_move_changes_selection_within_group() {
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
         // Kind group: Right -> claude, Left -> shell (clamps).
-        app.chooser_option_move(1);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                kind: SessionKind::Claude,
-                ..
-            }
-        ));
-        app.chooser_option_move(-5);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                kind: SessionKind::Shell,
-                ..
-            }
-        ));
+        form.option_move(1);
+        assert_eq!(form.kind, SessionKind::Claude);
+        form.option_move(-5);
+        assert_eq!(form.kind, SessionKind::Shell);
         // Back to claude, then walk into Perm and toggle normal -> skip.
-        app.chooser_option_move(1);
-        app.chooser_group_move(1); // -> Perm
-        app.chooser_option_move(1); // normal -> skip
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                perm: ClaudePerm::Skip,
-                ..
-            }
-        ));
-        app.chooser_option_move(-1); // skip -> normal
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                perm: ClaudePerm::Normal,
-                ..
-            }
-        ));
+        form.option_move(1);
+        form.group_move(1); // -> Perm
+        form.option_move(1); // normal -> skip
+        assert_eq!(form.perm, ClaudePerm::Skip);
+        form.option_move(-1); // skip -> normal
+        assert_eq!(form.perm, ClaudePerm::Normal);
     }
 
     #[test]
-    fn chooser_group_cycle_wraps_around_ends() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app); // shell: groups are [Kind, Actions]
-                                    // Shift-Tab from the first group wraps to the last (Actions).
-        app.chooser_group_cycle(-1);
-        assert_eq!(app.chooser_group(), ChooserGroup::Actions);
+    fn form_group_cycle_wraps_around_ends() {
+        // shell: groups are [Kind, Actions].
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
+        // Shift-Tab from the first group wraps to the last (Actions).
+        form.group_cycle(-1);
+        assert_eq!(form.group, ChooserGroup::Actions);
         // Tab from the last group wraps back to the first (Kind).
-        app.chooser_group_cycle(1);
-        assert_eq!(app.chooser_group(), ChooserGroup::Kind);
+        form.group_cycle(1);
+        assert_eq!(form.group, ChooserGroup::Kind);
     }
 
     #[test]
-    fn chooser_defaults_to_shell_with_no_perm_rows() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
+    fn form_defaults_to_shell_with_no_perm_rows() {
+        let form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
         assert_eq!(
-            app.chooser_rows(),
+            form.rows(),
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
@@ -596,16 +563,11 @@ mod tests {
 
     #[test]
     fn focusing_claude_reveals_perm_rows_and_selects_it() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
-        app.chooser_option_move(1); // Kind group: shell -> claude
-        if let Popup::Chooser { kind, .. } = app.popup {
-            assert_eq!(kind, SessionKind::Claude);
-        } else {
-            panic!("expected chooser");
-        }
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
+        form.option_move(1); // Kind group: shell -> claude
+        assert_eq!(form.kind, SessionKind::Claude);
         assert_eq!(
-            app.chooser_rows(),
+            form.rows(),
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
@@ -620,41 +582,30 @@ mod tests {
 
     #[test]
     fn switching_back_to_shell_drops_perm_group() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
-        app.chooser_option_move(1); // Kind -> claude
-        app.chooser_group_move(1); // -> Perm group (normal)
-        app.chooser_option_move(1); // normal -> skip
-        if let Popup::Chooser { perm, .. } = app.popup {
-            assert_eq!(perm, ClaudePerm::Skip);
-        } else {
-            panic!();
-        }
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
+        form.option_move(1); // Kind -> claude
+        form.group_move(1); // -> Perm group (normal)
+        form.option_move(1); // normal -> skip
+        assert_eq!(form.perm, ClaudePerm::Skip);
         // Back on Kind, switch to shell: the Perm group disappears and the
         // focused group stays valid (no stale index to reclamp).
-        app.chooser_group_move(-1); // -> Kind
-        app.chooser_option_move(-1); // claude -> shell
-        if let Popup::Chooser { kind, .. } = app.popup {
-            assert_eq!(kind, SessionKind::Shell);
-        } else {
-            panic!();
-        }
-        assert!(!app.chooser_groups().contains(&ChooserGroup::Perm));
-        assert!(app.chooser_groups().contains(&app.chooser_group()));
+        form.group_move(-1); // -> Kind
+        form.option_move(-1); // claude -> shell
+        assert_eq!(form.kind, SessionKind::Shell);
+        assert!(!form.groups().contains(&ChooserGroup::Perm));
+        assert!(form.groups().contains(&form.group));
     }
 
     #[test]
-    fn claude_chooser_lists_resume_rows_when_history_exists() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
-        // Inject discovered sessions (open_chooser found none for the tempdir).
-        app.chooser_resumes = vec![
+    fn claude_form_lists_resume_rows_when_history_exists() {
+        let resumes = vec![
             fake_resume("aaa", "do a thing"),
             fake_resume("bbb", "do another"),
         ];
-        app.chooser_option_move(1); // Kind group: shell -> claude
+        let mut form = ChooserForm::new(PathBuf::from("/p"), resumes);
+        form.option_move(1); // Kind group: shell -> claude
         assert_eq!(
-            app.chooser_rows(),
+            form.rows(),
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
@@ -669,9 +620,9 @@ mod tests {
             ]
         );
         // Switching back to shell hides the resume rows again.
-        app.chooser_click(ChooserRow::KindShell).unwrap();
+        form.select(ChooserRow::KindShell);
         assert_eq!(
-            app.chooser_rows(),
+            form.rows(),
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
@@ -686,14 +637,10 @@ mod tests {
     fn chooser_create_claude_resume_appends_resume_flag() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_resumes = vec![fake_resume("sess-xyz", "fix the parser")];
+        form_mut(&mut app).resumes = vec![fake_resume("sess-xyz", "fix the parser")];
         app.chooser_click(ChooserRow::KindClaude).unwrap();
         app.chooser_click(ChooserRow::Resume(0)).unwrap();
-        if let Popup::Chooser { resume, .. } = app.popup {
-            assert_eq!(resume, Some(0));
-        } else {
-            panic!("expected chooser");
-        }
+        assert_eq!(form(&app).resume, Some(0));
         push_create_seq(&mut app);
         app.chooser_click(ChooserRow::Create).unwrap();
         assert!(app
@@ -704,54 +651,59 @@ mod tests {
     }
 
     #[test]
-    fn chooser_command_maps_kind_and_perm() {
+    fn launch_command_maps_kind_and_perm() {
         let id = ResumeId::new("abc-123").expect("test id is shell-safe");
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal, None),
+            launch_command(SessionKind::Shell, ClaudePerm::Normal, None),
             None
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, None)
-                .as_deref(),
+            launch_command(SessionKind::Claude, ClaudePerm::Normal, None).as_deref(),
             Some("claude")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, None)
-                .as_deref(),
+            launch_command(SessionKind::Claude, ClaudePerm::Skip, None).as_deref(),
             Some("claude --dangerously-skip-permissions")
         );
         // Resuming an existing session injects --resume <id>, before the perm flag.
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, Some(&id))
-                .as_deref(),
+            launch_command(SessionKind::Claude, ClaudePerm::Normal, Some(&id)).as_deref(),
             Some("claude --resume abc-123")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, Some(&id))
-                .as_deref(),
+            launch_command(SessionKind::Claude, ClaudePerm::Skip, Some(&id)).as_deref(),
             Some("claude --resume abc-123 --dangerously-skip-permissions")
         );
         // Codex ignores the claude-only perm/resume inputs and just runs `codex`.
         assert_eq!(
-            App::<MockRunner>::chooser_command(SessionKind::Codex, ClaudePerm::Skip, Some(&id))
-                .as_deref(),
+            launch_command(SessionKind::Codex, ClaudePerm::Skip, Some(&id)).as_deref(),
             Some("codex")
         );
     }
 
     #[test]
+    fn form_command_resolves_the_selected_resume() {
+        let mut form = ChooserForm::new(
+            PathBuf::from("/p"),
+            vec![fake_resume("sess-abc", "earlier work")],
+        );
+        form.kind = SessionKind::Claude;
+        assert_eq!(form.command().as_deref(), Some("claude"));
+        form.resume = Some(0);
+        assert_eq!(form.command().as_deref(), Some("claude --resume sess-abc"));
+        // An out-of-range index (impossible via navigation) falls back to fresh.
+        form.resume = Some(9);
+        assert_eq!(form.command().as_deref(), Some("claude"));
+    }
+
+    #[test]
     fn focusing_codex_selects_it_without_perm_rows() {
-        let (_d, mut app) = app_over_tempdir();
-        open_dir_chooser(&mut app);
-        app.chooser_option_move(2); // Kind group: shell -> claude -> codex
-        if let Popup::Chooser { kind, .. } = app.popup {
-            assert_eq!(kind, SessionKind::Codex);
-        } else {
-            panic!("expected chooser");
-        }
+        let mut form = ChooserForm::new(PathBuf::from("/p"), Vec::new());
+        form.option_move(2); // Kind group: shell -> claude -> codex
+        assert_eq!(form.kind, SessionKind::Codex);
         // Codex offers no permission/resume rows (those are claude-only).
         assert_eq!(
-            app.chooser_rows(),
+            form.rows(),
             vec![
                 ChooserRow::KindShell,
                 ChooserRow::KindClaude,
@@ -766,7 +718,7 @@ mod tests {
     fn chooser_create_codex_runs_codex_and_tags_session() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_option_move(2); // Kind group: shell -> claude -> codex
+        form_mut(&mut app).option_move(2); // Kind group: shell -> claude -> codex
         push_create_seq(&mut app);
         focus_create(&mut app);
         app.chooser_activate().unwrap();
@@ -781,9 +733,10 @@ mod tests {
     fn chooser_activate_create_starts_claude_skip() {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
-        app.chooser_option_move(1); // Kind -> claude
-        app.chooser_group_move(1); // -> Perm group
-        app.chooser_option_move(1); // normal -> skip
+        let form = form_mut(&mut app);
+        form.option_move(1); // Kind -> claude
+        form.group_move(1); // -> Perm group
+        form.option_move(1); // normal -> skip
         focus_create(&mut app);
         push_create_seq(&mut app);
         app.chooser_activate().unwrap();
@@ -798,10 +751,9 @@ mod tests {
         let (_d, mut app) = app_over_tempdir();
         open_dir_chooser(&mut app);
         // Focus the Actions group on the Cancel button.
-        if let Popup::Chooser { group, action, .. } = &mut app.popup {
-            *group = ChooserGroup::Actions;
-            *action = false;
-        }
+        let form = form_mut(&mut app);
+        form.group = ChooserGroup::Actions;
+        form.action = false;
         app.chooser_activate().unwrap();
         assert_eq!(app.popup, Popup::None);
         assert_eq!(app.tmux.runner.call_count(), 0);

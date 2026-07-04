@@ -273,19 +273,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 drop(screen_guard);
                 match &app.popup {
                     Popup::Help => ui::render_help(f, f.area()),
-                    Popup::Chooser {
-                        kind, perm, resume, ..
-                    } => {
-                        let focus_row = app.chooser_focus_row();
-                        (chooser_rect, chooser_hits) = ui::render_chooser(
-                            f,
-                            f.area(),
-                            *kind,
-                            *perm,
-                            &app.chooser_resumes,
-                            *resume,
-                            focus_row,
-                        );
+                    Popup::Chooser(form) => {
+                        (chooser_rect, chooser_hits) = ui::render_chooser(f, f.area(), form);
                     }
                     Popup::ConfirmClose { slug } => {
                         confirm_buttons = ui::render_confirm_close(f, f.area(), slug);

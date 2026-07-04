@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use crate::app::rows::{build_project_rows, build_rows, Row, RowKind};
 use crate::app::viewer::FileView;
-use crate::project::claude::ResumeSession;
 use crate::project::config::Config;
 use crate::project::git::GitStatuses;
 use crate::project::tree::Tree;
@@ -23,7 +22,7 @@ pub mod rows;
 pub(crate) mod testutil;
 pub mod viewer;
 
-pub use chooser::{ChooserGroup, ChooserRow};
+pub use chooser::{ChooserForm, ChooserGroup, ChooserRow};
 
 const MIN_SPLIT: u16 = 15;
 const MAX_SPLIT: u16 = 80;
@@ -77,21 +76,10 @@ pub enum Popup {
     None,
     /// The keybinding help overlay.
     Help,
-    /// The new-session form (kind / permission / resume radio groups).
-    Chooser {
-        dir: PathBuf,
-        kind: SessionKind,
-        perm: crate::tmux::session::ClaudePerm,
-        /// Which existing Claude session to resume: `None` = start fresh,
-        /// `Some(i)` = resume `App::chooser_resumes[i]`.
-        resume: Option<usize>,
-        /// Which selection group has focus (moved by Up/Down). The selected
-        /// option within each radio group lives in `kind`/`perm`/`resume`; the
-        /// focused button within `Actions` is `action`.
-        group: ChooserGroup,
-        /// Focused action button: `false` = Cancel, `true` = Create.
-        action: bool,
-    },
+    /// The new-session form. All of its state — the selections, the focus
+    /// position, and the discovered resume list — lives in the carried
+    /// [`ChooserForm`], so it exists exactly as long as the popup is open.
+    Chooser(ChooserForm),
     /// "Really close this session?" — opened by `x`/`[×]`, resolved by
     /// `confirm_close`/`cancel_close`. Keyed off the slug (not a row index) so a
     /// periodic `sync` between opening and confirming can't redirect the kill.
@@ -142,9 +130,6 @@ pub struct App<R: CommandRunner> {
     pub focus: Focus,
     /// The modal overlay currently shown, if any.
     pub popup: Popup,
-    /// Resumable Claude sessions for the directory the chooser is open on,
-    /// discovered when the chooser opens. Indexed by `ChooserRow::Resume`.
-    pub chooser_resumes: Vec<ResumeSession>,
     /// One-line message shown in the status bar (last action or error).
     pub status: String,
     /// Width of the tree pane as a percent of the terminal, clamped 15–80.
@@ -204,7 +189,6 @@ impl<R: CommandRunner> App<R> {
             viewer: None,
             focus: Focus::Tree,
             popup: Popup::None,
-            chooser_resumes: Vec::new(),
             status: String::new(),
             split_pct,
             tree_offset: 0,

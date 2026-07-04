@@ -31,9 +31,9 @@ pub(crate) fn open_dir_chooser(app: &mut App<MockRunner>) {
 
 /// Move focus to the `[ Create ]` button (Actions group, Create selected).
 pub(crate) fn focus_create(app: &mut App<MockRunner>) {
-    if let Popup::Chooser { group, action, .. } = &mut app.popup {
-        *group = ChooserGroup::Actions;
-        *action = true;
+    if let Popup::Chooser(form) = &mut app.popup {
+        form.group = ChooserGroup::Actions;
+        form.action = true;
     }
 }
 

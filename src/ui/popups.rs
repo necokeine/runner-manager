@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::ChooserRow;
+use crate::app::{ChooserForm, ChooserRow};
 use crate::project::claude::ResumeSession;
 use crate::tmux::session::{ClaudePerm, SessionKind};
 
@@ -104,22 +104,21 @@ fn options_line(
     Line::from(spans)
 }
 
-/// Draw the new-session form. Options are grouped (Kind / Permission / Resume /
-/// actions); the layout puts each group's label on its own line with its
-/// options laid out horizontally below it, mirroring the navigation model
-/// (Up/Down between groups, Left/Right between options). Returns the popup's
-/// rect plus the clickable column span `(y, x_start, x_end, row)` of every
-/// *drawn* option — lines clipped off a short popup register no hits, so a
-/// click below the popup can never activate an invisible control.
+/// Draw the new-session form from its [`ChooserForm`] state. Options are
+/// grouped (Kind / Permission / Resume / actions); the layout puts each
+/// group's label on its own line with its options laid out horizontally below
+/// it, mirroring the navigation model (Up/Down between groups, Left/Right
+/// between options). Returns the popup's rect plus the clickable column span
+/// `(y, x_start, x_end, row)` of every *drawn* option — lines clipped off a
+/// short popup register no hits, so a click below the popup can never
+/// activate an invisible control.
 pub fn render_chooser(
     f: &mut Frame,
     area: Rect,
-    kind: SessionKind,
-    perm: ClaudePerm,
-    resumes: &[ResumeSession],
-    resume_sel: Option<usize>,
-    focus_row: ChooserRow,
+    form: &ChooserForm,
 ) -> (Rect, Vec<(u16, u16, u16, ChooserRow)>) {
+    let (kind, perm, resumes, resume_sel) = (form.kind, form.perm, &form.resumes, form.resume);
+    let focus_row = form.focus_row();
     let popup = centered_rect(50, 70, area);
     f.render_widget(Clear, popup);
     let block = Block::default().title("New session").borders(Borders::ALL);
@@ -330,9 +329,30 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::ChooserGroup;
     use crate::project::claude::ResumeId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    /// A form in the given state; the focus fields (`group`/`action`) are set
+    /// so `focus_row()` lands where each test needs it.
+    fn form(
+        kind: SessionKind,
+        perm: ClaudePerm,
+        resumes: Vec<ResumeSession>,
+        resume: Option<usize>,
+        group: ChooserGroup,
+        action: bool,
+    ) -> ChooserForm {
+        let mut form = ChooserForm::new(PathBuf::from("/p"), resumes);
+        form.kind = kind;
+        form.perm = perm;
+        form.resume = resume;
+        form.group = group;
+        form.action = action;
+        form
+    }
 
     #[test]
     fn centered_rect_is_centered() {
@@ -357,17 +377,18 @@ mod tests {
     fn render_chooser_draws_radios_and_buttons() {
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
+        // Focus on [ Create ]: Actions group with the Create button selected.
+        let chooser = form(
+            SessionKind::Claude,
+            ClaudePerm::Skip,
+            Vec::new(),
+            None,
+            ChooserGroup::Actions,
+            true,
+        );
         terminal
             .draw(|f| {
-                let (_, rows) = render_chooser(
-                    f,
-                    f.area(),
-                    SessionKind::Claude,
-                    ClaudePerm::Skip,
-                    &[],
-                    None,
-                    ChooserRow::Create,
-                );
+                let (_, rows) = render_chooser(f, f.area(), &chooser);
                 assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::Create));
             })
             .unwrap();
@@ -388,17 +409,18 @@ mod tests {
             modified: std::time::SystemTime::UNIX_EPOCH,
         }];
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        // Focus on the first resume entry: Resume group with entry 0 selected.
+        let chooser = form(
+            SessionKind::Claude,
+            ClaudePerm::Normal,
+            resumes,
+            Some(0),
+            ChooserGroup::Resume,
+            true,
+        );
         terminal
             .draw(|f| {
-                let (_, rows) = render_chooser(
-                    f,
-                    f.area(),
-                    SessionKind::Claude,
-                    ClaudePerm::Normal,
-                    &resumes,
-                    Some(0),
-                    ChooserRow::Resume(0),
-                );
+                let (_, rows) = render_chooser(f, f.area(), &chooser);
                 assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::Resume(0)));
                 assert!(rows.iter().any(|(_, _, _, r)| *r == ChooserRow::ResumeNew));
             })
@@ -485,17 +507,18 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut popup = Rect::default();
         let mut hits = Vec::new();
+        // Focus on the claude kind radio: Kind group with claude selected.
+        let chooser = form(
+            SessionKind::Claude,
+            ClaudePerm::Normal,
+            resumes,
+            None,
+            ChooserGroup::Kind,
+            true,
+        );
         terminal
             .draw(|f| {
-                (popup, hits) = render_chooser(
-                    f,
-                    f.area(),
-                    SessionKind::Claude,
-                    ClaudePerm::Normal,
-                    &resumes,
-                    None,
-                    ChooserRow::KindClaude,
-                );
+                (popup, hits) = render_chooser(f, f.area(), &chooser);
             })
             .unwrap();
         let inner_bottom = popup.y + popup.height - 1; // last border row
@@ -509,17 +532,11 @@ mod tests {
     fn render_chooser_lays_kind_options_horizontally() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         let mut hits = Vec::new();
+        // Focus on the shell kind radio: the form's defaults.
+        let chooser = ChooserForm::new(PathBuf::from("/p"), Vec::new());
         terminal
             .draw(|f| {
-                (_, hits) = render_chooser(
-                    f,
-                    f.area(),
-                    SessionKind::Shell,
-                    ClaudePerm::Normal,
-                    &[],
-                    None,
-                    ChooserRow::KindShell,
-                );
+                (_, hits) = render_chooser(f, f.area(), &chooser);
             })
             .unwrap();
         let shell = hits
