@@ -8,7 +8,7 @@
 use std::io;
 
 use crate::app::rows::RowKind;
-use crate::project::claude;
+use crate::project::claude::{self, ResumeId};
 use crate::tmux::session::{ClaudePerm, SessionKind};
 use crate::tmux::CommandRunner;
 
@@ -359,7 +359,7 @@ impl<R: CommandRunner> App<R> {
         };
         let resume_id = resume
             .and_then(|i| self.chooser_resumes.get(i))
-            .map(|s| s.id.as_str());
+            .map(|s| &s.id);
         let cmd = Self::chooser_command(kind, perm, resume_id);
         self.popup = Popup::None;
         self.create_session(&dir, kind, cmd.as_deref())
@@ -373,11 +373,13 @@ impl<R: CommandRunner> App<R> {
     /// Build the launch command for a session. Shell sessions run the default
     /// shell (`None`). Claude sessions run `claude`, optionally resuming an
     /// existing session (`--resume <id>`) and/or skipping permission prompts.
-    /// Codex sessions run `codex`.
+    /// Codex sessions run `codex`. The command string is handed to a shell by
+    /// tmux; splicing the resume id is safe because a [`ResumeId`] is
+    /// shell-safe by construction.
     pub fn chooser_command(
         kind: SessionKind,
         perm: ClaudePerm,
-        resume_id: Option<&str>,
+        resume_id: Option<&ResumeId>,
     ) -> Option<String> {
         match kind {
             SessionKind::Shell => None,
@@ -386,7 +388,7 @@ impl<R: CommandRunner> App<R> {
                 let mut cmd = String::from("claude");
                 if let Some(id) = resume_id {
                     cmd.push_str(" --resume ");
-                    cmd.push_str(id);
+                    cmd.push_str(id.as_str());
                 }
                 if perm == ClaudePerm::Skip {
                     cmd.push_str(" --dangerously-skip-permissions");
@@ -703,6 +705,7 @@ mod tests {
 
     #[test]
     fn chooser_command_maps_kind_and_perm() {
+        let id = ResumeId::new("abc-123").expect("test id is shell-safe");
         assert_eq!(
             App::<MockRunner>::chooser_command(SessionKind::Shell, ClaudePerm::Normal, None),
             None
@@ -719,31 +722,19 @@ mod tests {
         );
         // Resuming an existing session injects --resume <id>, before the perm flag.
         assert_eq!(
-            App::<MockRunner>::chooser_command(
-                SessionKind::Claude,
-                ClaudePerm::Normal,
-                Some("abc-123")
-            )
-            .as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Normal, Some(&id))
+                .as_deref(),
             Some("claude --resume abc-123")
         );
         assert_eq!(
-            App::<MockRunner>::chooser_command(
-                SessionKind::Claude,
-                ClaudePerm::Skip,
-                Some("abc-123")
-            )
-            .as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Claude, ClaudePerm::Skip, Some(&id))
+                .as_deref(),
             Some("claude --resume abc-123 --dangerously-skip-permissions")
         );
         // Codex ignores the claude-only perm/resume inputs and just runs `codex`.
         assert_eq!(
-            App::<MockRunner>::chooser_command(
-                SessionKind::Codex,
-                ClaudePerm::Skip,
-                Some("abc-123")
-            )
-            .as_deref(),
+            App::<MockRunner>::chooser_command(SessionKind::Codex, ClaudePerm::Skip, Some(&id))
+                .as_deref(),
             Some("codex")
         );
     }

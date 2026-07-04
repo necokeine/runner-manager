@@ -5,10 +5,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
-};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -16,12 +13,15 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{col_to_split_pct, App, ChooserRow, Focus, Popup};
+use crate::app::{App, Popup};
 use crate::project::git::GitStatuses;
-use crate::term::keys::{encode_key, encode_wheel};
 use crate::term::pty::{read_screen, ParserHandle, Pty};
 use crate::tmux::{SystemRunner, Tmux};
-use crate::ui::{self, Hit, PaneHit};
+use crate::ui;
+
+mod input;
+
+use input::{Action, Geometry, Router};
 
 /// Minimum idle gap between git-status scans, measured from when the previous
 /// scan *finished*. The scan runs on a background thread, so this only bounds
@@ -200,24 +200,18 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
 
     let mut last_term_size: (u16, u16) = (0, 0);
     let mut last_sync = Instant::now();
-    let mut area_width: u16 = 0;
-    let mut dragging_split = false;
-    // Clickable chooser regions: (row y, x start, x end inclusive, the row),
-    // plus the popup rect so a click inside it that misses every control is a
-    // harmless no-op rather than a cancel.
-    let mut chooser_rect = ratatui::layout::Rect::default();
-    let mut chooser_row_ys: Vec<(u16, u16, u16, ChooserRow)> = Vec::new();
-    // Confirm-close buttons: (row y, x start, x end inclusive, true = Yes).
-    let mut confirm_buttons: Vec<(u16, u16, u16, bool)> = Vec::new();
+    // Translates key/mouse events into `App` mutations and the loop-owned
+    // side effects below (quit, PTY writes, git scans); see `run::input`.
+    let mut router = Router::new();
 
     // The render is by far the most expensive thing this loop does (it copies
     // the whole embedded-terminal grid and rebuilds every widget), so we only
     // draw when something actually changed. `dirty` starts `true` for the first
     // frame; thereafter it is re-armed by terminal output, input events, resize,
-    // the periodic sync, and background git results. The last computed layout is
-    // kept so mouse hit-testing still works on frames we skip drawing.
+    // the periodic sync, and background git results. The last drawn frame's
+    // geometry is kept so mouse hit-testing still works on frames we skip.
     let mut dirty = true;
-    let mut layout: Option<ui::Layout> = None;
+    let mut geom: Option<Geometry> = None;
 
     let result = loop {
         // Apply a finished background git scan, if one landed since last frame.
@@ -263,6 +257,10 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         // Only pay for a render when something changed since the last frame.
         if dirty {
             let mut captured: Option<ui::Layout> = None;
+            let mut area_width = 0;
+            let mut chooser_rect = ratatui::layout::Rect::default();
+            let mut chooser_hits = Vec::new();
+            let mut confirm_buttons = Vec::new();
             let draw_res = terminal.draw(|f| {
                 area_width = f.area().width;
                 let screen_guard = if app.viewer.is_none() {
@@ -279,7 +277,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                         kind, perm, resume, ..
                     } => {
                         let focus_row = app.chooser_focus_row();
-                        (chooser_rect, chooser_row_ys) = ui::render_chooser(
+                        (chooser_rect, chooser_hits) = ui::render_chooser(
                             f,
                             f.area(),
                             *kind,
@@ -298,18 +296,24 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             if let Err(e) = draw_res {
                 break Err(e);
             }
-            let new_layout = captured.expect("render returns a Layout");
+            let layout = captured.expect("render returns a Layout");
 
             if app.viewer.is_none() {
                 if let Some(p) = &mut pty {
-                    let term_size = (new_layout.term_area.height, new_layout.term_area.width);
+                    let term_size = (layout.term_area.height, layout.term_area.width);
                     if term_size != last_term_size && term_size.0 > 0 && term_size.1 > 0 {
                         let _ = p.resize(term_size.0, term_size.1);
                         last_term_size = term_size;
                     }
                 }
             }
-            layout = Some(new_layout);
+            geom = Some(Geometry {
+                layout,
+                chooser_rect,
+                chooser_hits,
+                confirm_buttons,
+                area_width,
+            });
             dirty = false;
         }
 
@@ -321,9 +325,9 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             Err(e) => break Err(e),
         }
 
-        // We have drawn at least once (the first pass starts `dirty`), so a
-        // layout is always available for hit-testing here.
-        let layout = layout.as_ref().expect("a frame is drawn before any event");
+        // We have drawn at least once (the first pass starts `dirty`), so
+        // geometry is always available for hit-testing here.
+        let frame = geom.as_ref().expect("a frame is drawn before any event");
 
         let event = event::read();
         // Any input we act on — a keypress, a mouse action, or a terminal
@@ -334,203 +338,28 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             _ => {}
         }
 
-        match event {
+        // Route the event; the router mutates `app` directly and hands back
+        // the side effects only this loop can perform.
+        let action = match event {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                match app.popup.clone() {
-                    Popup::Help => {
-                        app.popup = Popup::None;
-                    }
-                    Popup::Chooser { .. } => match key.code {
-                        KeyCode::Esc => app.chooser_cancel(),
-                        // Enter commits the form from any group (Cancel still
-                        // cancels); Space acts on the focused button.
-                        KeyCode::Enter => {
-                            let _ = app.chooser_commit();
-                        }
-                        KeyCode::Char(' ') => {
-                            let _ = app.chooser_activate();
-                        }
-                        // Up/Down move between selection groups; Left/Right
-                        // change the option within the focused group.
-                        KeyCode::Down | KeyCode::Char('j') => app.chooser_group_move(1),
-                        KeyCode::Up | KeyCode::Char('k') => app.chooser_group_move(-1),
-                        KeyCode::Right | KeyCode::Char('l') => app.chooser_option_move(1),
-                        KeyCode::Left | KeyCode::Char('h') => app.chooser_option_move(-1),
-                        KeyCode::Tab => app.chooser_group_cycle(1),
-                        KeyCode::BackTab => app.chooser_group_cycle(-1),
-                        _ => {}
-                    },
-                    Popup::ConfirmClose { .. } => match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            let _ = app.confirm_close();
-                        }
-                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                            app.cancel_close()
-                        }
-                        _ => {}
-                    },
-                    Popup::None => {
-                        if key.code == KeyCode::Char('q')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            app.toggle_focus();
-                        } else {
-                            match app.focus {
-                                Focus::Tree => match key.code {
-                                    KeyCode::Char('q') => break Ok(()),
-                                    KeyCode::Char('h') | KeyCode::Char('?') => {
-                                        app.popup = Popup::Help;
-                                    }
-                                    KeyCode::Tab => app.toggle_tab(),
-                                    KeyCode::Char('a') => app.open_chooser(),
-                                    KeyCode::Char('x') => app.request_close(app.selected),
-                                    KeyCode::Char('j') | KeyCode::Down => app.down(),
-                                    KeyCode::Char('k') | KeyCode::Up => app.up(),
-                                    KeyCode::Enter => {
-                                        let _ = app.activate();
-                                    }
-                                    KeyCode::Char('<') => app.narrow_split(),
-                                    KeyCode::Char('>') => app.widen_split(),
-                                    // Toggle git-status colouring (off by
-                                    // default). Turning it on kicks an
-                                    // immediate scan so colours appear promptly.
-                                    KeyCode::Char('g') => {
-                                        let now_on = app.toggle_git_status();
-                                        if now_on && !git_inflight {
-                                            spawn_git_scan(app.root.clone(), git_tx.clone());
-                                            git_inflight = true;
-                                        }
-                                    }
-                                    _ => {}
-                                },
-                                Focus::Right => {
-                                    if app.viewer.is_some() {
-                                        match key.code {
-                                            KeyCode::Char('j') | KeyCode::Down => {
-                                                app.viewer_scroll(1, false)
-                                            }
-                                            KeyCode::Char('k') | KeyCode::Up => {
-                                                app.viewer_scroll(-1, false)
-                                            }
-                                            KeyCode::PageDown => app.viewer_scroll(1, true),
-                                            KeyCode::PageUp => app.viewer_scroll(-1, true),
-                                            _ => {}
-                                        }
-                                    } else if let Some(p) = &mut pty {
-                                        let _ = p.write_input(&encode_key(key));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                router.route_key(&mut app, key)
+            }
+            Ok(Event::Mouse(m)) => router.route_mouse(&mut app, m, frame),
+            Ok(_) => None,
+            Err(e) => break Err(e),
+        };
+        match action {
+            Some(Action::Quit) => break Ok(()),
+            Some(Action::WriteToPty(bytes)) => {
+                if let Some(p) = &mut pty {
+                    let _ = p.write_input(&bytes);
                 }
             }
-            Ok(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::Down(MouseButton::Left) => match app.popup.clone() {
-                    Popup::Help => app.popup = Popup::None,
-                    Popup::Chooser { .. } => {
-                        match ui::resolve_span(m.column, m.row, &chooser_row_ys) {
-                            Some(row) => {
-                                let _ = app.chooser_click(*row);
-                            }
-                            // A miss inside the popup (a group label, a blank
-                            // line) keeps the form; only a click outside
-                            // cancels it.
-                            None if !chooser_rect.contains((m.column, m.row).into()) => {
-                                app.chooser_cancel()
-                            }
-                            None => {}
-                        }
-                    }
-                    Popup::ConfirmClose { .. } => {
-                        // Only a click on the "[ Yes ]" text itself confirms
-                        // the kill; the No button or anywhere else dismisses.
-                        match ui::resolve_span(m.column, m.row, &confirm_buttons) {
-                            Some(true) => {
-                                let _ = app.confirm_close();
-                            }
-                            _ => app.cancel_close(),
-                        }
-                    }
-                    Popup::None => {
-                        let border = layout.split_col;
-                        let on_border =
-                            m.column + 1 >= border && m.column <= border.saturating_add(1);
-                        if let Some(tab) = ui::resolve_tab_click(m.column, m.row, &layout.tabs) {
-                            app.focus = Focus::Tree;
-                            app.set_tab(tab);
-                        } else if on_border {
-                            dragging_split = true;
-                        } else {
-                            match ui::resolve_pane_click(
-                                m.column,
-                                m.row,
-                                layout.split_col,
-                                &layout.tree,
-                                &app.rows,
-                            ) {
-                                PaneHit::Right => app.focus = Focus::Right,
-                                PaneHit::Tree(hit) => {
-                                    app.focus = Focus::Tree;
-                                    match hit {
-                                        Some(Hit::Row(idx)) => {
-                                            app.selected = idx;
-                                            let _ = app.activate();
-                                        }
-                                        Some(Hit::Button(idx)) => {
-                                            app.selected = idx;
-                                            app.open_chooser();
-                                        }
-                                        Some(Hit::Close(idx)) => {
-                                            app.selected = idx;
-                                            app.request_close(idx);
-                                        }
-                                        None => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    if dragging_split {
-                        app.split_pct = col_to_split_pct(m.column, area_width);
-                    }
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    // Save the dragged width once the drag ends, not on every
-                    // intermediate move.
-                    if dragging_split {
-                        app.persist_split();
-                    }
-                    dragging_split = false;
-                }
-                MouseEventKind::ScrollDown => {
-                    if matches!(app.popup, Popup::None) {
-                        if m.column < layout.split_col {
-                            app.scroll_tree(3, layout.tree.view_h as usize);
-                        } else if let Some(v) = &mut app.viewer {
-                            v.scroll_down(3);
-                        } else {
-                            forward_wheel(&mut pty, false, m.column, m.row, layout.term_area);
-                        }
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    if matches!(app.popup, Popup::None) {
-                        if m.column < layout.split_col {
-                            app.scroll_tree(-3, layout.tree.view_h as usize);
-                        } else if let Some(v) = &mut app.viewer {
-                            v.scroll_up(3);
-                        } else {
-                            forward_wheel(&mut pty, true, m.column, m.row, layout.term_area);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Ok(_) => {}
-            Err(e) => break Err(e),
+            Some(Action::SpawnGitScan) if !git_inflight => {
+                spawn_git_scan(app.root.clone(), git_tx.clone());
+                git_inflight = true;
+            }
+            Some(Action::SpawnGitScan) | None => {}
         }
 
         // The embedded terminal PTY dies when the last tmux session exits. If a
@@ -562,22 +391,4 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // defuse the guard and run the checked restore directly.
     guard.defused = true;
     result.and(restore_terminal_checked())
-}
-
-/// Forward a mouse-wheel tick to the embedded terminal, but only when a live
-/// client exists and the pointer is over its pane. Screen coordinates are
-/// translated to the tmux client's 1-based, pane-local origin so the wheel
-/// report lands on the right pane; tmux (`mouse on`) turns it into scrollback
-/// scrolling, revealing the old logs.
-fn forward_wheel(pty: &mut Option<Pty>, up: bool, col: u16, row: u16, term: ratatui::layout::Rect) {
-    let Some(p) = pty else { return };
-    if !p.is_alive() {
-        return;
-    }
-    let in_pane =
-        col >= term.x && row >= term.y && col < term.x + term.width && row < term.y + term.height;
-    if !in_pane {
-        return;
-    }
-    let _ = p.write_input(&encode_wheel(up, col - term.x + 1, row - term.y + 1));
 }

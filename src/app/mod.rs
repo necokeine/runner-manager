@@ -70,7 +70,7 @@ impl TreeTab {
 }
 
 /// The modal overlay currently shown, if any. While a popup is open it owns
-/// all key and mouse input (see the routing in `run.rs`).
+/// all key and mouse input (see the routing in `run/input.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Popup {
     /// No popup; input goes to the focused pane.
