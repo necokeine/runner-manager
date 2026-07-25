@@ -1,7 +1,8 @@
-//! Lazy filesystem tree for the left pane: children are read from disk on
-//! first expand, directories sorted before files. The expanded set can be
-//! collected (`expanded_dirs`) and re-applied (`apply_expanded`) so it
-//! survives restarts via `config.rs`.
+//! Lazy filesystem tree for the left pane: children are read from disk when a
+//! directory is expanded (re-read on every expand, so the listing is never
+//! stale), directories sorted before files. The expanded set can be collected
+//! (`expanded_dirs`) and re-applied (`apply_expanded`) so it survives restarts
+//! via `config.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,8 +61,35 @@ impl Node {
         self.children = Some(entries);
     }
 
-    /// Flip a directory between expanded and collapsed, loading its children on
-    /// the first expand. No-op on files.
+    /// Re-read this directory from disk while keeping the tree state of
+    /// entries that still exist: a surviving subdirectory keeps its expanded
+    /// flag and loaded subtree, and expanded survivors are refreshed
+    /// recursively so everything visible under this node is current. New
+    /// entries appear collapsed; vanished ones are dropped. No-op on files.
+    pub fn refresh_children(&mut self) {
+        if !self.is_dir {
+            return;
+        }
+        let mut old = self.children.take().unwrap_or_default();
+        self.load_children();
+        for child in self.children.as_mut().into_iter().flatten() {
+            if let Some(i) = old
+                .iter()
+                .position(|o| o.path == child.path && o.is_dir == child.is_dir)
+            {
+                let prev = old.swap_remove(i);
+                child.expanded = prev.expanded;
+                child.children = prev.children;
+                if child.expanded {
+                    child.refresh_children();
+                }
+            }
+        }
+    }
+
+    /// Flip a directory between expanded and collapsed. Every expand re-reads
+    /// the directory from disk (see [`Node::refresh_children`]) so the listing
+    /// is never stale. No-op on files.
     pub fn toggle(&mut self) {
         if !self.is_dir {
             return;
@@ -69,9 +97,7 @@ impl Node {
         if self.expanded {
             self.expanded = false;
         } else {
-            if self.children.is_none() {
-                self.load_children();
-            }
+            self.refresh_children();
             self.expanded = true;
         }
     }
@@ -211,6 +237,36 @@ mod tests {
         let node = tree.node_at_mut(&zsub).unwrap();
         assert!(!node.expanded);
         assert!(node.children.is_some());
+    }
+
+    #[test]
+    fn expand_rereads_children_from_disk() {
+        let dir = setup();
+        let mut tree = Tree::new(dir.path().to_path_buf());
+        let zsub = dir.path().join("zsub");
+        tree.node_at_mut(&zsub).unwrap().toggle(); // expand: loads children
+        tree.node_at_mut(&zsub).unwrap().toggle(); // collapse
+        fs::write(zsub.join("added.txt"), "z").unwrap();
+        fs::remove_file(zsub.join("inner.txt")).unwrap();
+        tree.node_at_mut(&zsub).unwrap().toggle(); // expand again: re-reads disk
+        assert_eq!(child_names(tree.node_at_mut(&zsub).unwrap()), ["added.txt"]);
+    }
+
+    #[test]
+    fn expand_refresh_preserves_and_refreshes_expanded_descendants() {
+        let dir = setup();
+        let zsub = dir.path().join("zsub");
+        let deep = zsub.join("deep");
+        fs::create_dir(&deep).unwrap();
+        let mut tree = Tree::new(dir.path().to_path_buf());
+        tree.node_at_mut(&zsub).unwrap().toggle(); // expand zsub
+        tree.node_at_mut(&deep).unwrap().toggle(); // expand zsub/deep (empty)
+        tree.node_at_mut(&zsub).unwrap().toggle(); // collapse zsub only
+        fs::write(deep.join("fresh.txt"), "z").unwrap();
+        tree.node_at_mut(&zsub).unwrap().toggle(); // expand again
+        let deep_node = tree.node_at_mut(&deep).unwrap();
+        assert!(deep_node.expanded, "expanded state survives the refresh");
+        assert_eq!(child_names(deep_node), ["fresh.txt"]);
     }
 
     #[test]
