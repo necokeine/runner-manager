@@ -170,9 +170,9 @@ impl<R: CommandRunner> Tmux<R> {
     /// Tag a session with its directory and kind so it can be re-adopted into
     /// the tree on a later run. Stored as one user option `@rm` = "<kind> <dir>"
     /// (kind has no spaces, so the dir is everything after the first space).
-    /// A dir containing a tab or newline would corrupt the tab-delimited
-    /// `list_sessions_full` format, so such a session is left untagged (it
-    /// still works; it just won't be re-adopted on a later run).
+    /// tmux replaces every control character in format output with `_`, so a
+    /// dir containing one could never be read back as itself; such a session is
+    /// left untagged (it still works; it just won't be re-adopted later).
     ///
     /// # Errors
     ///
@@ -180,24 +180,29 @@ impl<R: CommandRunner> Tmux<R> {
     /// exited non-zero (no such session).
     pub fn tag_session(&self, slug: &str, dir: &Path, kind: &str) -> io::Result<()> {
         let dir = path_str(dir)?;
-        if dir.contains(['\t', '\n']) {
+        if dir.chars().any(char::is_control) {
             return Ok(());
         }
         let value = format!("{kind} {dir}");
-        let target = exact(slug);
+        let target = exact_pane(slug);
         self.run_ok(&["set-option", "-t", &target, "@rm", &value], "set-option")
     }
 
     /// List live sessions with their `@rm` tag split back into kind + dir, plus
-    /// the active pane's foreground command. The three fields are tab-delimited;
-    /// the `@rm` tag itself is "<kind> <dir>" (space-separated, and `tag_session`
-    /// refuses tab-containing dirs) and a command never contains a tab, so a
-    /// three-way `splitn` is unambiguous.
+    /// the active pane's foreground command.
+    ///
+    /// The three fields are `|`-delimited. The delimiter has to be a *printable*
+    /// character: tmux rewrites every control character in format output as `_`,
+    /// so the tab this format used to rely on never survived — every session
+    /// came back as one unsplittable field with an empty tag, which is why none
+    /// could be re-adopted. `|` appears in neither the slugs we generate nor a
+    /// pane's command name, and the `@rm` tag comes last so a `|` inside a
+    /// tagged directory is harmless.
     pub fn list_sessions_full(&self) -> io::Result<Vec<SessionInfo>> {
         let out = self.run(&[
             "list-sessions",
             "-F",
-            "#{session_name}\t#{@rm}\t#{pane_current_command}",
+            "#{session_name}|#{pane_current_command}|#{@rm}",
         ])?;
         if !out.success {
             return Ok(Vec::new());
@@ -206,13 +211,13 @@ impl<R: CommandRunner> Tmux<R> {
             .stdout
             .lines()
             .filter_map(|l| {
-                let mut cols = l.splitn(3, '\t');
+                let mut cols = l.splitn(3, '|');
                 let name = cols.next()?.trim().to_string();
                 if name.is_empty() {
                     return None;
                 }
-                let tag = cols.next().unwrap_or("").trim();
                 let command = cols.next().unwrap_or("").trim().to_string();
+                let tag = cols.next().unwrap_or("").trim();
                 let (kind, dir) = match tag.split_once(' ') {
                     Some((k, d)) => (k.to_string(), d.to_string()),
                     None => (String::new(), String::new()),
@@ -287,6 +292,16 @@ impl<R: CommandRunner> Tmux<R> {
 /// deliberately prefix-shaped sibling slugs (`src-shell`, `src-shell-2`).
 fn exact(slug: &str) -> String {
     format!("={slug}")
+}
+
+/// The same exact session, spelled the way `set-option` needs it. Unlike
+/// `switch-client`/`kill-session`, `set-option` resolves its `-t` as a *pane*
+/// target, and a bare `=<name>` is not one — tmux rejects it outright with
+/// "no such session: =<name>". Naming the session as the session half of a
+/// `session:window` target (window left empty, i.e. the session's current one)
+/// keeps the exact match and is accepted.
+fn exact_pane(slug: &str) -> String {
+    format!("={slug}:")
 }
 
 /// `path` as UTF-8, or an error naming the problem — tmux arguments are
@@ -525,6 +540,8 @@ mod tests {
         let tmux = Tmux::new("runner", runner);
         tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell")
             .unwrap();
+        // `=src-shell:` — the session named exactly, as a target `set-option`
+        // accepts; a bare `=src-shell` is rejected ("no such session").
         assert_eq!(
             tmux.runner.nth_call(0),
             vec![
@@ -532,7 +549,7 @@ mod tests {
                 "runner",
                 "set-option",
                 "-t",
-                "=src-shell",
+                "=src-shell:",
                 "@rm",
                 "shell /tmp/proj/src"
             ]
@@ -540,7 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn tag_session_skips_dirs_that_would_corrupt_the_tag() {
+    fn tag_session_skips_dirs_tmux_could_not_read_back() {
+        // tmux rewrites control characters in format output as `_`, so a dir
+        // holding one would come back as a different path: don't tag at all.
         let runner = MockRunner::new();
         let tmux = Tmux::new("runner", runner);
         tmux.tag_session("x-shell", Path::new("/tmp/a\tb"), "shell")
@@ -551,8 +570,12 @@ mod tests {
     #[test]
     fn list_sessions_full_splits_tag_into_kind_and_dir() {
         let runner = MockRunner::new();
-        // a tagged claude session, a tagged shell session, and the untagged scratch client
-        runner.push(true, "src-claude\tclaude /tmp/proj/src\tnode\nroot-shell\tshell /tmp/proj\tvim\nscratch\t\tzsh\n");
+        // a tagged claude session, a tagged shell session, and an untagged
+        // hand-made one
+        runner.push(
+            true,
+            "src-claude|node|claude /tmp/proj/src\nroot-shell|vim|shell /tmp/proj\nscratch|zsh|\n",
+        );
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
@@ -562,7 +585,7 @@ mod tests {
                 "runner",
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{@rm}\t#{pane_current_command}"
+                "#{session_name}|#{pane_current_command}|#{@rm}"
             ]
         );
         assert_eq!(infos.len(), 3);
@@ -584,7 +607,8 @@ mod tests {
                 command: "vim".into()
             }
         );
-        // scratch (no tag) -> empty dir/kind so it won't be adopted into the tree
+        // the hand-made session (no tag) -> empty dir/kind so it won't be
+        // adopted into the tree
         assert_eq!(
             infos[2],
             SessionInfo {
@@ -597,20 +621,38 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_full_tolerates_missing_command_column() {
-        // Older tags / mocked rows without the command column still parse, just
-        // with an empty brief.
+    fn list_sessions_full_keeps_delimiters_inside_the_tagged_dir() {
+        // The tag is the last field, so a `|` in the directory stays part of
+        // it rather than eating the next column.
         let runner = MockRunner::new();
-        runner.push(true, "root-shell\tshell /tmp/proj\n");
+        runner.push(true, "odd-shell|zsh|shell /tmp/a|b\n");
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
             infos[0],
             SessionInfo {
-                name: "root-shell".into(),
-                dir: "/tmp/proj".into(),
+                name: "odd-shell".into(),
+                dir: "/tmp/a|b".into(),
                 kind: "shell".into(),
-                command: String::new()
+                command: "zsh".into()
+            }
+        );
+    }
+
+    #[test]
+    fn list_sessions_full_tolerates_a_missing_tag_column() {
+        // A row without the trailing tag column still parses, just untagged.
+        let runner = MockRunner::new();
+        let tmux = Tmux::new("runner", runner);
+        tmux.runner.push(true, "root-shell|vim\n");
+        let infos = tmux.list_sessions_full().unwrap();
+        assert_eq!(
+            infos[0],
+            SessionInfo {
+                name: "root-shell".into(),
+                dir: String::new(),
+                kind: String::new(),
+                command: "vim".into()
             }
         );
     }
