@@ -15,7 +15,8 @@ use ratatui::Terminal;
 
 use crate::app::{App, Popup};
 use crate::project::git::GitStatuses;
-use crate::term::pty::{read_screen, ParserHandle, Pty};
+use crate::term::embedded::EmbeddedTerm;
+use crate::term::pty::read_screen;
 use crate::tmux::{SystemRunner, Tmux};
 use crate::ui;
 
@@ -36,16 +37,6 @@ fn spawn_git_scan(root: PathBuf, tx: Sender<GitStatuses>) {
     thread::spawn(move || {
         let _ = tx.send(GitStatuses::load(&root));
     });
-}
-
-/// Spawn the embedded terminal PTY attached to `session` on `socket`
-/// (`new-session -A` attaches if the session exists, creates it otherwise).
-fn spawn_attached_pty(socket: &str, session: &str) -> io::Result<Pty> {
-    Pty::spawn(
-        &["tmux", "-S", socket, "new-session", "-A", "-s", session],
-        24,
-        80,
-    )
 }
 
 /// Global options every tmux server we talk to must carry. Applied after a
@@ -156,22 +147,16 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     // Label the terminal pane with the recovered session from the first frame;
     // `sync` later reconciles this against the client's real session.
     app.current_session = latest.clone();
-    let mut pty: Option<Pty> = None;
-    let mut parser: Option<ParserHandle> = None;
+    let mut term = EmbeddedTerm::new(socket);
     if let Some(name) = &latest {
-        match spawn_attached_pty(&socket, name) {
-            Ok(p) => {
-                parser = Some(p.parser());
-                pty = Some(p);
-            }
-            Err(e) => return Err(e), // the guard restores the terminal
-        }
+        // A failed spawn aborts startup; the guard restores the terminal.
+        term.spawn_attached(name)?;
     }
 
     // Only wait for / configure a tmux server when we actually attached a
     // client. With no sessions there is no server to talk to yet; the first
     // `create_session` starts one and the respawn path re-applies the options.
-    if pty.is_some() {
+    if term.is_attached() {
         for _ in 0..20 {
             if app.host_client_ready() {
                 break;
@@ -198,7 +183,6 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
     }
     let mut last_git = Instant::now();
 
-    let mut last_term_size: (u16, u16) = (0, 0);
     let mut last_sync = Instant::now();
     // Translates key/mouse events into `App` mutations and the loop-owned
     // side effects below (quit, PTY writes, git scans); see `run::input`.
@@ -239,10 +223,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         }
 
         // Fresh output from the embedded terminal is a reason to redraw.
-        if let Some(p) = &pty {
-            if p.take_dirty() {
-                dirty = true;
-            }
+        if term.take_dirty() {
+            dirty = true;
         }
 
         // Reconcile sessions once a second. Sync can change the row list,
@@ -264,7 +246,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             let draw_res = terminal.draw(|f| {
                 area_width = f.area().width;
                 let screen_guard = if app.viewer.is_none() {
-                    parser.as_ref().map(read_screen)
+                    term.parser().map(read_screen)
                 } else {
                     None
                 };
@@ -273,19 +255,8 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
                 drop(screen_guard);
                 match &app.popup {
                     Popup::Help => ui::render_help(f, f.area()),
-                    Popup::Chooser {
-                        kind, perm, resume, ..
-                    } => {
-                        let focus_row = app.chooser_focus_row();
-                        (chooser_rect, chooser_hits) = ui::render_chooser(
-                            f,
-                            f.area(),
-                            *kind,
-                            *perm,
-                            &app.chooser_resumes,
-                            *resume,
-                            focus_row,
-                        );
+                    Popup::Chooser(form) => {
+                        (chooser_rect, chooser_hits) = ui::render_chooser(f, f.area(), form);
                     }
                     Popup::ConfirmClose { slug } => {
                         confirm_buttons = ui::render_confirm_close(f, f.area(), slug);
@@ -299,13 +270,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
             let layout = captured.expect("render returns a Layout");
 
             if app.viewer.is_none() {
-                if let Some(p) = &mut pty {
-                    let term_size = (layout.term_area.height, layout.term_area.width);
-                    if term_size != last_term_size && term_size.0 > 0 && term_size.1 > 0 {
-                        let _ = p.resize(term_size.0, term_size.1);
-                        last_term_size = term_size;
-                    }
-                }
+                term.resize_to(layout.term_area.height, layout.term_area.width);
             }
             geom = Some(Geometry {
                 layout,
@@ -350,11 +315,7 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         };
         match action {
             Some(Action::Quit) => break Ok(()),
-            Some(Action::WriteToPty(bytes)) => {
-                if let Some(p) = &mut pty {
-                    let _ = p.write_input(&bytes);
-                }
-            }
+            Some(Action::WriteToPty(bytes)) => term.write_input(&bytes),
             Some(Action::SpawnGitScan) if !git_inflight => {
                 spawn_git_scan(app.root.clone(), git_tx.clone());
                 git_inflight = true;
@@ -365,17 +326,16 @@ pub fn run(root: PathBuf, socket: String) -> io::Result<()> {
         // The embedded terminal PTY dies when the last tmux session exits. If a
         // new session was just created with no client to switch into, respawn
         // the PTY attached to it so the right pane fills with the new session.
+        // A request that arrives while the PTY is still alive (a transient
+        // empty `list-clients` while the client was starting) is deliberately
+        // dropped rather than yanking a healthy client: the next `sync`
+        // reconciles `current_session`, and re-selecting the session switches
+        // normally.
         if let Some(slug) = app.pending_respawn.take() {
-            let needs_spawn = pty.as_ref().is_none_or(|p| !p.is_alive());
-            if needs_spawn {
-                if let Ok(p) = spawn_attached_pty(&socket, &slug) {
-                    parser = Some(p.parser());
-                    pty = Some(p);
-                    last_term_size = (0, 0); // force a resize so the session fills the pane
-                                             // A brand-new tmux server lost the global options; re-apply.
-                    apply_tmux_options(&app.tmux);
-                    app.status = format!("reopened terminal for {slug}");
-                }
+            if term.respawn_if_dead(&slug) {
+                // A brand-new tmux server lost the global options; re-apply.
+                apply_tmux_options(&app.tmux);
+                app.status = format!("reopened terminal for {slug}");
             }
         }
     };

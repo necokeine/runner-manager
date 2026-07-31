@@ -206,13 +206,21 @@ fn chooser_key<R: CommandRunner>(app: &mut App<R>, key: KeyEvent) {
         KeyCode::Char(' ') => {
             let _ = app.chooser_activate();
         }
-        KeyCode::Down | KeyCode::Char('j') => app.chooser_group_move(1),
-        KeyCode::Up | KeyCode::Char('k') => app.chooser_group_move(-1),
-        KeyCode::Right | KeyCode::Char('l') => app.chooser_option_move(1),
-        KeyCode::Left | KeyCode::Char('h') => app.chooser_option_move(-1),
-        KeyCode::Tab => app.chooser_group_cycle(1),
-        KeyCode::BackTab => app.chooser_group_cycle(-1),
-        _ => {}
+        // Pure form navigation goes straight to the form.
+        code => {
+            let Popup::Chooser(form) = &mut app.popup else {
+                return;
+            };
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => form.group_move(1),
+                KeyCode::Up | KeyCode::Char('k') => form.group_move(-1),
+                KeyCode::Right | KeyCode::Char('l') => form.option_move(1),
+                KeyCode::Left | KeyCode::Char('h') => form.option_move(-1),
+                KeyCode::Tab => form.group_cycle(1),
+                KeyCode::BackTab => form.group_cycle(-1),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -633,13 +641,12 @@ mod tests {
 
         // A hit selects the option.
         router.route_mouse(&mut app, left_down(15, 5), &geom);
-        assert!(matches!(
-            app.popup,
-            Popup::Chooser {
-                kind: crate::tmux::session::SessionKind::Claude,
-                ..
+        match &app.popup {
+            Popup::Chooser(form) => {
+                assert_eq!(form.kind, crate::tmux::session::SessionKind::Claude)
             }
-        ));
+            other => panic!("expected an open chooser, got {other:?}"),
+        }
         // A miss inside the popup keeps the form open.
         router.route_mouse(&mut app, left_down(11, 4), &geom);
         assert!(matches!(app.popup, Popup::Chooser { .. }));
