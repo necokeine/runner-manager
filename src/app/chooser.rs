@@ -771,10 +771,11 @@ mod tests {
         focus_create(&mut app);
         app.chooser_activate().unwrap();
         assert!(app.tmux.runner.nth_call(0).contains(&"codex".to_string()));
-        // The @rm tag records the codex kind so a later run re-adopts it.
+        // The @rm tag records the codex kind so a later run re-adopts it as
+        // codex rather than falling back to reading the slug.
         let tag = app.tmux.runner.nth_call(1);
         assert_eq!(tag[2], "set-option");
-        assert!(tag.iter().any(|a| a.starts_with("codex ")));
+        assert_eq!(tag.last().map(String::as_str), Some("codex"));
     }
 
     #[test]

@@ -19,11 +19,18 @@ pub struct CmdOutput {
     pub stdout: String,
 }
 
-/// A live tmux session plus the metadata this tool tags it with at creation
-/// (`@rm` = "<kind> <dir>"). `kind`/`dir` are empty for sessions we did not
-/// create (the embedded `scratch` client, or anything made by hand). `command`
-/// is the foreground command of the session's active pane (`pane_current_command`),
-/// used as a one-word "session brief" in the project view.
+/// A live tmux session as the tree needs it.
+///
+/// `dir` is tmux's own `session_path` — the directory the session was created
+/// in, which (unlike a pane's cwd) does not follow a `cd` and exists for every
+/// session, tagged or not. `kind` comes from the `@rm` tag this tool sets at
+/// creation and is empty for a session it did not create or could not tag;
+/// [`SessionKind::from_slug`] recovers it from the name in that case.
+/// `command` is the foreground command of the active pane
+/// (`pane_current_command`), used as a one-word "session brief" in the project
+/// view.
+///
+/// [`SessionKind::from_slug`]: session::SessionKind::from_slug
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub name: String,
@@ -167,42 +174,35 @@ impl<R: CommandRunner> Tmux<R> {
             .collect())
     }
 
-    /// Tag a session with its directory and kind so it can be re-adopted into
-    /// the tree on a later run. Stored as one user option `@rm` = "<kind> <dir>"
-    /// (kind has no spaces, so the dir is everything after the first space).
-    /// tmux replaces every control character in format output with `_`, so a
-    /// dir containing one could never be read back as itself; such a session is
-    /// left untagged (it still works; it just won't be re-adopted later).
+    /// Tag a session with its kind so a later run knows what runs inside it.
+    /// Stored as one user option `@rm` = "<kind>". The session's directory is
+    /// deliberately *not* recorded here — tmux's own `session_path` already
+    /// holds it for every session, including ones we failed to tag.
     ///
     /// # Errors
     ///
-    /// Fails if `dir` is not valid UTF-8, or if tmux could not be spawned or
-    /// exited non-zero (no such session).
-    pub fn tag_session(&self, slug: &str, dir: &Path, kind: &str) -> io::Result<()> {
-        let dir = path_str(dir)?;
-        if dir.chars().any(char::is_control) {
-            return Ok(());
-        }
-        let value = format!("{kind} {dir}");
+    /// Fails if tmux could not be spawned or exited non-zero (no such session).
+    pub fn tag_session(&self, slug: &str, kind: &str) -> io::Result<()> {
         let target = exact_pane(slug);
-        self.run_ok(&["set-option", "-t", &target, "@rm", &value], "set-option")
+        self.run_ok(&["set-option", "-t", &target, "@rm", kind], "set-option")
     }
 
-    /// List live sessions with their `@rm` tag split back into kind + dir, plus
-    /// the active pane's foreground command.
+    /// List live sessions with the directory each was created in, its `@rm`
+    /// kind tag, and the active pane's foreground command.
     ///
-    /// The three fields are `|`-delimited. The delimiter has to be a *printable*
+    /// The four fields are `|`-delimited. The delimiter has to be a *printable*
     /// character: tmux rewrites every control character in format output as `_`,
     /// so the tab this format used to rely on never survived — every session
-    /// came back as one unsplittable field with an empty tag, which is why none
-    /// could be re-adopted. `|` appears in neither the slugs we generate nor a
-    /// pane's command name, and the `@rm` tag comes last so a `|` inside a
-    /// tagged directory is harmless.
+    /// came back as one unsplittable field, which is why none could be
+    /// re-adopted. `|` appears in neither the slugs we generate, a kind tag, nor
+    /// a pane's command name, and the directory comes last so a `|` inside it is
+    /// harmless. A tag written by an older build was "<kind> <dir>", so only the
+    /// first word of the tag is read as the kind.
     pub fn list_sessions_full(&self) -> io::Result<Vec<SessionInfo>> {
         let out = self.run(&[
             "list-sessions",
             "-F",
-            "#{session_name}|#{pane_current_command}|#{@rm}",
+            "#{session_name}|#{@rm}|#{pane_current_command}|#{session_path}",
         ])?;
         if !out.success {
             return Ok(Vec::new());
@@ -211,17 +211,15 @@ impl<R: CommandRunner> Tmux<R> {
             .stdout
             .lines()
             .filter_map(|l| {
-                let mut cols = l.splitn(3, '|');
+                let mut cols = l.splitn(4, '|');
                 let name = cols.next()?.trim().to_string();
                 if name.is_empty() {
                     return None;
                 }
-                let command = cols.next().unwrap_or("").trim().to_string();
                 let tag = cols.next().unwrap_or("").trim();
-                let (kind, dir) = match tag.split_once(' ') {
-                    Some((k, d)) => (k.to_string(), d.to_string()),
-                    None => (String::new(), String::new()),
-                };
+                let kind = tag.split_whitespace().next().unwrap_or("").to_string();
+                let command = cols.next().unwrap_or("").trim().to_string();
+                let dir = cols.next().unwrap_or("").trim().to_string();
                 Some(SessionInfo {
                     name,
                     dir,
@@ -538,8 +536,7 @@ mod tests {
         let runner = MockRunner::new();
         runner.push(true, "");
         let tmux = Tmux::new("runner", runner);
-        tmux.tag_session("src-shell", Path::new("/tmp/proj/src"), "shell")
-            .unwrap();
+        tmux.tag_session("src-shell", "shell").unwrap();
         // `=src-shell:` — the session named exactly, as a target `set-option`
         // accepts; a bare `=src-shell` is rejected ("no such session").
         assert_eq!(
@@ -551,30 +548,19 @@ mod tests {
                 "-t",
                 "=src-shell:",
                 "@rm",
-                "shell /tmp/proj/src"
+                "shell"
             ]
         );
     }
 
     #[test]
-    fn tag_session_skips_dirs_tmux_could_not_read_back() {
-        // tmux rewrites control characters in format output as `_`, so a dir
-        // holding one would come back as a different path: don't tag at all.
+    fn list_sessions_full_reads_kind_tag_and_session_path() {
         let runner = MockRunner::new();
-        let tmux = Tmux::new("runner", runner);
-        tmux.tag_session("x-shell", Path::new("/tmp/a\tb"), "shell")
-            .unwrap();
-        assert_eq!(tmux.runner.call_count(), 0);
-    }
-
-    #[test]
-    fn list_sessions_full_splits_tag_into_kind_and_dir() {
-        let runner = MockRunner::new();
-        // a tagged claude session, a tagged shell session, and an untagged
-        // hand-made one
+        // a tagged claude session, a tagged shell session, and an untagged one
+        // left by a build that could not write the tag
         runner.push(
             true,
-            "src-claude|node|claude /tmp/proj/src\nroot-shell|vim|shell /tmp/proj\nscratch|zsh|\n",
+            "src-claude|claude|node|/tmp/proj/src\nroot-shell|shell|vim|/tmp/proj\nold-codex||zsh|/tmp/proj/old\n",
         );
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
@@ -585,7 +571,7 @@ mod tests {
                 "runner",
                 "list-sessions",
                 "-F",
-                "#{session_name}|#{pane_current_command}|#{@rm}"
+                "#{session_name}|#{@rm}|#{pane_current_command}|#{session_path}"
             ]
         );
         assert_eq!(infos.len(), 3);
@@ -607,13 +593,13 @@ mod tests {
                 command: "vim".into()
             }
         );
-        // the hand-made session (no tag) -> empty dir/kind so it won't be
-        // adopted into the tree
+        // No tag, but tmux still reports where it was started — enough to place
+        // it in the tree, with the kind read off the slug by the caller.
         assert_eq!(
             infos[2],
             SessionInfo {
-                name: "scratch".into(),
-                dir: String::new(),
+                name: "old-codex".into(),
+                dir: "/tmp/proj/old".into(),
                 kind: String::new(),
                 command: "zsh".into()
             }
@@ -621,11 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_full_keeps_delimiters_inside_the_tagged_dir() {
-        // The tag is the last field, so a `|` in the directory stays part of
-        // it rather than eating the next column.
+    fn list_sessions_full_reads_a_legacy_kind_and_dir_tag() {
+        // An older build wrote `@rm` as "<kind> <dir>"; only the kind is taken
+        // from it now, and the dir comes from tmux either way.
         let runner = MockRunner::new();
-        runner.push(true, "odd-shell|zsh|shell /tmp/a|b\n");
+        runner.push(true, "root-shell|shell /tmp/proj|vim|/tmp/proj\n");
+        let tmux = Tmux::new("runner", runner);
+        let infos = tmux.list_sessions_full().unwrap();
+        assert_eq!(infos[0].kind, "shell");
+        assert_eq!(infos[0].dir, "/tmp/proj");
+    }
+
+    #[test]
+    fn list_sessions_full_keeps_delimiters_inside_the_directory() {
+        // The directory is the last field, so a `|` in it stays part of the
+        // path rather than eating the next column.
+        let runner = MockRunner::new();
+        runner.push(true, "odd-shell|shell|zsh|/tmp/a|b\n");
         let tmux = Tmux::new("runner", runner);
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
@@ -640,18 +638,18 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_full_tolerates_a_missing_tag_column() {
-        // A row without the trailing tag column still parses, just untagged.
+    fn list_sessions_full_tolerates_a_missing_path_column() {
+        // A row without the trailing path column still parses, just unplaceable.
         let runner = MockRunner::new();
         let tmux = Tmux::new("runner", runner);
-        tmux.runner.push(true, "root-shell|vim\n");
+        tmux.runner.push(true, "root-shell|shell|vim\n");
         let infos = tmux.list_sessions_full().unwrap();
         assert_eq!(
             infos[0],
             SessionInfo {
                 name: "root-shell".into(),
                 dir: String::new(),
-                kind: String::new(),
+                kind: "shell".into(),
                 command: "vim".into()
             }
         );
