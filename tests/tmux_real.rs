@@ -57,7 +57,7 @@ fn tag_session_round_trips_and_never_tags_a_prefix_sibling() {
     tmux.new_session("src-shell-2", dir, None).expect("sibling");
     tmux.new_session("src-shell", dir, None).expect("session");
 
-    tmux.tag_session("src-shell", dir, "claude").expect("tag");
+    tmux.tag_session("src-shell", "claude").expect("tag");
 
     let infos = tmux.list_sessions_full().expect("list");
     let tagged = infos
@@ -71,7 +71,8 @@ fn tag_session_round_trips_and_never_tags_a_prefix_sibling() {
         .find(|i| i.name == "src-shell-2")
         .expect("sibling listed");
     assert_eq!(sibling.kind, "", "the sibling must be left untagged");
-    assert_eq!(sibling.dir, "");
+    // Its directory still comes back — tmux knows it without any tag.
+    assert_eq!(sibling.dir, "/tmp");
 }
 
 #[test]
@@ -87,13 +88,9 @@ fn sessions_from_a_previous_run_are_recovered_into_the_tree() {
     std::fs::create_dir(&sub).expect("subdir");
     let previous = &server.tmux;
     previous.new_session("root-shell", &root, None).expect("a");
-    previous
-        .tag_session("root-shell", &root, "shell")
-        .expect("tag a");
+    previous.tag_session("root-shell", "shell").expect("tag a");
     previous.new_session("src-claude", &sub, None).expect("b");
-    previous
-        .tag_session("src-claude", &sub, "claude")
-        .expect("tag b");
+    previous.tag_session("src-claude", "claude").expect("tag b");
 
     // This run starts with an empty store and reconciles against tmux.
     let mut app = App::new(root.clone(), Tmux::new(server.socket.clone(), SystemRunner));
@@ -121,6 +118,44 @@ fn sessions_from_a_previous_run_are_recovered_into_the_tree() {
 }
 
 #[test]
+fn untagged_sessions_left_by_an_older_build_are_still_recovered() {
+    let Some(server) = server() else {
+        return;
+    };
+    // Sessions created while the `@rm` tag could not be written: tmux knows
+    // where each was started and the slug says what runs inside, and that has
+    // to be enough — these are exactly the sessions a user still has open.
+    let root_dir = TempDir::new().expect("root");
+    let root: PathBuf = root_dir.path().canonicalize().expect("canonical root");
+    let sub = root.join("polymarket-backend");
+    std::fs::create_dir(&sub).expect("subdir");
+    let older = &server.tmux;
+    older
+        .new_session("polymarket-backend-claude", &sub, None)
+        .expect("claude");
+    older
+        .new_session("polymarket-backend-shell", &sub, None)
+        .expect("shell");
+
+    let mut app = App::new(root.clone(), Tmux::new(server.socket.clone(), SystemRunner));
+    app.sync().expect("sync");
+
+    let by_dir = app.store.by_dir();
+    let rows = by_dir.get(&sub).expect("untagged sessions recovered");
+    assert_eq!(rows.len(), 2);
+    let claude = rows
+        .iter()
+        .find(|r| r.slug == "polymarket-backend-claude")
+        .expect("claude session");
+    assert_eq!(claude.kind, SessionKind::Claude, "kind read off the slug");
+    let shell = rows
+        .iter()
+        .find(|r| r.slug == "polymarket-backend-shell")
+        .expect("shell session");
+    assert_eq!(shell.kind, SessionKind::Shell);
+}
+
+#[test]
 fn tag_session_fails_when_the_exact_session_is_absent() {
     let Some(server) = server() else {
         return;
@@ -131,7 +166,7 @@ fn tag_session_fails_when_the_exact_session_is_absent() {
 
     // Only the sibling exists: tagging `src-shell` must be an error, not a
     // silent write onto `src-shell-2`.
-    assert!(tmux.tag_session("src-shell", dir, "shell").is_err());
+    assert!(tmux.tag_session("src-shell", "shell").is_err());
     let infos = tmux.list_sessions_full().expect("list");
     assert_eq!(infos[0].name, "src-shell-2");
     assert_eq!(infos[0].kind, "");

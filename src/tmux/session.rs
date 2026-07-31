@@ -66,6 +66,25 @@ impl SessionKind {
             _ => SessionKind::Shell,
         }
     }
+
+    /// Recover the kind from a slug `create` generated (`<dirslug>-<kind>[-N]`),
+    /// for sessions that carry no `@rm` tag — those left by a build whose tag
+    /// write silently failed, so the slug is all that is left to go on. A name
+    /// that doesn't end in a known kind is a shell, same as an unknown tag.
+    pub fn from_slug(slug: &str) -> SessionKind {
+        // Drop the `-N` disambiguator `create` appends to a repeated dir+kind,
+        // so `src-claude-2` reads the same as `src-claude`.
+        let base = match slug.rsplit_once('-') {
+            Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() => {
+                head
+            }
+            _ => slug,
+        };
+        match base.rsplit_once('-') {
+            Some((_, kind)) => SessionKind::from_tag(kind),
+            None => SessionKind::from_tag(base),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,8 +121,8 @@ impl SessionStore {
 
     /// Register a new session for `dir` and return its unique slug
     /// (`<dirslug>-<kind>`, suffixed `-2`, `-3`, … on collision). Uniqueness
-    /// considers both tracked entries and `taken` — live tmux session names
-    /// the store doesn't track (untagged/hand-made) — because `new-session`
+    /// considers both tracked entries and `taken` — every live tmux session
+    /// name, including any the store doesn't track — because `new-session`
     /// hard-fails on a duplicate name.
     pub fn create(
         &mut self,
@@ -140,9 +159,8 @@ impl SessionStore {
         self.entries.retain(|e| e.slug != slug);
     }
 
-    /// Pull live sessions that this tool created on a previous run (they carry a
-    /// `@rm` dir tag) back into the store. Sessions already tracked, or without a
-    /// directory tag (the embedded client, hand-made sessions), are skipped.
+    /// Pull live sessions from a previous run back into the store, each under
+    /// the directory tmux reports for it. Sessions already tracked are skipped.
     /// Returns the slugs newly adopted.
     pub fn adopt(&mut self, sessions: &[(String, PathBuf, SessionKind)]) -> Vec<String> {
         let mut adopted = Vec::new();
@@ -161,8 +179,8 @@ impl SessionStore {
     }
 
     /// The directory a tracked session was created in, looked up by slug.
-    /// `None` for an untracked slug (e.g. an untagged hand-made session that
-    /// was never adopted into the store).
+    /// `None` for an untracked slug (e.g. a session tmux reports no directory
+    /// for, which cannot be placed in the tree).
     pub fn dir_of(&self, slug: &str) -> Option<&Path> {
         self.entries
             .iter()
@@ -295,6 +313,25 @@ mod tests {
             SessionKind::from_tag(SessionKind::Codex.label_base()),
             SessionKind::Codex
         );
+    }
+
+    #[test]
+    fn kind_from_slug_reads_the_trailing_kind() {
+        assert_eq!(SessionKind::from_slug("src-claude"), SessionKind::Claude);
+        assert_eq!(SessionKind::from_slug("src-claude-2"), SessionKind::Claude);
+        assert_eq!(
+            SessionKind::from_slug("MobileApps-xihudianzi-codex"),
+            SessionKind::Codex
+        );
+        assert_eq!(SessionKind::from_slug("root-shell"), SessionKind::Shell);
+        // A dir that itself ends in a kind name doesn't confuse the suffix.
+        assert_eq!(
+            SessionKind::from_slug("my-claude-shell"),
+            SessionKind::Shell
+        );
+        // Hand-made names fall back to shell rather than guessing.
+        assert_eq!(SessionKind::from_slug("scratch"), SessionKind::Shell);
+        assert_eq!(SessionKind::from_slug("notes-2"), SessionKind::Shell);
     }
 
     #[test]

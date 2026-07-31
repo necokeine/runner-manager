@@ -161,7 +161,7 @@ pub struct App<R: CommandRunner> {
     /// used to label the terminal pane with that session's directory.
     pub current_session: Option<String>,
     /// Every live session name on the socket as of the last `sync` — including
-    /// untagged ones the store never adopts. `create_session` dedupes new
+    /// any the store could not place in the tree. `create_session` dedupes new
     /// slugs against this set, since a name only the tmux server knows about
     /// would make `new-session` fail on every retry.
     pub live_sessions: HashSet<String>,
@@ -327,7 +327,7 @@ impl<R: CommandRunner> App<R> {
         // back on the next run, so it must not abort the switch — but it is
         // said out loud rather than swallowed, because a silent tag failure is
         // exactly how sessions stopped being recoverable before.
-        let tagged = self.tmux.tag_session(&slug, dir, kind.label_base());
+        let tagged = self.tmux.tag_session(&slug, kind.label_base());
         self.rebuild_rows();
         self.switch_to(&slug)?;
         let label = kind.label_base();
@@ -463,18 +463,20 @@ impl<R: CommandRunner> App<R> {
     /// off`). Deliberately does **no** git work — see [`App::apply_git`].
     pub fn sync(&mut self) -> io::Result<()> {
         let infos = self.tmux.list_sessions_full()?;
-        // Re-adopt sessions this tool created on a prior run (those tagged with a
-        // directory). Untagged ones — any hand-made sessions — are left out of
-        // the tree.
+        // Re-adopt every session on this project's socket under the directory
+        // tmux reports for it. The `@rm` tag says what runs inside, but a
+        // session left by a build that could not write the tag still has to come
+        // back, so an untagged one has its kind read off its slug instead.
         let adoptable: Vec<(String, PathBuf, SessionKind)> = infos
             .iter()
             .filter(|i| !i.dir.is_empty())
             .map(|i| {
-                (
-                    i.name.clone(),
-                    PathBuf::from(&i.dir),
-                    SessionKind::from_tag(&i.kind),
-                )
+                let kind = if i.kind.is_empty() {
+                    SessionKind::from_slug(&i.name)
+                } else {
+                    SessionKind::from_tag(&i.kind)
+                };
+                (i.name.clone(), PathBuf::from(&i.dir), kind)
             })
             .collect();
         self.store.adopt(&adoptable);
@@ -857,9 +859,9 @@ mod tests {
 
     #[test]
     fn sync_adopts_pre_existing_sessions_into_tree() {
-        // Simulates reopening the tool: tmux still has sessions from a prior run.
-        // They carry the `@rm` dir tag, so sync must re-adopt and list them, while
-        // an untagged hand-made session must stay out of the tree.
+        // Simulates reopening the tool: tmux still has sessions from a prior
+        // run, and sync must re-adopt and list them under the directory tmux
+        // reports for each.
         let (_d, mut app) = app_over_tempdir();
         let root = app.root.to_str().unwrap().to_string();
         assert!(!app
@@ -868,7 +870,7 @@ mod tests {
             .any(|r| matches!(r.kind, RowKind::Session { .. })));
         app.tmux
             .runner
-            .push(true, &format!("root-shell||shell {root}\nscratch||\n"));
+            .push(true, &format!("root-shell|shell|zsh|{root}\n"));
         app.sync().unwrap();
         let sessions: Vec<&Row> = app
             .rows
@@ -883,7 +885,27 @@ mod tests {
                 ..
             }
         ));
-        assert!(!app.rows.iter().any(|r| r.label == "scratch"));
+    }
+
+    #[test]
+    fn sync_recovers_untagged_sessions_from_their_tmux_path() {
+        // Sessions left by a build whose `@rm` tag never landed carry no tag at
+        // all. tmux still knows the directory each was started in and the slug
+        // still says what runs inside, so they are recovered rather than lost.
+        let (_d, mut app) = app_over_tempdir();
+        let root = app.root.to_str().unwrap().to_string();
+        app.tmux.runner.push(
+            true,
+            &format!("root-claude||2.1.220|{root}\nroot-shell-2||zsh|{root}\n"),
+        );
+        app.sync().unwrap();
+        let by = app.store.by_dir();
+        let rows = &by[&app.root];
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].slug, "root-claude");
+        assert_eq!(rows[0].kind, SessionKind::Claude);
+        assert_eq!(rows[1].slug, "root-shell-2");
+        assert_eq!(rows[1].kind, SessionKind::Shell);
     }
 
     #[test]
@@ -947,14 +969,14 @@ mod tests {
 
     #[test]
     fn create_session_steps_over_live_untracked_names() {
-        // An untagged session named like our slug lives on the socket (hand
-        // made, or its @rm tag was lost). sync never adopts it, but it must
-        // still be counted as taken or new-session would fail on every retry.
+        // A session on the socket that tmux reports no directory for cannot be
+        // placed in the tree, but its name is still taken — counting it is what
+        // stops new-session from failing on every retry.
         let (_d, mut app) = app_over_tempdir();
-        app.tmux.runner.push(true, "src-shell|zsh|\n"); // list-sessions-full: untagged
+        app.tmux.runner.push(true, "src-shell||zsh|\n"); // list-sessions-full: no path
         app.tmux.runner.push(true, ""); // list-clients (client_session)
         app.sync().unwrap();
-        assert!(app.store.by_dir().is_empty(), "untagged is not adopted");
+        assert!(app.store.by_dir().is_empty(), "no dir -> not placeable");
 
         open_dir_chooser(&mut app);
         push_create_seq(&mut app);
@@ -1159,7 +1181,7 @@ mod tests {
         // reports the client is attached to it.
         app.tmux
             .runner
-            .push(true, &format!("src-shell||shell {root}/src\n"));
+            .push(true, &format!("src-shell|shell||{root}/src\n"));
         app.tmux.runner.push(true, "src-shell\n"); // list-clients (client_session)
         app.sync().unwrap();
         assert_eq!(app.current_session.as_deref(), Some("src-shell"));
@@ -1224,7 +1246,7 @@ mod tests {
         // list-sessions-full: a tagged session whose active pane runs `vim`.
         app.tmux
             .runner
-            .push(true, &format!("src-shell|vim|shell {root}/src\n"));
+            .push(true, &format!("src-shell|shell|vim|{root}/src\n"));
         app.tmux.runner.push(true, "src-shell\n"); // client_session
         app.sync().unwrap();
         assert_eq!(app.briefs.get("src-shell").map(String::as_str), Some("vim"));
