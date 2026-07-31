@@ -322,11 +322,19 @@ impl<R: CommandRunner> App<R> {
             self.status = format!("could not start {}: {e}", kind.label_base());
             return Err(e);
         }
-        // Tag the session so a later run can re-adopt it into the tree.
-        let _ = self.tmux.tag_session(&slug, dir, kind.label_base());
+        // Tag the session so a later run can re-adopt it into the tree. A
+        // failed tag leaves a perfectly usable session that simply won't come
+        // back on the next run, so it must not abort the switch — but it is
+        // said out loud rather than swallowed, because a silent tag failure is
+        // exactly how sessions stopped being recoverable before.
+        let tagged = self.tmux.tag_session(&slug, dir, kind.label_base());
         self.rebuild_rows();
         self.switch_to(&slug)?;
-        self.status = format!("started {}", kind.label_base());
+        let label = kind.label_base();
+        self.status = match tagged {
+            Ok(()) => format!("started {label}"),
+            Err(e) => format!("started {label} (won't be recovered later: {e})"),
+        };
         Ok(())
     }
 
@@ -860,7 +868,7 @@ mod tests {
             .any(|r| matches!(r.kind, RowKind::Session { .. })));
         app.tmux
             .runner
-            .push(true, &format!("root-shell\tshell {root}\nscratch\t\n"));
+            .push(true, &format!("root-shell||shell {root}\nscratch||\n"));
         app.sync().unwrap();
         let sessions: Vec<&Row> = app
             .rows
@@ -897,6 +905,27 @@ mod tests {
     }
 
     #[test]
+    fn create_session_reports_a_failed_tag_without_aborting() {
+        // A rejected @rm tag costs only recoverability on a later run, so the
+        // session is still created and switched to — but the status says so
+        // instead of hiding it.
+        let (_d, mut app) = app_over_tempdir();
+        open_dir_chooser(&mut app);
+        focus_create(&mut app);
+        app.tmux.runner.push(true, ""); // new-session
+        app.tmux.runner.push(false, ""); // set-option (@rm tag) fails
+        app.tmux.runner.push(true, "/dev/ttys009\n"); // list-clients
+        app.tmux.runner.push(true, ""); // switch-client
+        app.chooser_activate().unwrap();
+        assert_eq!(app.current_session.as_deref(), Some("src-shell"));
+        assert!(
+            app.status.contains("won't be recovered later"),
+            "status was {:?}",
+            app.status
+        );
+    }
+
+    #[test]
     fn create_session_failure_rolls_back_and_reports() {
         // tmux rejecting new-session (e.g. "duplicate session") must not leave
         // a phantom store entry occupying the slug, and the status line must
@@ -922,7 +951,7 @@ mod tests {
         // made, or its @rm tag was lost). sync never adopts it, but it must
         // still be counted as taken or new-session would fail on every retry.
         let (_d, mut app) = app_over_tempdir();
-        app.tmux.runner.push(true, "src-shell\t\tzsh\n"); // list-sessions-full: untagged
+        app.tmux.runner.push(true, "src-shell|zsh|\n"); // list-sessions-full: untagged
         app.tmux.runner.push(true, ""); // list-clients (client_session)
         app.sync().unwrap();
         assert!(app.store.by_dir().is_empty(), "untagged is not adopted");
@@ -1130,7 +1159,7 @@ mod tests {
         // reports the client is attached to it.
         app.tmux
             .runner
-            .push(true, &format!("src-shell\tshell {root}/src\n"));
+            .push(true, &format!("src-shell||shell {root}/src\n"));
         app.tmux.runner.push(true, "src-shell\n"); // list-clients (client_session)
         app.sync().unwrap();
         assert_eq!(app.current_session.as_deref(), Some("src-shell"));
@@ -1195,7 +1224,7 @@ mod tests {
         // list-sessions-full: a tagged session whose active pane runs `vim`.
         app.tmux
             .runner
-            .push(true, &format!("src-shell\tshell {root}/src\tvim\n"));
+            .push(true, &format!("src-shell|vim|shell {root}/src\n"));
         app.tmux.runner.push(true, "src-shell\n"); // client_session
         app.sync().unwrap();
         assert_eq!(app.briefs.get("src-shell").map(String::as_str), Some("vim"));
